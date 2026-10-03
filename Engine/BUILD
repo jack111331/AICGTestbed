@@ -91,9 +91,13 @@ cc_library(
 
 cc_library(
     name = "GLTFAdapter",
-    srcs = ["GLTFAdapter.cc"],
+    srcs = [
+        "GLTFAdapter.cc",
+        "SceneGraph.cc",
+    ],
     hdrs = [
         "GLTFAdapter.hpp",
+        "SceneGraph.hpp",
     ],
     defines = SAMPLE_DEFINES,
     # GLTFAdapter.hpp includes DeviceResources.hpp and holds
@@ -104,6 +108,7 @@ cc_library(
         ":pch",
         "@fastgltf//:fastgltf",
         "//third:stb",
+        "@vcpkg_directxtk12//:imgui",
         ":shader_bytecode"
     ],
 )
@@ -178,4 +183,14 @@ cc_binary(
     name = "stb-smoke",
     srcs = ["stb-smoke.cc"],
     deps = ["//third:stb"],
+)
+
+cc_binary(
+    name = "scenegraph-smoke",
+    srcs = ["scenegraph-smoke.cc"],
+    defines = SAMPLE_DEFINES,
+    deps = [
+        ":GLTFAdapter",
+        ":pch",
+    ],
 )

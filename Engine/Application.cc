@@ -87,6 +87,7 @@ void Sample::Initialize(HWND window, int width, int height)
     m_gltfAdapter.AssignCamera(m_camera);
     m_gltfAdapter.PrepareBuffer(m_deviceResources);
     m_gltfAdapter.PrepareImage(m_deviceResources);
+    m_gltfAdapter.BuildSceneGraph();
     m_gltfAdapter.PreparePSO(m_deviceResources);
 
     // Setup Dear ImGui context

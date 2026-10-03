@@ -299,11 +299,50 @@ namespace NeuralModelIntegrateTestbed {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
 
+        // The fallback that fills unused material texture slots. Created here so
+        // it rides along with the same upload batch as the glTF images.
+        {
+            const auto fallbackDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1);
+            DX::ThrowIfFailed(device->CreateCommittedResource(&heapProperties,
+                D3D12_HEAP_FLAG_NONE,
+                &fallbackDesc,
+                c_initialCopyTargetState,
+                nullptr,
+                IID_GRAPHICS_PPV_ARGS(m_fallbackTexture.GetAddressOf())));
+            m_fallbackTexture->SetName(L"Material fallback (1x1 white)");
+
+            m_fallbackTextureDescriptor = m_srvAllocator->Allocate(1);
+            if (m_fallbackTextureDescriptor.IsNull()) {
+                throw std::runtime_error("could not allocate the fallback texture descriptor");
+            }
+            CreateShaderResourceView(device, m_fallbackTexture.Get(),
+                                     m_fallbackTextureDescriptor.GetDescriptorHandle());
+
+            // Opaque white, so a slot the material leaves empty multiplies
+            // through as a no-op for whatever shading reads it.
+            static const uint8_t kWhite[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+            D3D12_SUBRESOURCE_DATA initData = {};
+            initData.pData = kWhite;
+            initData.RowPitch = 4;
+            initData.SlicePitch = 4;
+            resourceUpload.Upload(m_fallbackTexture.Get(), 0, &initData, 1);
+            resourceUpload.Transition(m_fallbackTexture.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+
         auto uploadEndFuture = resourceUpload.End(deviceResources->GetCommandQueue());
         uploadEndFuture.wait();
 
     }
 
+
+    void GLTFAdapter::BuildSceneGraph() {
+        // glTF's `scene` property picks the one to display; fall back to the
+        // first if the asset does not name one.
+        m_currentSceneIdx = m_gltf.defaultScene.value_or(0);
+        m_sceneGraph.Build(m_gltf, m_currentSceneIdx, buffers, m_imageDescriptors.size());
+    }
 
     void GLTFAdapter::PreparePSO(std::shared_ptr<DX::DeviceResources> deviceResources) {
         auto device = deviceResources->GetD3DDevice();
@@ -345,16 +384,29 @@ namespace NeuralModelIntegrateTestbed {
             // DESCRIPTORS_VOLATILE keeps 1.0 semantics: the descriptors a table
             // points at may change between Set and Execute, which is exactly
             // what DynamicDescriptorHeap does when it copies into a fresh heap.
-            CD3DX12_ROOT_PARAMETER1 rootParameters[3] = {};
+            // Must stay in lockstep with NoTextureRootSignature in
+            // shaders/no_texture.fx -- the PSO is created with this signature
+            // while the shader carries its own copy.
+            //
+            //   b0  per-node transform constants
+            //   t0..t4  material textures (base colour, metallic-roughness,
+            //           normal, occlusion, emissive)
+            //   s0  sampler
+            //   b1  per-primitive material constants
+            CD3DX12_ROOT_PARAMETER1 rootParameters[4] = {};
 
-            // Constant buffer
             rootParameters[0].InitAsConstantBufferView(0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE, D3D12_SHADER_VISIBILITY_ALL);
-            const CD3DX12_DESCRIPTOR_RANGE1 texture1Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+            const CD3DX12_DESCRIPTOR_RANGE1 materialTextureRange(
+                D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                static_cast<UINT>(kMaterialTextureSlotCount), 0, 0,
                 D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
             const CD3DX12_DESCRIPTOR_RANGE1 texture1SamplerRange(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0,
                 D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
-            rootParameters[1].InitAsDescriptorTable(1, &texture1Range, D3D12_SHADER_VISIBILITY_PIXEL);
+            rootParameters[1].InitAsDescriptorTable(1, &materialTextureRange, D3D12_SHADER_VISIBILITY_PIXEL);
             rootParameters[2].InitAsDescriptorTable(1, &texture1SamplerRange, D3D12_SHADER_VISIBILITY_PIXEL);
+            // Visibility ALL, matching the HLSL "CBV(b1)" which defaults to ALL;
+            // a narrower visibility here would not match the shader's copy.
+            rootParameters[3].InitAsConstantBufferView(1, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE, D3D12_SHADER_VISIBILITY_ALL);
 
             D3D12_ROOT_SIGNATURE_DESC1 rsigDesc = {};
             rsigDesc.NumParameters = static_cast<UINT>(std::size(rootParameters));
@@ -460,98 +512,72 @@ namespace NeuralModelIntegrateTestbed {
         commandList->SetPipelineState(m_pso.Get());
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-        PBREffectConstants pbrEffectConstant = {};
+        // The scene placement, unchanged: this is now the root transform that
+        // every node's own transform is composed onto, rather than the single
+        // matrix every mesh was drawn with.
         const XMVECTORF32 scale = { 1.0f, 1.0f, 1.0f };
         const XMVECTORF32 translate = { m_position[0], m_position[1], m_position[2] };
         XMVECTOR rotate = DirectX::SimpleMath::Quaternion::CreateFromYawPitchRoll(XM_PI / 2.f, 0.f, -XM_PI / 2.f);
-        XMMATRIX local = worldMatrix * XMMatrixTransformation(g_XMZero, DirectX::SimpleMath::Quaternion::Identity, scale, g_XMZero, rotate, translate);
-        pbrEffectConstant.eyePosition = m_camera->mEye;
-        pbrEffectConstant.world = local;
-        pbrEffectConstant.worldViewProj = XMMatrixTranspose(XMMatrixMultiply(XMMatrixMultiply(local, viewMatrix), projectionMatrix));
-        SharedGraphicsResource cBufferResource = GraphicsMemory::Get(device).AllocateConstant(pbrEffectConstant);
-        // NOTE: Set*Root* only set BufferLocation instead of SizeInBytes, which may cause GPU to crash if shader access data out of bound
-        // Therefore, it's suitable for frequently changing resource 
-        // https://gamedev.net/forums/topic/678623-d3d12-using-setgraphicsrootview-functions/#post-5291945
-        commandList->SetGraphicsRootConstantBufferView(0, cBufferResource.GpuAddress());
-        // TODO should group render object
-        for (const auto &node: m_gltf.nodes) {
-            // TODO render hierarchically
-            // node.children
-            PIXBeginEvent(commandList.Get(), PIX_COLOR_DEFAULT, L"Begin GLTF mesh");
-            if (!node.meshIndex.has_value()) {
-                PIXEndEvent(commandList.Get());
-                continue;
-            }
-            const auto &meshIndex = node.meshIndex.value();
-            const auto &mesh = m_gltf.meshes[meshIndex];
-            for (const auto &primitive: mesh.primitives) {
-                const auto &primitiveType = primitive.type;
-                const auto &indicesAccessorIdx = primitive.indicesAccessor.value();
-                const auto &indicesAccessor = m_gltf.accessors[indicesAccessorIdx];
-                const auto &indicesBufferView = m_gltf.bufferViews[indicesAccessor.bufferViewIndex.value()];
-                const auto &indicesBufferLocation = buffers[indicesBufferView.bufferIndex]->GetGPUVirtualAddress() + indicesBufferView.byteOffset;
-                const auto &positionAttribute = primitive.attributes[0]; // TODO assume the position accessor is always at the first attribute of primitive, need further refinement
-                D3D12_VERTEX_BUFFER_VIEW vbView[2] = {};
-                if (primitive.attributes.size() > 2) {
-                    // TODO NORMAL
-                    auto texcoordIt = primitive.findAttribute("TEXCOORD_0");
-                    if (texcoordIt != primitive.attributes.end()) {
-                        const auto &texcoordAccessor = m_gltf.accessors[texcoordIt->accessorIndex];
-                        const auto &texcoordBufferView = m_gltf.bufferViews[texcoordAccessor.bufferViewIndex.value()];
-                        const auto &texcoordBufferLocation = buffers[texcoordBufferView.bufferIndex]->GetGPUVirtualAddress() + texcoordBufferView.byteOffset;                
-                        vbView[1].BufferLocation = texcoordBufferLocation + texcoordAccessor.byteOffset; // GPU virtual address
-                        vbView[1].SizeInBytes = sizeof(float) * texcoordAccessor.count * 2;             // TODO should reference accessor.componentType and accessor.type actually, but we use this default
-                        vbView[1].StrideInBytes = sizeof(float) * 2;                         // Size of one element
-                    }
-                }
-                const auto &positionAccessor = m_gltf.accessors[positionAttribute.accessorIndex];
-                const auto &positionBufferView = m_gltf.bufferViews[positionAccessor.bufferViewIndex.value()];
-                const auto &positionBufferLocation = buffers[positionBufferView.bufferIndex]->GetGPUVirtualAddress() + positionBufferView.byteOffset;                
+        XMMATRIX placement = worldMatrix * XMMatrixTransformation(g_XMZero, DirectX::SimpleMath::Quaternion::Identity, scale, g_XMZero, rotate, translate);
 
-                // TODO use image
-                if (primitive.materialIndex.has_value()) {
-                    const auto &materialIdx = primitive.materialIndex.value();
-                    if (m_gltf.materials[materialIdx].pbrData.baseColorTexture.has_value()) {
-                        const auto &baseColorTexture = m_gltf.materials[materialIdx].pbrData.baseColorTexture.value();
-                        // Resolve texture -> image, rather than the previous
-                        // hardcoded heap slot 3 which always bound image 0.
-                        const auto &texture = m_gltf.textures[baseColorTexture.textureIndex];
-                        if (texture.imageIndex.has_value()) {
-                            const std::size_t imageIdx = texture.imageIndex.value();
-                            if (imageIdx < m_imageDescriptors.size()) {
-                                // Staged, not bound: the copy into a GPU-visible
-                                // heap happens in CommitStagedDescriptorsForDraw
-                                // below, which also binds the table.
-                                m_srvDynamicHeap->StageDescriptors(
-                                    1, 0, 1, m_imageDescriptors[imageIdx].GetDescriptorHandle());
-                            }
-                        }
-                        // The sampler table still points straight into the
-                        // DirectXTK12 sampler heap, which the binder keeps bound.
-                        commandList->SetGraphicsRootDescriptorTable(2, m_commonStates->AnisotropicWrap());
-                    }
+        // Top-down pass: each node's world transform is its local transform
+        // composed with its parent's, and hidden subtrees drop out of the draw
+        // order here rather than being tested per draw.
+        m_sceneGraph.UpdateTransforms(placement);
+        // One constant buffer per node, because each now carries its own world
+        // matrix. SharedGraphicsResource keeps every allocation alive until
+        // GraphicsMemory::Commit runs at the end of the frame.
+        for (const std::size_t nodeIndex : m_sceneGraph.DrawOrder()) {
+            const SceneNode &node = m_sceneGraph.Nodes()[nodeIndex];
+
+            PIXBeginEvent(commandList.Get(), PIX_COLOR_DEFAULT, L"Begin GLTF node");
+
+            PBREffectConstants pbrEffectConstant = {};
+            pbrEffectConstant.eyePosition = m_camera->mEye;
+            pbrEffectConstant.world = node.worldTransform;
+            pbrEffectConstant.worldViewProj = XMMatrixTranspose(
+                XMMatrixMultiply(XMMatrixMultiply(node.worldTransform, viewMatrix), projectionMatrix));
+            // NOTE: Set*Root* only set BufferLocation instead of SizeInBytes, which may cause GPU to crash if shader access data out of bound
+            // Therefore, it's suitable for frequently changing resource.
+            // https://gamedev.net/forums/topic/678623-d3d12-using-setgraphicsrootview-functions/#post-5291945
+            SharedGraphicsResource cBufferResource =
+                GraphicsMemory::Get(device).AllocateConstant(pbrEffectConstant);
+            commandList->SetGraphicsRootConstantBufferView(0, cBufferResource.GpuAddress());
+
+            for (const PrimitiveResource &primitive : node.primitives) {
+                // Per-primitive material factors at b1.
+                SharedGraphicsResource materialResource =
+                    GraphicsMemory::Get(device).AllocateConstant(primitive.material);
+                commandList->SetGraphicsRootConstantBufferView(3, materialResource.GpuAddress());
+
+                // Every slot of the five-wide SRV table gets a descriptor:
+                // the material's texture where it has one, the white fallback
+                // otherwise. Leaving a slot unwritten would put an
+                // uninitialised descriptor in a bound table.
+                //
+                // Staged one slot at a time because StageDescriptors copies a
+                // *contiguous* source range, and these descriptors come from
+                // separate allocations.
+                for (std::size_t slot = 0; slot < kMaterialTextureSlotCount; ++slot) {
+                    const auto imageIndex = primitive.textureImageIndex[slot];
+                    const D3D12_CPU_DESCRIPTOR_HANDLE handle =
+                        imageIndex.has_value()
+                            ? m_imageDescriptors[imageIndex.value()].GetDescriptorHandle()
+                            : m_fallbackTextureDescriptor.GetDescriptorHandle();
+                    m_srvDynamicHeap->StageDescriptors(1, static_cast<uint32_t>(slot), 1, handle);
                 }
 
-                vbView[0].BufferLocation = positionBufferLocation + positionAccessor.byteOffset; // GPU virtual address
-                vbView[0].SizeInBytes = sizeof(float) * positionAccessor.count * 3;             // TODO should reference accessor.componentType and accessor.type actually, but we use this default
-                vbView[0].StrideInBytes = sizeof(float) * 3;                         // Size of one element
-                commandList->IASetVertexBuffers(0, 2, vbView);
+                // The sampler table points straight into the DirectXTK12
+                // sampler heap, which the binder keeps bound.
+                commandList->SetGraphicsRootDescriptorTable(2, m_commonStates->AnisotropicWrap());
 
-                D3D12_INDEX_BUFFER_VIEW idxView = {};
-                idxView.BufferLocation = indicesBufferLocation + indicesAccessor.byteOffset;
-                idxView.Format = indicesAccessor.componentType == fastgltf::ComponentType::UnsignedInt ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-                idxView.SizeInBytes = indicesAccessor.count * (indicesAccessor.componentType == fastgltf::ComponentType::UnsignedInt?sizeof(uint32_t):sizeof(uint16_t)); // TODO not sure indicesAccessor.count
-                commandList->IASetIndexBuffer(&idxView);
+                commandList->IASetVertexBuffers(0, 2, primitive.vertexBufferViews);
+                commandList->IASetIndexBuffer(&primitive.indexBufferView);
 
-                // Copy everything staged for this primitive into the GPU-visible
-                // heap and bind the resulting tables. Must happen after the last
-                // StageDescriptors for this draw and before the draw itself; it
-                // may switch to a new heap, which the binder handles.
                 m_srvDynamicHeap->CommitStagedDescriptorsForDraw(commandList.Get(), m_heapBinder);
-
-                // TODO bind texture and shader
-                commandList->DrawIndexedInstanced(indicesAccessor.count, 1, 0, 0, 0);
+                commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
             }
+
             PIXEndEvent(commandList.Get());
         }
         PIXEndEvent(commandList.Get());
@@ -562,6 +588,10 @@ namespace NeuralModelIntegrateTestbed {
 
     void GLTFAdapter::ShowImgui() {
         ImGui::SliderFloat3("GLTF position", m_position, -10.0, 10.0);
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Scene hierarchy", ImGuiTreeNodeFlags_DefaultOpen)) {
+            m_sceneGraph.DrawHierarchyUI();
+        }
     }
 
     void GLTFAdapter::ReleaseStaleDescriptors(uint64_t frameNumber) {
