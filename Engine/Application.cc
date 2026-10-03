@@ -7,6 +7,7 @@
 
 #include "pch.h"
 #include "Application.hpp"
+#include "Descriptors/DescriptorContext.hpp"
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -82,7 +83,7 @@ void Sample::Initialize(HWND window, int width, int height)
 
     // gltfAdapter.Initialize("resources/microphone_gxl_066_bafhcteks/scene.gltf");
     m_gltfAdapter.Initialize("resources/TestGLTF/WithTexture.gltf");
-    m_gltfAdapter.SetDescriptorHeap(m_resourceDescriptors, m_states);
+    m_gltfAdapter.SetCommonStates(m_states);
     m_gltfAdapter.AssignCamera(m_camera);
     m_gltfAdapter.PrepareBuffer(m_deviceResources);
     m_gltfAdapter.PrepareImage(m_deviceResources);
@@ -367,6 +368,19 @@ void Sample::Render()
     m_deviceResources->Present();
     m_graphicsMemory->Commit(m_deviceResources->GetCommandQueue());
     PIXEndEvent(m_deviceResources->GetCommandQueue());
+
+    // Advance the descriptor frame clock, then reclaim descriptors retired long
+    // enough ago that the GPU cannot still be reading them. Present() has
+    // already waited for the frame BACK_BUFFER_COUNT ago to complete, so
+    // anything retired before that point is safe; subtracting the back buffer
+    // count keeps a conservative margin rather than plumbing fence values in.
+    auto& descriptorContext = NeuralModelIntegrateTestbed::Descriptors::Context();
+    descriptorContext.AdvanceFrame();
+    const uint64_t frameCount = descriptorContext.GetFrameCount();
+    constexpr uint64_t kInFlightMargin = 3;  // back buffer count + 1
+    if (frameCount > kInFlightMargin) {
+        m_gltfAdapter.ReleaseStaleDescriptors(frameCount - kInFlightMargin);
+    }
 }
 
 // Helper method to clear the back buffers.

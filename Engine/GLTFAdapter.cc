@@ -8,6 +8,7 @@
 #include "imgui_impl_dx12.h"
 #include <directx/d3dx12.h>
 #include <stb_image.h>
+#include "Descriptors/DescriptorContext.hpp"
 #include <no_texture.h>
 
 using namespace DirectX;
@@ -44,6 +45,22 @@ namespace NeuralModelIntegrateTestbed {
 
     void GLTFAdapter::PrepareBuffer(std::shared_ptr<DX::DeviceResources> deviceResources) {
         auto device = deviceResources->GetD3DDevice();
+
+        // The ported descriptor classes reach for the device and the frame
+        // number through this context, so it has to exist before any of them
+        // are constructed. Idempotent: safe to call again after a device reset.
+        Descriptors::Context().Initialize(device);
+
+        // CPU-visible staging descriptors, grown a page at a time. 256 per page
+        // is the upstream default; glTF images are allocated one descriptor at
+        // a time so a page covers 256 textures before another is created.
+        m_srvAllocator = std::make_unique<Descriptors::DescriptorAllocator>(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256);
+
+        // GPU-visible heap that per-draw descriptor tables are copied into.
+        m_srvDynamicHeap = std::make_unique<Descriptors::DynamicDescriptorHeap>(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1024);
+
         ResourceUploadBatch resourceUpload(device);
 
         const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
@@ -257,7 +274,16 @@ namespace NeuralModelIntegrateTestbed {
                 nullptr,
                 IID_GRAPHICS_PPV_ARGS(createdTexture.GetAddressOf())));
             createdTexture->SetName(L"GLTF image 1");
-            CreateShaderResourceView(device, createdTexture.Get(), m_descriptorHeap->GetCpuHandle(descriptorHeapStartIdx++));
+            // One page-allocated CPU descriptor per image, kept alongside it.
+            // These are never bound directly -- DynamicDescriptorHeap copies
+            // them into a shader-visible heap at draw time -- so the allocator
+            // heap does not need to be shader visible.
+            Descriptors::DescriptorAllocation srv = m_srvAllocator->Allocate(1);
+            if (srv.IsNull()) {
+                throw std::runtime_error("out of SRV descriptors for glTF images");
+            }
+            CreateShaderResourceView(device, createdTexture.Get(), srv.GetDescriptorHandle());
+            m_imageDescriptors.push_back(std::move(srv));
             images.push_back(createdTexture);
 
             SetDebugObjectName(createdTexture.Get(), L"Image");
@@ -311,28 +337,43 @@ namespace NeuralModelIntegrateTestbed {
                 D3D12_FLOAT32_MAX,
                 D3D12_SHADER_VISIBILITY_PIXEL);
 
-            CD3DX12_ROOT_PARAMETER rootParameters[3] = {};
-
-            // Root parameter descriptor
-            CD3DX12_ROOT_SIGNATURE_DESC rsigDesc = {};
+            // Root signature 1.1 rather than 1.0, because
+            // Descriptors::RootSignature takes a D3D12_ROOT_SIGNATURE_DESC1 --
+            // DynamicDescriptorHeap needs the parsed layout to know which root
+            // parameters are descriptor tables and how wide each one is.
+            //
+            // DESCRIPTORS_VOLATILE keeps 1.0 semantics: the descriptors a table
+            // points at may change between Set and Execute, which is exactly
+            // what DynamicDescriptorHeap does when it copies into a fresh heap.
+            CD3DX12_ROOT_PARAMETER1 rootParameters[3] = {};
 
             // Constant buffer
-            rootParameters[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
-            // TODO Need to understand
-            const CD3DX12_DESCRIPTOR_RANGE texture1Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-            const CD3DX12_DESCRIPTOR_RANGE texture1SamplerRange(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0);
+            rootParameters[0].InitAsConstantBufferView(0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE, D3D12_SHADER_VISIBILITY_ALL);
+            const CD3DX12_DESCRIPTOR_RANGE1 texture1Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+                D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
+            const CD3DX12_DESCRIPTOR_RANGE1 texture1SamplerRange(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0,
+                D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
             rootParameters[1].InitAsDescriptorTable(1, &texture1Range, D3D12_SHADER_VISIBILITY_PIXEL);
             rootParameters[2].InitAsDescriptorTable(1, &texture1SamplerRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
-            rsigDesc.Init(static_cast<UINT>(std::size(rootParameters)), rootParameters, 0, nullptr, rootSignatureFlags);
-            Microsoft::WRL::ComPtr<ID3DBlob> pSignature;
-            Microsoft::WRL::ComPtr<ID3DBlob> pError;
-            HRESULT                          hr = D3D12SerializeRootSignature(&rsigDesc,
-                D3D_ROOT_SIGNATURE_VERSION_1,
-                pSignature.GetAddressOf(),
-                pError.GetAddressOf());
-            device->CreateRootSignature(0, pSignature->GetBufferPointer(), pSignature->GetBufferSize(), IID_PPV_ARGS(&pRootSignature));
-            psoDesc.pRootSignature = pRootSignature;
+            D3D12_ROOT_SIGNATURE_DESC1 rsigDesc = {};
+            rsigDesc.NumParameters = static_cast<UINT>(std::size(rootParameters));
+            rsigDesc.pParameters = rootParameters;
+            rsigDesc.NumStaticSamplers = 0;
+            rsigDesc.pStaticSamplers = nullptr;
+            rsigDesc.Flags = rootSignatureFlags;
+
+            // Serializes and creates the ID3D12RootSignature, and records the
+            // descriptor-table bit masks and per-table descriptor counts.
+            m_rootSignature.SetRootSignatureDesc(rsigDesc, D3D_ROOT_SIGNATURE_VERSION_1_1);
+            psoDesc.pRootSignature = m_rootSignature.GetRootSignature().Get();
+
+            // NOTE: the dynamic heap is NOT taught the layout here.
+            // DynamicDescriptorHeap::Reset() clears the descriptor-table bit mask
+            // and nulls every cached BaseDescriptor, so ParseRootSignature has to
+            // be re-called every frame after the reset -- see Render(), which
+            // does it alongside SetGraphicsRootSignature exactly as upstream's
+            // CommandList does.
         }
 
 
@@ -393,11 +434,29 @@ namespace NeuralModelIntegrateTestbed {
         commandList->RSSetViewports(1, &viewport);
         commandList->RSSetScissorRects(1, &scissorRect);
 
-        // TODO I don't sure why I need this, I thought I've already set it? Or m_modelResources in Application.cc's own heap just override it?
-        ID3D12DescriptorHeap* heaps[] = { m_descriptorHeap->Heap(), m_commonStates->Heap() };
-        commandList->SetDescriptorHeaps(_countof(heaps), heaps);
+        // Descriptor heap bindings do not survive a command list reset, and
+        // Application's DirectXTK12 draws rebind their own heaps earlier in the
+        // frame, so re-establish ours here. The sampler heap is registered once;
+        // the dynamic SRV heap registers itself as it commits, and the binder
+        // reissues SetDescriptorHeaps with both whenever either changes.
+        m_heapBinder.Reset(commandList.Get());
+        m_heapBinder.SetDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, m_commonStates->Heap());
 
-        commandList->SetGraphicsRootSignature(pRootSignature);
+        // The dynamic heap has to be reset in step with the command list. It
+        // otherwise keeps last frame's GPU-visible heap in m_CurrentDescriptorHeap
+        // and, finding it still has free handles, never re-issues
+        // SetDescriptorHeaps -- but the binding died with the command list reset,
+        // so the first SetGraphicsRootDescriptorTable fails validation with
+        // SET_DESCRIPTOR_TABLE_INVALID.
+        //
+        // Safe here for the same reason resetting the command allocator above is:
+        // Present() has already waited for the previous use of this back buffer
+        // index, so the GPU-visible heaps being recycled are no longer in flight.
+        m_srvDynamicHeap->Reset();
+
+        commandList->SetGraphicsRootSignature(m_rootSignature.GetRootSignature().Get());
+        // Must follow Reset(), which wipes the parsed layout.
+        m_srvDynamicHeap->ParseRootSignature(m_rootSignature);
         commandList->SetPipelineState(m_pso.Get());
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -454,9 +513,22 @@ namespace NeuralModelIntegrateTestbed {
                     const auto &materialIdx = primitive.materialIndex.value();
                     if (m_gltf.materials[materialIdx].pbrData.baseColorTexture.has_value()) {
                         const auto &baseColorTexture = m_gltf.materials[materialIdx].pbrData.baseColorTexture.value();
-                        commandList->SetGraphicsRootDescriptorTable(1, m_descriptorHeap->GetGpuHandle(3)); // TODO
+                        // Resolve texture -> image, rather than the previous
+                        // hardcoded heap slot 3 which always bound image 0.
+                        const auto &texture = m_gltf.textures[baseColorTexture.textureIndex];
+                        if (texture.imageIndex.has_value()) {
+                            const std::size_t imageIdx = texture.imageIndex.value();
+                            if (imageIdx < m_imageDescriptors.size()) {
+                                // Staged, not bound: the copy into a GPU-visible
+                                // heap happens in CommitStagedDescriptorsForDraw
+                                // below, which also binds the table.
+                                m_srvDynamicHeap->StageDescriptors(
+                                    1, 0, 1, m_imageDescriptors[imageIdx].GetDescriptorHandle());
+                            }
+                        }
+                        // The sampler table still points straight into the
+                        // DirectXTK12 sampler heap, which the binder keeps bound.
                         commandList->SetGraphicsRootDescriptorTable(2, m_commonStates->AnisotropicWrap());
-                        // commandList->SetGraphicsRootShaderResourceView(0, images[baseColorTexture.textureIndex]->GetGPUVirtualAddress());
                     }
                 }
 
@@ -471,6 +543,12 @@ namespace NeuralModelIntegrateTestbed {
                 idxView.SizeInBytes = indicesAccessor.count * (indicesAccessor.componentType == fastgltf::ComponentType::UnsignedInt?sizeof(uint32_t):sizeof(uint16_t)); // TODO not sure indicesAccessor.count
                 commandList->IASetIndexBuffer(&idxView);
 
+                // Copy everything staged for this primitive into the GPU-visible
+                // heap and bind the resulting tables. Must happen after the last
+                // StageDescriptors for this draw and before the draw itself; it
+                // may switch to a new heap, which the binder handles.
+                m_srvDynamicHeap->CommitStagedDescriptorsForDraw(commandList.Get(), m_heapBinder);
+
                 // TODO bind texture and shader
                 commandList->DrawIndexedInstanced(indicesAccessor.count, 1, 0, 0, 0);
             }
@@ -484,6 +562,18 @@ namespace NeuralModelIntegrateTestbed {
 
     void GLTFAdapter::ShowImgui() {
         ImGui::SliderFloat3("GLTF position", m_position, -10.0, 10.0);
+    }
+
+    void GLTFAdapter::ReleaseStaleDescriptors(uint64_t frameNumber) {
+        // Returns descriptors freed on or before frameNumber to their pages.
+        // The caller passes a frame number it knows the GPU is done with, so
+        // nothing still referenced by an in-flight command list is recycled.
+        if (m_srvAllocator) {
+            m_srvAllocator->ReleaseStaleDescriptors(frameNumber);
+        }
+        // The dynamic heap's GPU-visible heaps are recycled by its own Reset()
+        // at the top of Render(), which is tied to the command list rather than
+        // to this frame-retirement margin.
     }
 
 }

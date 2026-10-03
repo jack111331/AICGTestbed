@@ -60,6 +60,21 @@ cc_library(
     ],
 )
 
+# Page-based descriptor management, ported from LearningDirectX12 v0.0.3 (MIT).
+# See Descriptors/LICENSE-LearningDirectX12.txt for the upstream licence and the
+# header comment in each file for what was adapted.
+#
+# includes = ["."] puts Engine/ on the search path so these files can say
+# #include "pch.h" and #include "Descriptors/...".
+cc_library(
+    name = "Descriptors",
+    srcs = glob(["Descriptors/*.cc"]),
+    hdrs = glob(["Descriptors/*.hpp"]),
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+    deps = [":pch"],
+)
+
 cc_library(
     name = "DeviceResources",
     srcs = ["DeviceResources.cc"],
@@ -85,6 +100,7 @@ cc_library(
     # ComPtr<ID3D12Resource> members; GLTFAdapter.cc includes pch.h.
     deps = [
         ":DeviceResources",
+        ":Descriptors",
         ":pch",
         "@fastgltf//:fastgltf",
         "//third:stb",
@@ -102,6 +118,7 @@ cc_library(
     ],
     defines = SAMPLE_DEFINES,
     deps = [
+        ":Descriptors",
         ":DeviceResources",
         ":GLTFAdapter",
         ":pch",
