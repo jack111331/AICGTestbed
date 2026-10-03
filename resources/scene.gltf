@@ -1,0 +1,38 @@
+GLTF({
+  "asset": {"version": "2.0"},
+  "extensionsUsed": ["MYLAB_generative"],
+  "extensions": {
+    "MYLAB_generative": {
+      "generators": [{
+        "name": "cam_gen",
+        "task": "text_to_camera_trajectory",
+        "model": {
+          "uri": "models/camtraj.onnx",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "output": {"fps": 30, "cameraConvention": "opencv", "poseType": "cam_to_world"}
+      }],
+      "timeline": {"duration": 8.0}
+    }
+  },
+  "cameras": [{"type": "perspective", "perspective": {"yfov": 0.7, "znear": 0.01}}],
+  "nodes": [
+    {"name": "Actor"},
+    {
+      "name": "MainCamera",
+      "camera": 0,
+      "extensions": {
+        "MYLAB_generative": {
+          "generator": 0,
+          "prompt": "slow orbit around the actor, ending on a close-up",
+          "seed": 7,
+          "start": 0.5,
+          "duration": 6.0,
+          "conditionOn": {"lookAtNode": 0}
+        }
+      }
+    }
+  ],
+  "scene": 0,
+  "scenes": [{"nodes": [0, 1]}]
+})GLTF

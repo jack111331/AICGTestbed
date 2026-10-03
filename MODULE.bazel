@@ -1,0 +1,35 @@
+module(
+    name = "ptflio",
+    version = "0.0.1",
+)
+
+bazel_dep(name = "rules_cc", version = "0.2.17")
+
+# Needed so `@platforms//os:windows` is visible from the repo mapping of the
+# vcpkg_directxtk12 repo below (repos made by use_repo_rule inherit the root
+# module's repo mapping, which only contains its *direct* bazel_deps).
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# In Bzlmod (Bazel 8+/9) `new_local_repository` is no longer a built-in global in
+# MODULE.bazel -- it has to be pulled in as a repo rule first.
+new_local_repository = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:local.bzl",
+    "new_local_repository",
+)
+
+# Relative paths are resolved against the main workspace root, so this stays
+# portable instead of hard-coding C:/Code/ptflio.
+new_local_repository(
+    name = "vcpkg_directxtk12",
+    build_file = "//third:vcpkg.BUILD",
+    path = "third/vcpkg_installed/x64-windows",
+)
+
+# A local source checkout of fastgltf carrying project-specific modifications
+# (the MYLAB_generative vendor extension). Built from source rather than taken
+# from vcpkg, so edits in the checkout rebuild here without a CMake step.
+new_local_repository(
+    name = "fastgltf",
+    build_file = "//third:fastgltf.BUILD",
+    path = "../fastgltf",
+)

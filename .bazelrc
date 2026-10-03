@@ -1,0 +1,9 @@
+build --enable_platform_specific_config
+
+# DirectXTK12 requires C++11 or later; C++17 matches what the vcpkg port is
+# built with and enables SimpleMath's constexpr paths.
+build:windows --cxxopt=/std:c++17
+build:windows --host_cxxopt=/std:c++17
+
+build --action_env=VSLANG="1033"
+

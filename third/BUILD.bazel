@@ -1,0 +1,59 @@
+# third/ holds the dependency wiring: the vcpkg manifest, the build files handed
+# to new_local_repository in MODULE.bazel (vcpkg.BUILD, fastgltf.BUILD), and the
+# targets below for dependencies that need no external repo at all.
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# DirectML needs no download and no vcpkg port -- vcpkg has none. Everything
+# comes from what is already on the toolchain's search paths:
+#
+#   DirectML.h       Windows SDK  Include/<ver>/um
+#   directml.lib     Windows SDK  Lib/<ver>/um/x64
+#   directml.dll     in-box       %WINDIR%\System32 (Windows 10 1903+)
+#
+# So this is a header-free, source-free target: just the link flag and the
+# version define. Nothing to stage into runfiles, since the DLL ships with the OS.
+cc_library(
+    name = "directml",
+    # DirectML.h derives DML_TARGET_VERSION from NTDDI_VERSION via a ladder, so
+    # leaving it implicit pins the API surface to whatever NTDDI the SDK settles
+    # on rather than to what the runtime can do. Measured on this machine
+    # (SDK 10.0.26100, Engine/pch.h setting _WIN32_WINNT 0x0A00 before
+    # SDKDDKVer.h): NTDDI_VERSION comes out 0x0A000010 (NTDDI_WIN10_NI) and
+    # DML_TARGET_VERSION 0x5000 -- feature level 5.0, hiding everything added in
+    # DirectML 6.x. USE_LATEST opts into 0x6400 instead.
+    #
+    # The trade-off: the compile-time surface is now newer than some machines'
+    # in-box runtime, so anything above the level you are willing to require must
+    # be gated on IDMLDevice::CheckFeatureSupport(DML_FEATURE_FEATURE_LEVELS,
+    # ...) at run time. See Engine/directml-smoke.cc for how to query it.
+    defines = ["DML_TARGET_VERSION_USE_LATEST"],
+    linkopts = [
+        "-DEFAULTLIB:directml.lib",
+        # DMLCreateDevice takes an ID3D12Device, so callers always need D3D12 too.
+        "-DEFAULTLIB:d3d12.lib",
+        "-DEFAULTLIB:dxgi.lib",
+        "-DEFAULTLIB:dxguid.lib",
+    ],
+    target_compatible_with = ["@platforms//os:windows"],
+    visibility = ["//visibility:public"],
+)
+
+# stb_image, as a normal compiled library. The headers come from the vcpkg port;
+# what this adds is the single translation unit that instantiates them.
+cc_library(
+    name = "stb",
+    srcs = ["stb_impl.cc"],
+    # STB_IMAGE_IMPLEMENTATION must reach exactly ONE translation unit in the
+    # binary -- local_defines keeps it off every dependent, which `defines` would
+    # not, and a second definition is a duplicate-symbol link error.
+    local_defines = ["STB_IMAGE_IMPLEMENTATION"],
+    # This one is deliberately propagated: it changes how stbi_load interprets
+    # filenames (UTF-8 rather than the ANSI codepage, converted to wide internally
+    # on Windows) and it also guards the declaration of
+    # stbi_convert_wchar_to_utf8, so dependents must see the same value.
+    defines = ["STBI_WINDOWS_UTF8"],
+    target_compatible_with = ["@platforms//os:windows"],
+    visibility = ["//visibility:public"],
+    deps = ["@vcpkg_directxtk12//:stb_headers"],
+)

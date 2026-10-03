@@ -1,0 +1,20 @@
+{
+  "dependencies": [
+    {
+      "name": "directxtk12",
+      "features": [
+        "xaudio2-9"
+      ]
+    },
+    {
+      "name": "imgui",
+      "features": [
+        "dx12-binding",
+        "win32-binding"
+      ]
+    },
+    {
+      "name": "stb"
+    }
+  ]
+}
