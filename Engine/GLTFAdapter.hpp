@@ -21,29 +21,60 @@ namespace NeuralModelIntegrateTestbed {
 
     };
 
+    // Mirrors `cbuffer PBR_Constants : register(b0)` in shaders/no_texture.fx.
+    // The HLSL side spells out a packoffset for every field, so the two layouts
+    // have to be changed together; the comments below give each field's
+    // register so that stays checkable by eye.
     struct PBREffectConstants
-    {    
-        DirectX::XMVECTOR eyePosition;
-        DirectX::XMMATRIX world;
-        DirectX::XMVECTOR worldInverseTranspose[3];
-        DirectX::XMMATRIX worldViewProj;
-        DirectX::XMMATRIX prevWorldViewProj; // for velocity generation
+    {
+        DirectX::XMVECTOR eyePosition;                 // c0
+        DirectX::XMMATRIX world;                       // c1..c4
+        DirectX::XMVECTOR worldInverseTranspose[3];    // c5..c7  (float3x3)
+        DirectX::XMMATRIX worldViewProj;               // c8..c11
+        DirectX::XMMATRIX prevWorldViewProj;           // c12..c15, for velocity generation
 
-        DirectX::XMVECTOR lightDirection[4];           
-        DirectX::XMVECTOR lightDiffuseColor[4];
-        
+        // Lights from the glTF asset's KHR_lights_punctual, resolved against the
+        // node instancing each one. Replaces the earlier pair of loose
+        // lightDirection[]/lightDiffuseColor[] arrays, which could not express
+        // point or spot lights -- and which nothing ever filled in.
+        //
+        // Only the first `lightCount` entries hold a light; the rest are zeroed.
+        ShaderLight lights[kMaxShaderLights];          // c16..c31 (4 registers each)
+
         // PBR Parameters
-        DirectX::XMVECTOR Albedo;
-        float    Metallic;
-        float    Roughness;
-        int      numRadianceMipLevels;
+        DirectX::XMVECTOR Albedo;                      // c32
+        float    Metallic;                             // c33.x
+        float    Roughness;                            // c33.y
+        int      numRadianceMipLevels;                 // c33.z
+        int      lightCount;                           // c33.w
 
-        // Size of render target 
-        float   targetWidth;
-        float   targetHeight;
+        // Size of render target
+        float   targetWidth;                           // c34.x
+        float   targetHeight;                          // c34.y
+        float   padding[2];                            // c34.zw
     };
 
     static_assert( ( sizeof(PBREffectConstants) % 16 ) == 0, "CB size not padded correctly" );
+
+    // Field offsets, verified against the layout dxc reports for
+    // cbuffer PBR_Constants in shaders/no_texture.fx. A mismatch here would
+    // otherwise show up only as the shader reading the wrong bytes -- which
+    // renders something plausible rather than failing.
+    static_assert(offsetof(PBREffectConstants, eyePosition)            ==   0, "c0");
+    static_assert(offsetof(PBREffectConstants, world)                  ==  16, "c1");
+    static_assert(offsetof(PBREffectConstants, worldInverseTranspose)  ==  80, "c5");
+    static_assert(offsetof(PBREffectConstants, worldViewProj)          == 128, "c8");
+    static_assert(offsetof(PBREffectConstants, prevWorldViewProj)      == 192, "c12");
+    static_assert(offsetof(PBREffectConstants, lights)                 == 256, "c16");
+    static_assert(offsetof(PBREffectConstants, Albedo)                 == 512, "c32");
+    static_assert(offsetof(PBREffectConstants, Metallic)               == 528, "c33.x");
+    static_assert(offsetof(PBREffectConstants, Roughness)              == 532, "c33.y");
+    static_assert(offsetof(PBREffectConstants, numRadianceMipLevels)   == 536, "c33.z");
+    static_assert(offsetof(PBREffectConstants, lightCount)             == 540, "c33.w");
+    static_assert(offsetof(PBREffectConstants, targetWidth)            == 544, "c34.x");
+    static_assert(offsetof(PBREffectConstants, targetHeight)           == 548, "c34.y");
+    static_assert( sizeof(PBREffectConstants) == 560,
+                   "PBR_Constants packoffsets in no_texture.fx assume this layout" );
 
     // The node describe what things in a scene will input into AI model or what things need AI model to evaluate
     class GLTFAdapter {
@@ -52,11 +83,27 @@ namespace NeuralModelIntegrateTestbed {
         void PrepareBuffer(std::shared_ptr<DX::DeviceResources> deviceResources);
         void PrepareImage(std::shared_ptr<DX::DeviceResources> deviceResources);
         void PreparePSO(std::shared_ptr<DX::DeviceResources> deviceResources);
+        // Per-image colour space, decided from the material slots that
+        // reference each image. PrepareImage computes this before creating any
+        // texture, so each one gets the matching DXGI format.
+        const ImageColorSpaceClassification &ImageColorSpaces() const {
+            return m_imageColorSpaces;
+        }
+
         // Resolves the scene hierarchy and per-primitive buffer views.
         // Must run after PrepareBuffer and PrepareImage, whose results it
         // references.
         void BuildSceneGraph();
         void AssignCamera(std::shared_ptr<Camera> camera) { m_camera = camera; }
+
+        // Advances the selected animation and poses the scene's nodes. Call
+        // once per frame BEFORE Render, which is what turns those local
+        // transforms into world transforms and joint matrices.
+        //
+        // Nothing about this touches the shader: the animated node transforms
+        // reach it through the joint matrices already bound at b2, and through
+        // PBR_World for an animated node that is not skinned.
+        void UpdateAnimation(float deltaSeconds);
         void Render(std::shared_ptr<DX::DeviceResources> deviceResources, const DirectX::SimpleMath::Matrix &worldMatrix, const DirectX::SimpleMath::Matrix &viewMatrix, const DirectX::SimpleMath::Matrix &projectionMatrix);
         void ShowImgui();
         // Only the sampler heap comes from the caller now. SRV descriptors for
@@ -102,6 +149,8 @@ namespace NeuralModelIntegrateTestbed {
         // destructor returns it to its page.
         std::unique_ptr<Descriptors::DescriptorAllocator> m_srvAllocator;
         std::vector<Descriptors::DescriptorAllocation> m_imageDescriptors;
+        // Filled at the top of PrepareImage, before any texture is created.
+        ImageColorSpaceClassification m_imageColorSpaces;
         // A 1x1 opaque white texture, staged into any material texture slot the
         // material leaves empty. Keeps every descriptor in the five-wide SRV
         // table valid, so the shader can sample unconditionally and branch on
@@ -115,5 +164,18 @@ namespace NeuralModelIntegrateTestbed {
         // together across dynamic-heap switches.
         Descriptors::HeapBinder m_heapBinder;
         float m_position[3] = {3.0f, -2.0f, -4.0f};
+
+        // --- Animation playback ---------------------------------------------
+        // Empty when the asset has no animations, or when the user selects
+        // "none" to see the authored bind pose.
+        std::optional<std::size_t> m_activeAnimation;
+        // Distinguishes "no clip chosen yet" from "the user deliberately chose
+        // the authored pose". Without it an empty selection is indistinguishable
+        // from a fresh start and clip 0 gets re-selected every frame.
+        bool m_animationAutoSelected = false;
+        float m_animationTime = 0.0f;
+        float m_animationSpeed = 1.0f;
+        bool m_animationPlaying = true;
+        bool m_animationLoop = true;
     };
 }

@@ -156,7 +156,18 @@ void DeviceResources::CreateDeviceResources()
             D3D12_MESSAGE_ID_EXECUTECOMMANDLISTS_WRONGSWAPCHAINBUFFERREFERENCE,
             D3D12_MESSAGE_ID_RESOURCE_BARRIER_MISMATCHING_COMMAND_LIST_TYPE,
         };
+        // INFO and MESSAGE are per-object-creation chatter. Left on, they
+        // flood an attached debugger badly enough to stall the app, which makes
+        // diagnosing a real crash impractical. ERROR, WARNING and CORRUPTION
+        // all still come through, and the break-on-severity above is unaffected.
+        D3D12_MESSAGE_SEVERITY denySeverities[] =
+        {
+            D3D12_MESSAGE_SEVERITY_INFO,
+            D3D12_MESSAGE_SEVERITY_MESSAGE,
+        };
         D3D12_INFO_QUEUE_FILTER filter = {};
+        filter.DenyList.NumSeverities = _countof(denySeverities);
+        filter.DenyList.pSeverityList = denySeverities;
         filter.DenyList.NumIDs = _countof(hide);
         filter.DenyList.pIDList = hide;
         d3dInfoQueue->AddStorageFilterEntries(&filter);

@@ -110,6 +110,39 @@ ship both CRT variants, so `third/vcpkg.BUILD` uses `select()` to pick the
 matching one. Mixing them would be a silent CRT mismatch, so prefer these three
 modes over hand-rolled flags.
 
+### Shader debugging in RenderDoc
+
+Shaders are compiled with debug information embedded in the shader container, so
+RenderDoc shows the HLSL source and can step through it with no extra setup --
+no PDB search path and no source path mapping, because `dxc` embeds the source
+text itself alongside the line tables and the original variable names.
+
+`shaders.bzl` passes `-Zi -Qembed_debug` in every compilation mode, and adds
+`-Od` under `-c dbg` only. That last flag is the one that matters for stepping:
+with optimisation on, DXIL reorders instructions and folds locals away, so
+RenderDoc's line highlighting drifts and variables show as optimised out. Use
+`-c dbg` when you intend to debug a shader.
+
+Note `-c dbg` is currently the only mode whose executable runs at all (see
+Rough edges), so in practice it is the mode you capture in.
+
+To confirm a build really carries the information, dump the compiled container:
+
+```bash
+"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe" -T ps_6_0 -E PSStraight -Zi -Qembed_debug -Od -Fo ps.cso Engine/shaders/no_texture.fx
+```
+
+```bash
+"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe" -dumpbin ps.cso
+```
+
+The dump should contain `DILocalVariable` entries and the shader source as a
+metadata string. The same command without `-Zi` has neither.
+
+The cost is container size, about 8 KB to 39 KB per shader for `no_texture.fx`,
+which ends up in the generated `no_texture.h` byte arrays. If that ever matters,
+move `-Zi -Qembed_debug` into the `dbg` branch of `_DXC_DEBUG_FLAGS`.
+
 ## Dependencies
 
 Four different mechanisms, because each library wants something different:

@@ -81,8 +81,9 @@ void Sample::Initialize(HWND window, int width, int height)
     m_effect1->Play(true);
     m_effect2->Play();
 
-    // gltfAdapter.Initialize("resources/microphone_gxl_066_bafhcteks/scene.gltf");
-    m_gltfAdapter.Initialize("resources/TestGLTF/WithTexture.gltf");
+    // m_gltfAdapter.Initialize("resources/microphone_gxl_066_bafhcteks/scene_withlight.gltf");
+    m_gltfAdapter.Initialize("resources/microphone_and_animated_char/scene_withlight_animated_char.gltf");
+    // m_gltfAdapter.Initialize("resources/TestGLTF/WithTexture.gltf");
     m_gltfAdapter.SetCommonStates(m_states);
     m_gltfAdapter.AssignCamera(m_camera);
     m_gltfAdapter.PrepareBuffer(m_deviceResources);
@@ -174,6 +175,10 @@ void Sample::Update(DX::StepTimer const& timer)
     m_lineEffect->SetWorld(Matrix::Identity);
 
     m_shapeEffect->SetView(m_view);
+
+    // Before Render, which composes the posed nodes into world transforms and
+    // the joint matrices the vertex shader skins with.
+    m_gltfAdapter.UpdateAnimation((float)timer.GetElapsedSeconds());
 
     m_audioTimerAcc -= (float)timer.GetElapsedSeconds();
     if (m_audioTimerAcc < 0)
@@ -297,19 +302,6 @@ void Sample::Render()
     m_shapeEffect->SetWorld(local);
     m_shapeEffect->Apply(commandList);
     m_shape->Draw(commandList);
-    PIXEndEvent(commandList);
-
-    // Draw model
-    PIXBeginEvent(commandList, PIX_COLOR_DEFAULT, L"Draw model");
-    const XMVECTORF32 scale = { 0.01f, 0.01f, 0.01f };
-    const XMVECTORF32 translate = { 3.f, -2.f, -4.f };
-    XMVECTOR rotate = Quaternion::CreateFromYawPitchRoll(XM_PI / 2.f, 0.f, -XM_PI / 2.f);
-    local = m_world * XMMatrixTransformation(g_XMZero, Quaternion::Identity, scale, g_XMZero, rotate, translate);
-    Model::UpdateEffectMatrices(m_modelEffects, local, m_view, m_projection);
-    // TODO currently, it's a separate heap, we want to modify it so that all the descriptor heap share the same one so that no descriptor heap need reload
-    heaps[0] = m_modelResources->Heap();
-    commandList->SetDescriptorHeaps(_countof(heaps), heaps);
-    m_model->Draw(commandList, m_modelEffects.begin());
     PIXEndEvent(commandList);
 
     PIXEndEvent(commandList);

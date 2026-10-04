@@ -1,0 +1,250 @@
+{
+    "asset": {
+        "version": "2.0",
+        "generator": "ptflio scratchpad: SkinnedQuad"
+    },
+    "scene": 0,
+    "scenes": [
+        {
+            "name": "SkinnedQuadScene",
+            "nodes": [
+                0
+            ]
+        }
+    ],
+    "nodes": [
+        {
+            "name": "Root",
+            "children": [
+                1,
+                2,
+                3
+            ]
+        },
+        {
+            "name": "Joint0"
+        },
+        {
+            "name": "Joint1",
+            "translation": [
+                0.0,
+                2.0,
+                0.0
+            ]
+        },
+        {
+            "name": "SkinnedQuad",
+            "mesh": 0,
+            "skin": 0
+        }
+    ],
+    "skins": [
+        {
+            "name": "QuadRig",
+            "joints": [
+                1,
+                2
+            ],
+            "inverseBindMatrices": 7
+        }
+    ],
+    "animations": [
+        {
+            "name": "Shear",
+            "channels": [
+                {
+                    "sampler": 0,
+                    "target": {
+                        "node": 2,
+                        "path": "translation"
+                    }
+                }
+            ],
+            "samplers": [
+                {
+                    "input": 8,
+                    "output": 9,
+                    "interpolation": "LINEAR"
+                }
+            ]
+        }
+    ],
+    "meshes": [
+        {
+            "name": "Quad",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 0,
+                        "NORMAL": 1,
+                        "TANGENT": 2,
+                        "TEXCOORD_0": 3,
+                        "JOINTS_0": 4,
+                        "WEIGHTS_0": 5
+                    },
+                    "indices": 6,
+                    "material": 0
+                }
+            ]
+        }
+    ],
+    "materials": [
+        {
+            "name": "QuadMaterial",
+            "doubleSided": true,
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [
+                    0.8,
+                    0.5,
+                    0.2,
+                    1.0
+                ],
+                "metallicFactor": 0.0,
+                "roughnessFactor": 0.6
+            }
+        }
+    ],
+    "accessors": [
+        {
+            "bufferView": 0,
+            "componentType": 5126,
+            "count": 4,
+            "type": "VEC3",
+            "min": [
+                -1.0,
+                0.0,
+                0.0
+            ],
+            "max": [
+                1.0,
+                2.0,
+                0.0
+            ]
+        },
+        {
+            "bufferView": 1,
+            "componentType": 5126,
+            "count": 4,
+            "type": "VEC3"
+        },
+        {
+            "bufferView": 2,
+            "componentType": 5126,
+            "count": 4,
+            "type": "VEC4"
+        },
+        {
+            "bufferView": 3,
+            "componentType": 5126,
+            "count": 4,
+            "type": "VEC2"
+        },
+        {
+            "bufferView": 4,
+            "componentType": 5121,
+            "count": 4,
+            "type": "VEC4"
+        },
+        {
+            "bufferView": 5,
+            "componentType": 5126,
+            "count": 4,
+            "type": "VEC4"
+        },
+        {
+            "bufferView": 6,
+            "componentType": 5123,
+            "count": 6,
+            "type": "SCALAR"
+        },
+        {
+            "bufferView": 7,
+            "componentType": 5126,
+            "count": 2,
+            "type": "MAT4"
+        },
+        {
+            "bufferView": 8,
+            "componentType": 5126,
+            "count": 3,
+            "type": "SCALAR",
+            "min": [
+                0.0
+            ],
+            "max": [
+                2.0
+            ]
+        },
+        {
+            "bufferView": 9,
+            "componentType": 5126,
+            "count": 3,
+            "type": "VEC3"
+        }
+    ],
+    "bufferViews": [
+        {
+            "buffer": 0,
+            "byteOffset": 0,
+            "byteLength": 48,
+            "target": 34962
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 48,
+            "byteLength": 48,
+            "target": 34962
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 96,
+            "byteLength": 64,
+            "target": 34962
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 160,
+            "byteLength": 32,
+            "target": 34962
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 192,
+            "byteLength": 16,
+            "target": 34962
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 208,
+            "byteLength": 64,
+            "target": 34962
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 272,
+            "byteLength": 12,
+            "target": 34963
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 284,
+            "byteLength": 128
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 412,
+            "byteLength": 12
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 424,
+            "byteLength": 36
+        }
+    ],
+    "buffers": [
+        {
+            "byteLength": 460,
+            "uri": "data:application/octet-stream;base64,AACAvwAAAAAAAAAAAACAPwAAAAAAAAAAAACAvwAAAEAAAAAAAACAPwAAAEAAAAAAAAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAAAAAAAAAACAPwAAgD8AAAAAAAAAAAAAgD8AAIA/AAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAACAPwAAAAAAAIA/AACAPwAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAABAAAAAQAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAEAAgACAAEAAwAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAMAAAAAAAACAPwAAAAAAAIA/AAAAQAAAAAAAAABAAAAAAAAAAEAAAIBAAAAAAAAAAAAAAABAAAAAAA=="
+        }
+    ]
+}

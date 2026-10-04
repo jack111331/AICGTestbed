@@ -1,5 +1,8 @@
 #include "pch.h"
 #include "GLTFAdapter.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <sstream>
 #include <memory>
@@ -29,7 +32,10 @@ namespace NeuralModelIntegrateTestbed {
         if (data.error() != fastgltf::Error::None) {
             return data.error();
         }
-        fastgltf::Extensions extensions = fastgltf::Extensions::MYLAB_generative;
+        // KHR_lights_punctual is opt-in: fastgltf leaves Asset::lights empty
+        // and drops every Node::lightIndex unless it is requested here.
+        fastgltf::Extensions extensions = fastgltf::Extensions::MYLAB_generative |
+                                          fastgltf::Extensions::KHR_lights_punctual;
         fastgltf::Parser parser(extensions);
         std::filesystem::path absPath = std::filesystem::absolute(gltfFilepath);
         auto loadedGLTF = parser.loadGltfJson(data.get(), absPath.parent_path(), fastgltf::Options::LoadGLBBuffers | 
@@ -196,12 +202,38 @@ namespace NeuralModelIntegrateTestbed {
     }
 
     void GLTFAdapter::PrepareImage(std::shared_ptr<DX::DeviceResources> deviceResources) {
+        // Decide each image's colour space from the material slots that
+        // reference it, before any texture resource is created.
+        m_imageColorSpaces = ClassifyImageColorSpaces(m_gltf);
+        {
+            std::size_t srgbCount = 0;
+            for (const ImageColorSpace space : m_imageColorSpaces.perImage) {
+                if (space == ImageColorSpace::Srgb) {
+                    ++srgbCount;
+                }
+            }
+            std::printf("glTF images: %zu total, %zu sRGB, %zu linear\n",
+                        m_imageColorSpaces.perImage.size(), srgbCount,
+                        m_imageColorSpaces.perImage.size() - srgbCount);
+            for (const std::size_t imageIdx : m_imageColorSpaces.conflicts) {
+                std::printf("  warning: image %zu is used as both colour and linear "
+                            "data; loaded as sRGB\n", imageIdx);
+            }
+        }
+
+        // Light definitions are shared; how many actually get instanced depends
+        // on the nodes, which BuildSceneGraph resolves later. Printed here
+        // because an asset exported without KHR_lights_punctual is otherwise
+        // indistinguishable from one deliberately lit by nothing.
+        std::printf("glTF lights: %zu definition(s) in the asset\n", m_gltf.lights.size());
+
         auto device = deviceResources->GetD3DDevice();
         ResourceUploadBatch resourceUpload(device);
 
         const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
 
         resourceUpload.Begin();
+        std::size_t imageIndex = 0;
         for (const auto &image: m_gltf.images) {
             // Create staging buffer via GraphicsMemory and upload buffer data via memcpy, save allocation time using paging mechanism
             // https://github.com/microsoft/DirectXTK12/blob/f003171e0c6a30cc61444864ef756bd3cf2fc310/Src/GraphicsMemory.cpp#L126
@@ -263,7 +295,23 @@ namespace NeuralModelIntegrateTestbed {
                 },
             }, image.data);
 
-            const auto desc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, width, height);
+            // CD3DX12_RESOURCE_DESC::Tex2D defaults mipLevels to 0, which means
+            // "allocate the full chain" -- a 1024x1024 image gets 11 mips. Only
+            // subresource 0 is uploaded below, so the other 10 were left
+            // uninitialised and sampled as black, which is why the model got
+            // darker with distance as the sampler selected higher mips.
+            //
+            // Ask for the full chain only when the mips can actually be filled;
+            // otherwise take a single level, so there is never an uninitialised
+            // mip to sample either way.
+            const ImageColorSpace colorSpace = m_imageColorSpaces.perImage[imageIndex];
+            const DXGI_FORMAT imageFormat = (colorSpace == ImageColorSpace::Srgb)
+                                                ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                                                : DXGI_FORMAT_R8G8B8A8_UNORM;
+            const bool canGenerateMips =
+                resourceUpload.IsSupportedForGenerateMips(imageFormat);
+            const UINT16 mipLevels = canGenerateMips ? 0 : 1;
+            const auto desc = CD3DX12_RESOURCE_DESC::Tex2D(imageFormat, width, height, 1, mipLevels);
 
             // TODO get image data size from image.data
             Microsoft::WRL::ComPtr<ID3D12Resource> createdTexture;
@@ -297,6 +345,19 @@ namespace NeuralModelIntegrateTestbed {
             resourceUpload.Transition(createdTexture.Get(),
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+            // Fills mips 1..N from mip 0 on the GPU. Must come after the
+            // transition above: GenerateMips requires the resource to already be
+            // in PIXEL_SHADER_RESOURCE, and it restores that state when done.
+            //
+            // sRGB cannot have a UAV created on it directly, so DirectXTK12
+            // routes this through a non-sRGB alias internally; nothing extra is
+            // needed here beyond the format check.
+            if (canGenerateMips) {
+                resourceUpload.GenerateMips(createdTexture.Get());
+            }
+
+            ++imageIndex;
         }
 
         // The fallback that fills unused material texture slots. Created here so
@@ -342,16 +403,65 @@ namespace NeuralModelIntegrateTestbed {
         // first if the asset does not name one.
         m_currentSceneIdx = m_gltf.defaultScene.value_or(0);
         m_sceneGraph.Build(m_gltf, m_currentSceneIdx, buffers, m_imageDescriptors.size());
+
+        // Skins degrade rather than fail -- a missing attribute or an unreadable
+        // bind matrix still renders, just wrongly -- so report what was found
+        // and anything suspect about it.
+        const auto &skins = m_sceneGraph.Skins();
+        if (!skins.empty()) {
+            std::printf("glTF skins: %zu\n", skins.size());
+            for (const auto &skin : skins) {
+                std::printf("  \"%s\": %zu joints, inverse bind matrices %s\n",
+                            skin.name.c_str(), skin.JointCount(),
+                            skin.inverseBindMatricesLoaded ? "loaded"
+                                                           : "substituted (identity)");
+            }
+        }
+        const auto &animations = m_sceneGraph.Animations();
+        if (!animations.empty()) {
+            std::printf("glTF animations: %zu\n", animations.size());
+            for (const auto &animation : animations) {
+                std::printf("  \"%s\": %.3fs, %zu channels, %zu samplers",
+                            animation.name.c_str(), animation.duration,
+                            animation.channels.size(), animation.samplers.size());
+                if (animation.skippedChannels != 0) {
+                    std::printf(" (%zu channel(s) skipped: unsupported target)",
+                                animation.skippedChannels);
+                }
+                std::printf("\n");
+            }
+        }
+        for (const auto &diagnostic : m_sceneGraph.SkinDiagnostics()) {
+            if (diagnostic.nodeIndex.has_value()) {
+                std::printf("  warning: skin %zu, node %zu: %s\n", diagnostic.skinIndex,
+                            diagnostic.nodeIndex.value(), ToString(diagnostic.issue));
+            } else {
+                std::printf("  warning: skin %zu: %s\n", diagnostic.skinIndex,
+                            ToString(diagnostic.issue));
+            }
+        }
     }
 
     void GLTFAdapter::PreparePSO(std::shared_ptr<DX::DeviceResources> deviceResources) {
         auto device = deviceResources->GetD3DDevice();
-        // TODO TexCoord0's AlignedByteOffset not determined
-        D3D12_INPUT_ELEMENT_DESC inputElementDesc[2] = {{ "Position", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-                                                        { "TexCoord", 0, DXGI_FORMAT_R32G32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }};
+        // One slot per VertexStream, in that order; must match VSInput in
+        // shaders/no_texture.fx. Each attribute lives in its own buffer slot
+        // rather than being interleaved, so AlignedByteOffset stays 0.
+        D3D12_INPUT_ELEMENT_DESC inputElementDesc[kVertexStreamCount] = {
+            { "Position", 0, DXGI_FORMAT_R32G32B32_FLOAT, static_cast<UINT>(VertexStream::Position), 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TexCoord", 0, DXGI_FORMAT_R32G32_FLOAT,    static_cast<UINT>(VertexStream::TexCoord0), 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "Normal",   0, DXGI_FORMAT_R32G32B32_FLOAT, static_cast<UINT>(VertexStream::Normal),    0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            // 4 components: glTF TANGENT carries the bitangent handedness in w.
+            { "Tangent",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, static_cast<UINT>(VertexStream::Tangent), 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            // Formats come from the asset, because the vertex buffers are its
+            // own bytes bound directly: glTF allows JOINTS_0 as unsigned byte or
+            // short and WEIGHTS_0 as float or normalised integer, and this
+            // single PSO has to declare whichever one this asset used.
+            { "Joints",   0, m_sceneGraph.JointIndexFormat(),  static_cast<UINT>(VertexStream::Joints0),  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "Weights",  0, m_sceneGraph.JointWeightFormat(), static_cast<UINT>(VertexStream::Weights0), 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }};
 
         D3D12_INPUT_LAYOUT_DESC inputLayoutDesc = {};
-        inputLayoutDesc.NumElements = 2;
+        inputLayoutDesc.NumElements = static_cast<UINT>(kVertexStreamCount);
         inputLayoutDesc.pInputElementDescs = inputElementDesc;
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
@@ -393,7 +503,8 @@ namespace NeuralModelIntegrateTestbed {
             //           normal, occlusion, emissive)
             //   s0  sampler
             //   b1  per-primitive material constants
-            CD3DX12_ROOT_PARAMETER1 rootParameters[4] = {};
+            //   b2  per-node joint matrices (skinning)
+            CD3DX12_ROOT_PARAMETER1 rootParameters[5] = {};
 
             rootParameters[0].InitAsConstantBufferView(0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE, D3D12_SHADER_VISIBILITY_ALL);
             const CD3DX12_DESCRIPTOR_RANGE1 materialTextureRange(
@@ -407,6 +518,10 @@ namespace NeuralModelIntegrateTestbed {
             // Visibility ALL, matching the HLSL "CBV(b1)" which defaults to ALL;
             // a narrower visibility here would not match the shader's copy.
             rootParameters[3].InitAsConstantBufferView(1, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE, D3D12_SHADER_VISIBILITY_ALL);
+            // Vertex-only: skinning happens before rasterisation, so the pixel
+            // shader never needs the joint matrices. Narrowing it here is safe
+            // because the shader's own copy says VERTEX too.
+            rootParameters[4].InitAsConstantBufferView(2, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE, D3D12_SHADER_VISIBILITY_VERTEX);
 
             D3D12_ROOT_SIGNATURE_DESC1 rsigDesc = {};
             rsigDesc.NumParameters = static_cast<UINT>(std::size(rootParameters));
@@ -467,7 +582,7 @@ namespace NeuralModelIntegrateTestbed {
         // The setting of pRootSignature through Set*RootSignature() is like holding CPU and GPU function signature along with their constant buffer, texture binding so that when swithcing PSO or partial resources, the other binding doesn't change
         // While the creation of PSO with pRootSignature is like providing hardware and driver info to optimize shader compilation
         // https://learn.microsoft.com/en-us/windows/win32/direct3d12/root-signatures-overview
-        float blendFactor[4] = {1.0, 1.0, 1.0, 1.0};
+        float blendFactor[4] = {0.0, 0.0, 0.0, 0.0};
         commandList->OMSetBlendFactor(blendFactor); // Set null means (1, 1, 1, 1)
         
         commandList->OMSetRenderTargets(1, &deviceResources->GetRenderTargetView(), false, &deviceResources->GetDepthStencilView());
@@ -517,16 +632,44 @@ namespace NeuralModelIntegrateTestbed {
         // matrix every mesh was drawn with.
         const XMVECTORF32 scale = { 1.0f, 1.0f, 1.0f };
         const XMVECTORF32 translate = { m_position[0], m_position[1], m_position[2] };
-        XMVECTOR rotate = DirectX::SimpleMath::Quaternion::CreateFromYawPitchRoll(XM_PI / 2.f, 0.f, -XM_PI / 2.f);
-        XMMATRIX placement = worldMatrix * XMMatrixTransformation(g_XMZero, DirectX::SimpleMath::Quaternion::Identity, scale, g_XMZero, rotate, translate);
+        XMVECTOR rotate = DirectX::SimpleMath::Quaternion::CreateFromYawPitchRoll(.0f, 0.f, .0f);
+        XMMATRIX placement = XMMatrixTransformation(g_XMZero, DirectX::SimpleMath::Quaternion::Identity, scale, g_XMZero, rotate, translate);
 
         // Top-down pass: each node's world transform is its local transform
         // composed with its parent's, and hidden subtrees drop out of the draw
         // order here rather than being tested per draw.
         m_sceneGraph.UpdateTransforms(placement);
+
+        // Lights are a property of the scene, not of a node, so they are packed
+        // once and copied into every node's constant buffer. UpdateTransforms
+        // above has just placed them, so this has to follow it.
+        ShaderLight frameLights[kMaxShaderLights] = {};
+        const std::size_t lightCount =
+            m_sceneGraph.GatherShaderLights(frameLights, kMaxShaderLights);
+
+        // b2 has to be bound for every draw, skinned or not: the vertex shader
+        // declares the cbuffer unconditionally, and reading an unbound root CBV
+        // is undefined. Unskinned nodes share this one all-identity allocation
+        // rather than each paying for 8 KB of identities.
+        SharedGraphicsResource identityJoints =
+            GraphicsMemory::Get(device).AllocateConstant<JointMatrixConstants>();
+        {
+            auto *joints = static_cast<JointMatrixConstants *>(identityJoints.Memory());
+            for (std::size_t j = 0; j < kMaxJointMatrices; ++j) {
+                joints->joints[j] = XMMatrixIdentity();
+            }
+        }
+        std::vector<DirectX::SimpleMath::Matrix> jointMatrices;
         // One constant buffer per node, because each now carries its own world
-        // matrix. SharedGraphicsResource keeps every allocation alive until
-        // GraphicsMemory::Commit runs at the end of the frame.
+        // matrix.
+        //
+        // NOTE: nothing in this project calls GraphicsMemory::Commit(), which is
+        // what retires allocator pages against a fence. Measured over 45 s the
+        // working set is stable, so this is not a leak -- pages are being
+        // recycled -- but recycling without the fence is what Commit() exists to
+        // prevent, so a page could in principle be reused while the GPU is still
+        // reading it. Pre-existing and never observed to misbehave; flagged
+        // rather than changed.
         for (const std::size_t nodeIndex : m_sceneGraph.DrawOrder()) {
             const SceneNode &node = m_sceneGraph.Nodes()[nodeIndex];
 
@@ -534,15 +677,53 @@ namespace NeuralModelIntegrateTestbed {
 
             PBREffectConstants pbrEffectConstant = {};
             pbrEffectConstant.eyePosition = m_camera->mEye;
-            pbrEffectConstant.world = node.worldTransform;
+
+            // World and world-inverse-transpose, in the byte order HLSL's
+            // column-major cbuffer read expects. Both were wrong before:
+            // `world` went in untransposed, and worldInverseTranspose was never
+            // written at all, so VSOutput::WorldPosition was garbage and
+            // WorldNormal was zero. Nothing consumed either -- the pixel shader
+            // returned base colour -- but the lights below are in world space,
+            // so the shading about to be written needs them both.
+            PackWorldMatrices(node.worldTransform, pbrEffectConstant.world,
+                              pbrEffectConstant.worldInverseTranspose);
+
             pbrEffectConstant.worldViewProj = XMMatrixTranspose(
                 XMMatrixMultiply(XMMatrixMultiply(node.worldTransform, viewMatrix), projectionMatrix));
+
+            std::memcpy(pbrEffectConstant.lights, frameLights, sizeof(frameLights));
+            pbrEffectConstant.lightCount = static_cast<int>(lightCount);
             // NOTE: Set*Root* only set BufferLocation instead of SizeInBytes, which may cause GPU to crash if shader access data out of bound
             // Therefore, it's suitable for frequently changing resource.
             // https://gamedev.net/forums/topic/678623-d3d12-using-setgraphicsrootview-functions/#post-5291945
             SharedGraphicsResource cBufferResource =
                 GraphicsMemory::Get(device).AllocateConstant(pbrEffectConstant);
             commandList->SetGraphicsRootConstantBufferView(0, cBufferResource.GpuAddress());
+
+            // Joint matrices are per (skin, node): the formula divides out this
+            // node's world transform, so two nodes sharing a skin do not share
+            // matrices. Computed here rather than in UpdateTransforms so an
+            // unskinned scene pays nothing.
+            D3D12_GPU_VIRTUAL_ADDRESS jointsAddress = identityJoints.GpuAddress();
+            SharedGraphicsResource nodeJoints;
+            if (node.IsSkinned() && m_sceneGraph.ComputeJointMatrices(nodeIndex, jointMatrices)) {
+                nodeJoints =
+                    GraphicsMemory::Get(device).AllocateConstant<JointMatrixConstants>();
+                auto *joints = static_cast<JointMatrixConstants *>(nodeJoints.Memory());
+                const std::size_t count = std::min(jointMatrices.size(), kMaxJointMatrices);
+                for (std::size_t j = 0; j < count; ++j) {
+                    // Transposed for the same reason PBR_World is: HLSL reads
+                    // cbuffer matrices column-major.
+                    joints->joints[j] = XMMatrixTranspose(jointMatrices[j]);
+                }
+                // A skin larger than the array is reported by SceneGraph; the
+                // remainder stays identity so an out-of-range index is harmless.
+                for (std::size_t j = count; j < kMaxJointMatrices; ++j) {
+                    joints->joints[j] = XMMatrixIdentity();
+                }
+                jointsAddress = nodeJoints.GpuAddress();
+            }
+            commandList->SetGraphicsRootConstantBufferView(4, jointsAddress);
 
             for (const PrimitiveResource &primitive : node.primitives) {
                 // Per-primitive material factors at b1.
@@ -571,7 +752,8 @@ namespace NeuralModelIntegrateTestbed {
                 // sampler heap, which the binder keeps bound.
                 commandList->SetGraphicsRootDescriptorTable(2, m_commonStates->AnisotropicWrap());
 
-                commandList->IASetVertexBuffers(0, 2, primitive.vertexBufferViews);
+                commandList->IASetVertexBuffers(0, static_cast<UINT>(kVertexStreamCount),
+                                                primitive.vertexBufferViews);
                 commandList->IASetIndexBuffer(&primitive.indexBufferView);
 
                 m_srvDynamicHeap->CommitStagedDescriptorsForDraw(commandList.Get(), m_heapBinder);
@@ -586,9 +768,123 @@ namespace NeuralModelIntegrateTestbed {
 
     }
 
+    void GLTFAdapter::UpdateAnimation(float deltaSeconds) {
+        const auto &animations = m_sceneGraph.Animations();
+        if (animations.empty()) {
+            return;
+        }
+
+        // Pick the first clip once, so an animated asset moves without the UI
+        // being touched. After that an empty selection means the user asked for
+        // the authored pose, and must be left alone.
+        if (!m_animationAutoSelected) {
+            m_animationAutoSelected = true;
+            m_activeAnimation = 0;
+            m_animationTime = 0.0f;
+        }
+        if (!m_activeAnimation.has_value()) {
+            return;
+        }
+        if (m_activeAnimation.value() >= animations.size()) {
+            m_activeAnimation = 0;
+        }
+
+        const SceneAnimation &animation = animations[m_activeAnimation.value()];
+
+        if (m_animationPlaying && animation.duration > 0.0f) {
+            m_animationTime += deltaSeconds * m_animationSpeed;
+            if (m_animationLoop) {
+                // fmod keeps a negative speed working too, where plain
+                // subtraction would walk off the start of the timeline.
+                m_animationTime = std::fmod(m_animationTime, animation.duration);
+                if (m_animationTime < 0.0f) {
+                    m_animationTime += animation.duration;
+                }
+            } else {
+                m_animationTime = std::min(m_animationTime, animation.duration);
+            }
+        }
+
+        // Poses the nodes. Render's UpdateTransforms then composes them and
+        // ComputeJointMatrices turns the joints into the b2 matrices.
+        m_sceneGraph.ApplyAnimation(m_activeAnimation.value(), m_animationTime);
+    }
+
     void GLTFAdapter::ShowImgui() {
         ImGui::SliderFloat3("GLTF position", m_position, -10.0, 10.0);
         ImGui::Separator();
+        if (ImGui::CollapsingHeader("Animation", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const auto &animations = m_sceneGraph.Animations();
+            if (animations.empty()) {
+                ImGui::TextUnformatted("This asset has no animations.");
+            } else {
+                // "none" restores the authored pose, which is the only way to
+                // see the bind pose once playback has started.
+                const char *current = m_activeAnimation.has_value()
+                                          ? animations[m_activeAnimation.value()].name.c_str()
+                                          : "(none -- authored pose)";
+                if (ImGui::BeginCombo("Clip", current)) {
+                    if (ImGui::Selectable("(none -- authored pose)",
+                                          !m_activeAnimation.has_value())) {
+                        m_activeAnimation.reset();
+                        m_sceneGraph.ResetToBasePose();
+                    }
+                    for (std::size_t i = 0; i < animations.size(); ++i) {
+                        const bool selected = m_activeAnimation.has_value() &&
+                                              m_activeAnimation.value() == i;
+                        if (ImGui::Selectable(animations[i].name.c_str(), selected)) {
+                            m_activeAnimation = i;
+                            m_animationTime = 0.0f;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                if (m_activeAnimation.has_value()) {
+                    const SceneAnimation &animation = animations[m_activeAnimation.value()];
+                    ImGui::Checkbox("Play", &m_animationPlaying);
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Loop", &m_animationLoop);
+                    ImGui::SliderFloat("Speed", &m_animationSpeed, -2.0f, 2.0f);
+                    // Scrubbing while paused is the useful case; dragging while
+                    // playing just gets overwritten on the next frame.
+                    if (ImGui::SliderFloat("Time", &m_animationTime, 0.0f,
+                                           animation.duration > 0.0f ? animation.duration
+                                                                     : 1.0f)) {
+                        m_sceneGraph.ApplyAnimation(m_activeAnimation.value(),
+                                                    m_animationTime);
+                    }
+                    ImGui::Text("%.3f / %.3f s, %zu channels", m_animationTime,
+                                animation.duration, animation.channels.size());
+                    if (animation.skippedChannels != 0) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                                           "%zu channel(s) skipped (morph weights "
+                                           "are not supported)",
+                                           animation.skippedChannels);
+                    }
+                }
+            }
+        }
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Textures")) {
+            const auto &spaces = m_imageColorSpaces.perImage;
+            std::size_t srgbCount = 0;
+            for (const ImageColorSpace space : spaces) {
+                if (space == ImageColorSpace::Srgb) {
+                    ++srgbCount;
+                }
+            }
+            ImGui::Text("%zu images: %zu sRGB, %zu linear", spaces.size(), srgbCount,
+                        spaces.size() - srgbCount);
+            if (!m_imageColorSpaces.conflicts.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                                   "%zu image(s) used as both colour and linear data",
+                                   m_imageColorSpaces.conflicts.size());
+            }
+            for (std::size_t i = 0; i < spaces.size(); ++i) {
+                ImGui::Text("  image %zu: %s", i, ToString(spaces[i]));
+            }
+        }
         if (ImGui::CollapsingHeader("Scene hierarchy", ImGuiTreeNodeFlags_DefaultOpen)) {
             m_sceneGraph.DrawHierarchyUI();
         }
