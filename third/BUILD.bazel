@@ -2,7 +2,7 @@
 # to new_local_repository in MODULE.bazel (vcpkg.BUILD, fastgltf.BUILD), and the
 # targets below for dependencies that need no external repo at all.
 
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
 
 # DirectML needs no download and no vcpkg port -- vcpkg has none. Everything
 # comes from what is already on the toolchain's search paths:
@@ -36,6 +36,68 @@ cc_library(
         "-DEFAULTLIB:dxguid.lib",
     ],
     target_compatible_with = ["@platforms//os:windows"],
+    visibility = ["//visibility:public"],
+)
+
+# ---------------------------------------------------------------------------
+# ONNX Runtime with the DirectML execution provider.
+#
+# Vendored from the Microsoft.ML.OnnxRuntime.DirectML 1.24.4 NuGet package
+# (third/onnxruntime/), because the vcpkg onnxruntime port CANNOT build this EP:
+# its portfile maps `directml -> onnxruntime_USE_DML` but no `directml` feature
+# is declared in its vcpkg.json, so the mapping can never activate. The only
+# alternatives were this redist or a from-source build with --use_dml.
+#
+# Why this rather than only translating ONNX by hand (see Engine/OnnxModel.cc):
+# the DML EP takes OUR IDMLDevice and OUR ID3D12CommandQueue via
+# OrtDmlApi::SessionOptionsAppendExecutionProvider_DML1, and binds OUR
+# ID3D12Resource into an Ort::Value through CreateGPUAllocationFromD3DResource
+# with no copy. Because its work is submitted to the same queue, it is ordered
+# against the renderer's submissions without any fence, and Run() does not stall
+# the CPU. It records onto its own command lists rather than one we pass in,
+# which is the only behavioural difference from the hand-translated path.
+#
+# DirectML.dll is NOT in this package: onnxruntime.dll imports it and resolves
+# against the in-box %WINDIR%\System32\DirectML.dll. The package declares a
+# dependency on Microsoft.AI.DirectML 1.15.4 and the in-box copy on this machine
+# is 1.15.5, so it satisfies it. A machine with an older in-box DirectML would
+# need that redist as well -- check with
+# `(Get-Item C:\Windows\System32\DirectML.dll).VersionInfo.FileVersion`.
+#
+# NOTE this is a RELEASE-only binary, built with /MD, and it is used in -c dbg
+# too where Bazel compiles with /MDd. That is safe here, unlike the vcpkg
+# packages which ship both variants: onnxruntime exposes a flat C ABI and the
+# C++ header is only inline wrappers over it, so no CRT-owned object ever
+# crosses the DLL boundary.
+# ---------------------------------------------------------------------------
+
+cc_import(
+    name = "onnxruntime_prebuilt",
+    interface_library = "onnxruntime/lib/onnxruntime.lib",
+    shared_library = "onnxruntime/bin/onnxruntime.dll",
+)
+
+cc_library(
+    name = "onnxruntime",
+    hdrs = glob(["onnxruntime/include/*.h"]),
+    # dml_provider_factory.h needs the D3D12 and DirectML declarations, which
+    # come from the Windows SDK via //third:directml.
+    includes = ["onnxruntime/include"],
+    target_compatible_with = ["@platforms//os:windows"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":directml",
+        ":onnxruntime_prebuilt",
+    ],
+)
+
+# onnxruntime_providers_shared.dll is loaded by name at run time when an EP
+# lives in its own module. The DirectML EP is built into onnxruntime.dll, so
+# nothing links against this -- it is staged only so a future EP that does need
+# it finds it beside the executable.
+filegroup(
+    name = "onnxruntime_runtime_files",
+    srcs = ["onnxruntime/bin/onnxruntime_providers_shared.dll"],
     visibility = ["//visibility:public"],
 )
 

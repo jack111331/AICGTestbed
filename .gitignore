@@ -28,6 +28,16 @@
 /third/vcpkg_installed/
 
 # ---------------------------------------------------------------------------
+# ONNX Runtime (DirectML build)
+# ---------------------------------------------------------------------------
+
+# Vendored from the Microsoft.ML.OnnxRuntime.DirectML NuGet package by
+# `python third/fetch_onnxruntime.py`. 18 MB, almost all of it onnxruntime.dll,
+# and the script pins the exact version -- so it is reproducible without
+# committing a binary into history. See README.md.
+/third/onnxruntime/
+
+# ---------------------------------------------------------------------------
 # Generated / runtime files
 # ---------------------------------------------------------------------------
 

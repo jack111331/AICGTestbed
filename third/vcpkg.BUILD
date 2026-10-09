@@ -62,6 +62,12 @@ cc_library(
             "include/imstb_*.h",
             "include/simdjson.h",
             "include/stb_*.h",
+            # onnx and its protobuf/abseil dependencies, owned by :onnx below.
+            "include/absl/**",
+            "include/google/**",
+            "include/onnx/**",
+            "include/utf8_range.h",
+            "include/utf8_validity.h",
         ],
     ),
     # Mirrors DirectXTK12-targets.cmake:
@@ -169,6 +175,109 @@ cc_library(
     ],
     target_compatible_with = ["@platforms//os:windows"],
     deps = [":imgui_prebuilt"],
+)
+
+# ---------------------------------------------------------------------------
+# ONNX -- the protobuf schema and checker only, NOT a runtime.
+#
+# This is what lets Engine/OnnxModel.cc read a .onnx file; the graph is then
+# translated into DirectML expressions by hand, so model work still records
+# into the renderer's command list. ONNX Runtime would own execution instead
+# and could not do that.
+#
+# The port builds protobuf and abseil as DLLs, which is why protobuf needs
+# PROTOBUF_USE_DLLS (without it the headers declare symbols without
+# __declspec(dllimport) and the link fails on protobuf globals) and why both
+# appear as cc_import with a shared_library, so Bazel stages the DLLs next to
+# the executable. onnx itself is static.
+#
+# ONNX_ML=1 is not optional here: the port installs only onnx-ml.pb.h, and
+# onnx_pb.h includes onnx.pb.h without it. Both defines mirror
+# share/onnx/ONNXTargets.cmake's INTERFACE_COMPILE_DEFINITIONS.
+# ---------------------------------------------------------------------------
+
+cc_import(
+    name = "protobuf_prebuilt",
+    interface_library = select({
+        ":dbg_build": "debug/lib/libprotobufd.lib",
+        "//conditions:default": "lib/libprotobuf.lib",
+    }),
+    shared_library = select({
+        ":dbg_build": "debug/bin/libprotobufd.dll",
+        "//conditions:default": "bin/libprotobuf.dll",
+    }),
+)
+
+cc_import(
+    name = "abseil_prebuilt",
+    interface_library = select({
+        ":dbg_build": "debug/lib/abseil_dll.lib",
+        "//conditions:default": "lib/abseil_dll.lib",
+    }),
+    shared_library = select({
+        ":dbg_build": "debug/bin/abseil_dll.dll",
+        "//conditions:default": "bin/abseil_dll.dll",
+    }),
+)
+
+cc_import(
+    name = "onnx_prebuilt",
+    static_library = select({
+        ":dbg_build": "debug/lib/onnx.lib",
+        "//conditions:default": "lib/onnx.lib",
+    }),
+)
+
+cc_import(
+    name = "onnx_proto_prebuilt",
+    static_library = select({
+        ":dbg_build": "debug/lib/onnx_proto.lib",
+        "//conditions:default": "lib/onnx_proto.lib",
+    }),
+)
+
+cc_import(
+    name = "utf8_range_prebuilt",
+    static_library = select({
+        ":dbg_build": "debug/lib/utf8_range.lib",
+        "//conditions:default": "lib/utf8_range.lib",
+    }),
+)
+
+cc_import(
+    name = "utf8_validity_prebuilt",
+    static_library = select({
+        ":dbg_build": "debug/lib/utf8_validity.lib",
+        "//conditions:default": "lib/utf8_validity.lib",
+    }),
+)
+
+cc_library(
+    name = "onnx",
+    hdrs = glob([
+        "include/onnx/**/*.h",
+        "include/google/**/*.h",
+        "include/google/**/*.inc",
+        "include/absl/**/*.h",
+        "include/absl/**/*.inc",
+        "include/utf8_range.h",
+        "include/utf8_validity.h",
+    ]),
+    defines = [
+        "ONNX_NAMESPACE=onnx",
+        "ONNX_ML=1",
+        "PROTOBUF_USE_DLLS",
+    ],
+    includes = ["include"],
+    target_compatible_with = ["@platforms//os:windows"],
+    deps = [
+        ":abseil_prebuilt",
+        ":onnx_prebuilt",
+        ":onnx_proto_prebuilt",
+        ":protobuf_prebuilt",
+        ":utf8_range_prebuilt",
+        ":utf8_validity_prebuilt",
+    ],
 )
 
 # ---------------------------------------------------------------------------

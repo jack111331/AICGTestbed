@@ -72,13 +72,34 @@ That populates `third/vcpkg_installed/` (git-ignored, ~90 MB) with directxtk12
 and imgui. `third/vcpkg-configuration.json` pins the registry baseline, so the
 result is reproducible.
 
-### 2. Build
+### 2. Fetch ONNX Runtime (DirectML build)
+
+```bash
+python third/fetch_onnxruntime.py
+```
+
+Writes `third/onnxruntime/` (18 MB, gitignored) from the
+Microsoft.ML.OnnxRuntime.DirectML NuGet package, pinned to a version in the
+script. Needed by `//third:onnxruntime`, which the `ModelManager` ONNX Runtime
+backend uses.
+
+This is vendored rather than taken from vcpkg because **the vcpkg
+`onnxruntime` port cannot build the DirectML execution provider**: its portfile
+maps `directml -> onnxruntime_USE_DML`, but no `directml` feature is declared in
+its `vcpkg.json`, so the mapping never activates. The only other route is a
+from-source build with `--use_dml`.
+
+`DirectML.dll` is not fetched: `onnxruntime.dll` imports it and resolves against
+the in-box `%WINDIR%\System32\DirectML.dll`. The script checks that copy is at
+least the 1.15.4 the package was built against, and says so if it is not.
+
+### 3. Build
 
 ```bash
 bazelisk build //...
 ```
 
-### 3. Run
+### 4. Run
 
 ```bash
 bazelisk run //Engine:hello-world

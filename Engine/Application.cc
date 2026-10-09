@@ -20,6 +20,11 @@
 extern void ExitSample() noexcept;
 
 using namespace DirectX;
+
+// The model ModelManager registers at startup and RecordModelDispatch runs each
+// frame. One constant so the two cannot disagree -- a typo would simply stop
+// dispatching, silently.
+static constexpr const char* kNeuralModelName = "FloodDiffusion";
 using namespace DirectX::SimpleMath;
 
 using Microsoft::WRL::ComPtr;
@@ -92,7 +97,40 @@ void Sample::Initialize(HWND window, int width, int height)
     m_gltfAdapter.PreparePSO(m_deviceResources);
 
     m_nnModelManager.Initialize(m_deviceResources);
-    m_nnModelManager.AddNewModel(m_deviceResources);
+    {
+        // Models are registered by name and dispatched by that name, so adding
+        // a second one is another AddModel / AddOnnxModel call rather than a
+        // change to ModelManager.
+        std::string modelError;
+        if (!m_nnModelManager.AddModel(
+                std::make_unique<NeuralModelIntegrateTestbed::FloodDiffusionNNModel>(
+                    kNeuralModelName),
+                &modelError)) {
+            std::printf("model '%s' failed to load: %s\n", kNeuralModelName,
+                        modelError.c_str());
+        }
+
+        // An ONNX file is registered the same way when one is present; absence
+        // is not an error, since the repo ships no .onnx by default.
+        //
+        // ONNX Runtime's DirectML EP is the default backend: it has full
+        // operator coverage, runs on this project's own device and queue, and
+        // Run() records without stalling. The DirectMLGraph backend is still
+        // there for a graph you want recorded into the render command list, or
+        // for operators you want to express yourself.
+        const std::filesystem::path onnxPath = "resources/Models/test.onnx";
+        if (std::filesystem::exists(onnxPath)) {
+            std::string onnxError;
+            if (m_nnModelManager.AddOnnxModel("test.onnx", onnxPath,
+                                              NeuralModelIntegrateTestbed::ModelBackend::OnnxRuntime,
+                                              &onnxError)) {
+                std::printf("loaded ONNX model 'test.onnx' (ONNX Runtime)\n");
+            } else {
+                std::printf("ONNX model '%s' failed to load: %s\n",
+                            onnxPath.string().c_str(), onnxError.c_str());
+            }
+        }
+    }
 
     // Setup Dear ImGui context
     ImGui_ImplWin32_EnableDpiAwareness();
@@ -328,6 +366,7 @@ void Sample::Render()
 
         ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
         m_gltfAdapter.ShowImgui();
+        m_nnModelManager.ShowImgui();
 
         ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
         ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
@@ -356,7 +395,10 @@ void Sample::Render()
     commandList->SetDescriptorHeaps(1, &m_imguiSrvDescHeap);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
-    m_nnModelManager.RecordModelDispatch(commandList);
+    // Dispatched by name. An unregistered name records nothing and returns
+    // false rather than asserting, so a model that failed to load does not
+    // take the frame down with it.
+    m_nnModelManager.RecordModelDispatch(commandList, kNeuralModelName);
     // commandList->Close();
 
     // m_deviceResources->GetCommandQueue()->ExecuteCommandLists(1, CommandListCast(&commandList));

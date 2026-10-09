@@ -125,22 +125,58 @@ cc_library(
     ],
 )
 
+cc_binary(
+    name = "modelmanager-smoke",
+    srcs = ["modelmanager-smoke.cc"],
+    deps = [
+        ":DeviceResources",
+        ":ModelManager",
+        ":pch",
+        "@vcpkg_directxtk12//:onnx",
+    ],
+)
+
+cc_binary(
+    name = "ortdml-smoke",
+    srcs = ["ortdml-smoke.cc"],
+    deps = [
+        ":pch",
+        "//third:onnxruntime",
+        "@vcpkg_directxtk12//:onnx",
+    ],
+)
+
+cc_binary(
+    name = "onnx-smoke",
+    srcs = ["onnx-smoke.cc"],
+    deps = ["@vcpkg_directxtk12//:onnx"],
+)
+
 cc_library(
     name = "ModelManager",
     srcs = [
         "ModelManager.cc",
+        "OnnxModel.cc",
+        "OrtModel.cc",
     ],
     hdrs = [
-        "ModelManager.hpp",
         "DirectMLX.h",
+        "ModelManager.hpp",
+        "OnnxModel.hpp",
+        "OrtModel.hpp",
     ],
     defines = SAMPLE_DEFINES,
-    # GLTFAdapter.hpp includes DeviceResources.hpp and holds
-    # ComPtr<ID3D12Resource> members; GLTFAdapter.cc includes pch.h.
     deps = [
         ":DeviceResources",
         ":Descriptors",
         ":pch",
+        # The ONNX protobuf schema, for OnnxModel.cc. Only the schema -- the
+        # graph is translated to DirectML here rather than run by ONNX Runtime.
+        "@vcpkg_directxtk12//:onnx",
+        # ShowImgui lists the registered models.
+        "@vcpkg_directxtk12//:imgui",
+        # ONNX Runtime with the DirectML EP, for the OnnxRuntime backend.
+        "//third:onnxruntime",
     ],
 )
 
