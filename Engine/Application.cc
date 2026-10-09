@@ -91,6 +91,9 @@ void Sample::Initialize(HWND window, int width, int height)
     m_gltfAdapter.BuildSceneGraph();
     m_gltfAdapter.PreparePSO(m_deviceResources);
 
+    m_nnModelManager.Initialize(m_deviceResources);
+    m_nnModelManager.AddNewModel(m_deviceResources);
+
     // Setup Dear ImGui context
     ImGui_ImplWin32_EnableDpiAwareness();
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
@@ -352,6 +355,8 @@ void Sample::Render()
     commandList->OMSetRenderTargets(1, &m_deviceResources->GetRenderTargetView(), FALSE, nullptr);
     commandList->SetDescriptorHeaps(1, &m_imguiSrvDescHeap);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
+
+    m_nnModelManager.RecordModelDispatch(commandList);
     // commandList->Close();
 
     // m_deviceResources->GetCommandQueue()->ExecuteCommandLists(1, CommandListCast(&commandList));

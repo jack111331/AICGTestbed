@@ -89,6 +89,12 @@
 #include "SpriteFont.h" 
 #include "VertexTypes.h"
 
+// DML_TARGET_VERSION_USE_LATEST is supplied by //third:directml's `defines`,
+// which :pch depends on, so it is already set on the command line before this
+// header is read. Defining it here as well is a C4005 redefinition; see
+// third/BUILD.bazel for why the target owns it.
+#include "DirectML.h"
+
 namespace DX
 {
     // Helper class for COM exceptions

@@ -10,6 +10,7 @@
 #include "DeviceResources.hpp"
 #include "StepTimer.hpp"
 #include "GLTFAdapter.hpp"
+#include "ModelManager.hpp"
 #include "Camera.hpp"
 
 // Simple free list based allocator
@@ -157,6 +158,7 @@ private:
     DirectX::SimpleMath::Matrix                                             m_projection;
 
     NeuralModelIntegrateTestbed::GLTFAdapter m_gltfAdapter;
+    NeuralModelIntegrateTestbed::ModelManager m_nnModelManager;
     std::shared_ptr<Camera>                                                 m_camera;
 
     ID3D12DescriptorHeap*        m_imguiSrvDescHeap = nullptr;

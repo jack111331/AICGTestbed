@@ -57,6 +57,7 @@ cc_library(
     deps = [
         "@vcpkg_directxtk12//:directx_headers",
         "@vcpkg_directxtk12//:directxtk12",
+        "//third:directml",
     ],
 )
 
@@ -90,6 +91,16 @@ cc_library(
 )
 
 cc_library(
+    name = "Camera",
+    srcs = ["Camera.cc"],
+    hdrs = ["Camera.hpp"],
+    defines = SAMPLE_DEFINES,
+    # Camera.hpp has no includes of its own -- it relies on pch.h having been
+    # read first for the DirectXMath/SimpleMath types.
+    deps = [":pch"],
+)
+
+cc_library(
     name = "GLTFAdapter",
     srcs = [
         "GLTFAdapter.cc",
@@ -103,6 +114,7 @@ cc_library(
     # GLTFAdapter.hpp includes DeviceResources.hpp and holds
     # ComPtr<ID3D12Resource> members; GLTFAdapter.cc includes pch.h.
     deps = [
+        ":Camera",
         ":DeviceResources",
         ":Descriptors",
         ":pch",
@@ -114,18 +126,38 @@ cc_library(
 )
 
 cc_library(
+    name = "ModelManager",
+    srcs = [
+        "ModelManager.cc",
+    ],
+    hdrs = [
+        "ModelManager.hpp",
+        "DirectMLX.h",
+    ],
+    defines = SAMPLE_DEFINES,
+    # GLTFAdapter.hpp includes DeviceResources.hpp and holds
+    # ComPtr<ID3D12Resource> members; GLTFAdapter.cc includes pch.h.
+    deps = [
+        ":DeviceResources",
+        ":Descriptors",
+        ":pch",
+    ],
+)
+
+cc_library(
     name = "Application",
-    srcs = ["Application.cc", "Camera.cc"],
+    srcs = ["Application.cc"],
     hdrs = [
         "Application.hpp",
         "FindMedia.h",
-        "Camera.hpp"
     ],
     defines = SAMPLE_DEFINES,
     deps = [
+        ":Camera",
         ":Descriptors",
         ":DeviceResources",
         ":GLTFAdapter",
+        ":ModelManager",
         ":pch",
         "@vcpkg_directxtk12//:directxtk12",
         "@vcpkg_directxtk12//:imgui"

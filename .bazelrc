@@ -5,5 +5,50 @@ build --enable_platform_specific_config
 build:windows --cxxopt=/std:c++17
 build:windows --host_cxxopt=/std:c++17
 
-build --action_env=VSLANG="1033"
+# Make __cplusplus report the standard actually in effect. For backwards
+# compatibility MSVC hard-codes it to 199711L unless this is passed, even under
+# /std:c++17 -- so any header that feature-tests on it takes the pre-C++11 path.
+#
+# Engine/DirectMLX.h is one: it gates `#include <optional>` on
+# `__cplusplus >= 201703L`, falls through to a dml_optional_extensions.h that
+# only exists inside the DirectML repo, includes nothing, and then uses
+# std::optional anyway -- 126 cascading errors from one lying macro. It gates
+# <string_view> the same way.
+#
+# _MSVC_LANG carries the real value regardless, which is why MSVC-aware headers
+# check it; DirectMLX.h is written for the DirectML repo's own CMake build,
+# which sets this flag.
+build:windows --cxxopt=/Zc:__cplusplus
+build:windows --host_cxxopt=/Zc:__cplusplus
 
+# Ask MSVC for English diagnostics, so its output is pure ASCII and no codepage
+# can mangle it.
+#
+# This matters here because the system ANSI codepage is 936 (GBK). cl.exe writes
+# diagnostics in the ANSI codepage -- not the console codepage, which was already
+# 65001 -- so localized messages arrive as CP936 bytes that a UTF-8 console
+# cannot decode, and you get mojibake. The bytes are not corrupt: A1 B0 is a
+# valid CP936 full-width quote and simply invalid UTF-8.
+#
+# VSLANG only selects among the language packs actually INSTALLED, as
+# VC\Tools\MSVC\<ver>\bin\HostX64\x64\<LCID>\clui.dll. Until 2026-10-08 only
+# 2052 (zh-CN) was present, so this line had no effect and messages stayed
+# Chinese; the en-US pack is now installed as 1033 and it works. If diagnostics
+# ever come back garbled, check that 1033\clui.dll still exists:
+#
+#   Visual Studio Installer -> Modify -> Language packs -> English, or
+#   "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe" modify ^
+#     --installPath "C:\Program Files\Microsoft Visual Studio\2022\Community" ^
+#     --addProductLang en-US --passive
+#
+# Do not quote the value. `bazel aquery --output=text
+# 'mnemonic("CppCompile", //Engine:hello-world)'` prints the action environment
+# with quotes stripped either way, so it cannot tell you whether a quoted form
+# reached cl.exe intact -- keep it bare and the question does not arise.
+build --action_env=VSLANG=1033
+
+# Source files are UTF-8. Without this MSVC reads them in the ANSI codepage
+# (936 here) and warns C4819 on any non-ASCII byte. The unconditional line
+# covers the host/exec configuration too, which is why both appear.
+build --copt=/utf-8
+build:windows --copt=/utf-8
