@@ -93,13 +93,38 @@ from-source build with `--use_dml`.
 the in-box `%WINDIR%\System32\DirectML.dll`. The script checks that copy is at
 least the 1.15.4 the package was built against, and says so if it is not.
 
-### 3. Build
+### 3. Stage the FloodDiffusion models (optional)
+
+Only needed for the text-to-motion panel. Point the script at a directory
+written by [FloodDiffusion](https://github.com/ShandaAI/FloodDiffusion)'s own
+`export_onnx.py`:
+
+```bash
+python tools/prepare_flooddiffusion.py C:/Code/FloodDiffusion/onnx_models/tiny --link
+```
+
+That writes `resources/FloodDiffusion/` (gitignored): the denoiser, the two VAE
+decoders, the text encoder, the tokenizer baked flat as `tokenizer.bin`, and
+`pipeline.txt`. `--link` hard-links the `.onnx` files instead of copying them,
+which saves 1.2 GB when the export is on the same volume.
+
+Two things are converted rather than copied, so the engine needs no JSON
+parser: `tokenizer.json` is 16 MB holding a 256k-entry Unigram vocabulary, and
+`config.json` becomes `key value` lines. The shapes `config.json` does not
+record -- the text feature width, the VAE cache count and each cache shape --
+are read back out of the `.onnx` files by `tools/onnx_signature.py`, so they
+cannot drift from the models they describe.
+
+Without this the application still runs; the FloodDiffusion panel reports that
+the models are not staged.
+
+### 4. Build
 
 ```bash
 bazelisk build //...
 ```
 
-### 4. Run
+### 5. Run
 
 ```bash
 bazelisk run //Engine:hello-world
@@ -115,6 +140,8 @@ bazelisk run //Engine:hello-world
 | `//Engine:imgui-smoke` | Builds an ImGui frame headless; link-checks the DX12 and Win32 backends. |
 | `//Engine:directml-smoke` | Creates a DirectML device and reports the runtime feature level. |
 | `//Engine:stb-smoke` | Decodes a known PNG from memory and from disk, checking pixel values. |
+| `//Engine:motionfeatures-smoke` | HumanML3D feature decoding and the Unigram tokenizer. No device or model needed. |
+| `//Engine:flooddiffusion-smoke` | Runs the real text-to-motion pipeline end to end on both providers and checks they agree; skips the model sections when `resources/FloodDiffusion/` is absent. |
 
 The smoke tests are cheap and each one pins a property that is easy to break
 silently, so they are worth running after any dependency change:
@@ -197,6 +224,158 @@ package declares only its own headers out of the shared vcpkg `include/`.
   the Bazel execroot without relying on runfiles symlinks, which are off by
   default on Windows.
 - `resources/` — glTF test scenes and HLSL sources.
+- `resources/FloodDiffusion/` — the staged text-to-motion models, written by
+  `tools/prepare_flooddiffusion.py` and gitignored. 1.2 GB, almost all of it
+  `text_encoder.onnx`, and the weights are not ours to redistribute.
+
+## Text to motion
+
+`//Engine:FloodDiffusion` streams
+[FloodDiffusion](https://github.com/ShandaAI/FloodDiffusion) text-to-motion and
+the application draws the result as skeleton lines, in the **FloodDiffusion
+motion** panel.
+
+It is four ONNX models with the sampling loop on the host:
+
+| Model | Signature |
+|---|---|
+| `text_encoder.onnx` | token ids → `[tokens, 768]` features |
+| `denoiser.onnx` | one diffusion-forcing denoising call |
+| `vae_decoder_first.onnx` | first latent → 1 motion frame + 20 caches |
+| `vae_decoder_step.onnx` | next latent + caches → 4 motion frames + 20 caches |
+
+**Why it streams.** Diffusion forcing gives each latent frame its own noise
+level, rising along the sequence, and every step shifts that ramp forward by a
+fraction of a chunk. Latents at the front finish while the ones behind are
+still noisy, so `FloodDiffusionPipeline::Step` denoises once and then decodes
+whatever that finalised. Motion appears after roughly 8 of 128 steps and keeps
+arriving, rather than all at the end. One step per rendered frame generates
+about five times faster than playback consumes it.
+
+**Either execution provider runs it, and the choice is per generation** —
+`FloodDiffusionOptions::device` for the sampler, `textEncoderDevice` for the
+prompt encoder, both switchable in the panel.
+
+An earlier export only ran on the CPU: the DirectML EP faulted on the
+attention mask, which the graph built from `context_lens` with a
+`Range → Reshape → Less` chain. That export was replaced and DirectML now runs
+every model. Measured on an RTX 5080, with both providers agreeing to within
+**0.000004** on the largest joint coordinate:
+
+| | DirectML | CPU |
+|---|---|---|
+| denoiser | 37–40 ms | 1.4–10.5 ms |
+| VAE step | 3.3 ms | 1.3 ms |
+| text encoder | 46 ms | 9.4 ms |
+| 8-latent generation, warmed | 955 ms | 83 ms |
+
+**The CPU is currently about 11× faster, and the reason is visible in the shape
+of the numbers**: the denoiser costs the same 40 ms whether one latent is live
+or sixty-four, while the CPU scales 1.4 → 10.5 ms over the same range. That is
+per-dispatch overhead, not compute. ORT profiling confirms it — 1226 of the
+graph's 1334 nodes are dispatched to DirectML individually, with 108 left on
+the CPU. A 36 MB model with `hidden_dim` 256 and a classifier-free-guidance
+batch of two does not fill a 5080; it starves it.
+
+Two consequences worth knowing before choosing DirectML:
+
+* **The first pass pays shape compilation.** The EP compiles per distinct input
+  shape and the sampler presents a new sequence length every other step, so a
+  cold 8-latent run took 1252 ms against 955 ms warmed.
+* **It contends with rendering.** A denoising step measured 44 ms standalone
+  but 91 ms inside the running application, because ORT's work goes on the
+  same queue as the renderer. At one step per frame that is a visible hitch
+  while generating. A worker thread, or fewer steps per frame, is the fix.
+
+**The EP already has the compiler needed to fix this; it just cannot use it.**
+ONNX Runtime's `DmlGraphFusionTransformer` compiles each DirectML-assignable
+partition into one `IDMLCompiledOperator` and dispatches it as a single
+`DmlFusedNode`. It is on by default, but it only engages when shapes are
+statically known, because `IDMLDevice1::CompileGraph` needs concrete tensor
+descriptions. Counting `Node` events in an ORT profile:
+
+| session | dispatches per run | on DML | on CPU | fused nodes |
+|---|---|---|---|---|
+| as exported, all dims symbolic | **1334** | 1226 | 108 | none |
+| `batch` and `time` pinned | **294** | 239 | 55 | 10 partitions |
+| all four dims pinned | **1** | 1 | 0 | `DmlFusedNode_0_2` |
+
+Fixing the shapes collapses the whole graph to one dispatch with no CPU
+partitions at all, and `ep.dml.disable_graph_fusion` confirms the mechanism:
+static shapes cost 2.0 ms with fusion and 10.2 ms without. (GPU-side tensor
+binding is **not** the lever — that saves copies, and copies are not where the
+time goes. See [`skills/onnx-directml-ep`](skills/onnx-directml-ep/SKILL.md)
+§6–§7.)
+
+**`FloodDiffusionOptions::staticShapes` turns this on without a re-export**, via
+`AddFreeDimensionOverrideByName`, and it is the "pin shapes" checkbox in the
+panel. An 8-latent generation:
+
+| | warmed | cold |
+|---|---|---|
+| CPU | 87 ms | 89 ms |
+| DirectML, as exported | 966 ms | 1289 ms |
+| DirectML, shapes pinned | **60 ms** | **171 ms** |
+
+So pinned DirectML is the fastest configuration available, 16× the dynamic GPU
+path and 1.5× the CPU, and the cold penalty falls 7.5× because there is only
+one shape left to compile. In the running application a denoising step went
+from 91.5 ms to 14.66 ms.
+
+Two things to know before switching it on, both deliberate:
+
+* **It changes the sampler.** `time` has to be pinned too, so the whole latent
+  buffer is submitted every step rather than the live prefix, with the noise
+  ramp clipped to 1 over the part that is not live. The denoiser is non-causal,
+  so that padding attends into the real frames: the motion differs (mean 0.11 m,
+  max 0.52 m against the prefix version, on a figure about 1.6 m tall). Bone
+  lengths and proportions hold, and it is arguably closer to how the model was
+  trained, but it is a different sampler. An export taking a valid-length input
+  and masking self-attention would make it exact. That is why the default is
+  off.
+* **The length is compiled in.** The pinned `time` is `latentFrames +
+  chunk_size`, baked at load, so `Begin` refuses a different length and the
+  panel's slider reloads the sessions.
+
+The VAE decoders are left dynamic on purpose: pinning their `batch` would take
+a decode from 1.48 ms to 0.47 ms, but it breaks the 20-tensor cache hand-off
+between `vae_decoder_first` and `vae_decoder_step` on ORT 1.24.4 (the step
+decoder reports a null input). The denoiser is where the time is.
+
+**The output is not joint positions.** The VAE decodes to HumanML3D's
+263-dimensional feature vector: a root trajectory as per-frame velocities plus
+joint positions in a root-local frame. `Engine/MotionFeatures.cc` integrates
+the root and un-rotates the joints. The subtlety worth knowing is that the
+batch formulation shifts the velocity arrays by one frame before integrating,
+so frame *i* is placed using frame *i-1*'s velocity; applying the current
+frame's instead still produces plausible motion that drifts one frame ahead of
+the pose. `//Engine:motionfeatures-smoke` pins this against
+`tools/motion_reference.py`, an independent numpy transcription, and against
+properties that hold either way — a constant velocity must integrate to a
+straight line, a pure yaw must not change a bone's length.
+
+**Reproducibility.** The same seed gives the same motion within the engine but
+*not* the same motion as the Python reference: that seeds numpy's PCG64 with a
+ziggurat normal, and this uses `std::mt19937`.
+
+**Not done yet.** Retargeting onto a glTF character — the skeleton is drawn on
+its own, and only a single prompt per generation is supported (the reference
+also accepts several prompts with `--text-end` handing over at given frames,
+which would widen the `segments` axis of `context`).
+
+## Skills
+
+`skills/` holds distilled notes meant to be read before starting a particular
+kind of work, in the Claude Code skill format (`SKILL.md` with frontmatter).
+
+- [`skills/onnx-directml-ep`](skills/onnx-directml-ep/SKILL.md) — pitfalls and
+  fixes for putting an existing ONNX model onto ONNX Runtime's DirectML
+  execution provider from C++: package selection, the session options that are
+  *not* in fact required, two `Ort::` lifetime traps that masquerade as broken
+  models, diagnosing `MLOperatorAuthorImpl` faults, why the GPU is often slower
+  for small models and how to prove it, which input dimensions must be fixed at
+  export time and which paddings are numerically exact, and sharing a device
+  and queue with a renderer.
 
 ## Rough edges
 

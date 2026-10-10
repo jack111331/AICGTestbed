@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "OrtModel.hpp"
+#include "OrtEnv.hpp"
 
 #include <dml_provider_factory.h>
 #include <onnxruntime_cxx_api.h>
@@ -11,37 +12,19 @@ namespace NeuralModelIntegrateTestbed {
 
 namespace {
 
+// The environment, the DirectML function table and the error convention are
+// shared with Engine/FloodDiffusion.cc through OrtEnv.hpp: one Ort::Env has to
+// cover every session in the process.
 void SetError(std::string* error, std::string message) {
-    if (error != nullptr) {
-        *error = std::move(message);
-    }
+    SetOrtError(error, std::move(message));
 }
 
-// One Ort::Env per process. ORT keys its logger and thread pools off this, and
-// creating one per model would spin up a set each time.
 Ort::Env& SharedEnv() {
-    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "ptflio");
-    return env;
+    return SharedOrtEnv();
 }
 
-// The DirectML-specific function table, fetched once.
 const OrtDmlApi* DmlApi(std::string* error) {
-    static const OrtDmlApi* api = [] {
-        const OrtDmlApi* result = nullptr;
-        const OrtStatus* status = Ort::GetApi().GetExecutionProviderApi(
-            "DML", ORT_API_VERSION, reinterpret_cast<const void**>(&result));
-        if (status != nullptr) {
-            Ort::GetApi().ReleaseStatus(const_cast<OrtStatus*>(status));
-            return static_cast<const OrtDmlApi*>(nullptr);
-        }
-        return result;
-    }();
-    if (api == nullptr) {
-        SetError(error, "ONNX Runtime has no DirectML execution provider; the "
-                        "onnxruntime.dll beside the executable is probably not the "
-                        "DirectML build");
-    }
-    return api;
+    return SharedDmlApi(error);
 }
 
 uint64_t ElementCount(const std::vector<int64_t>& shape) {
@@ -189,7 +172,9 @@ std::unique_ptr<OrtModelRunner> OrtModelRunner::Create(const std::string& name,
         impl.options = std::make_unique<Ort::SessionOptions>();
         // Both are required by the DirectML EP: it does not implement ORT's
         // memory-pattern optimisation, and parallel execution is unsupported.
-        // Session creation fails rather than degrading if these are left on.
+        // Advisable per DirectML's documentation, though measured on ORT
+        // 1.24.4 a session runs correctly without them; see
+        // skills/onnx-directml-ep/SKILL.md.
         impl.options->DisableMemPattern();
         impl.options->SetExecutionMode(ORT_SEQUENTIAL);
 
@@ -221,9 +206,17 @@ std::unique_ptr<OrtModelRunner> OrtModelRunner::Create(const std::string& name,
         impl.inputName = impl.session->GetInputNameAllocated(0, allocator).get();
         impl.outputName = impl.session->GetOutputNameAllocated(0, allocator).get();
 
-        const auto inputInfo = impl.session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
-        const auto outputInfo =
-            impl.session->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo();
+        // The Ort::TypeInfo must be held in a named local. It OWNS the
+        // OrtTypeInfo, while GetTensorTypeAndShapeInfo returns a
+        // ConstTensorTypeAndShapeInfo that merely points into it -- so calling
+        // both in one expression leaves the view dangling the moment the
+        // temporary TypeInfo is destroyed. That read-after-free returned the
+        // right element type for a while and then started reporting a
+        // non-FLOAT32 tensor, failing every ONNX Runtime model here.
+        const Ort::TypeInfo inputTypeInfo = impl.session->GetInputTypeInfo(0);
+        const Ort::TypeInfo outputTypeInfo = impl.session->GetOutputTypeInfo(0);
+        const auto inputInfo = inputTypeInfo.GetTensorTypeAndShapeInfo();
+        const auto outputInfo = outputTypeInfo.GetTensorTypeAndShapeInfo();
 
         if (inputInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
             outputInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
@@ -351,6 +344,16 @@ bool OrtModelRunner::RunInference(const void* input,
     staging->Unmap(0, nullptr);
 
     // Upload on our own list and submit, then let ORT's work queue behind it.
+    //
+    // The drain is not optional. An allocator may only be reset once every
+    // submission recorded from it has COMPLETED, and a previous Enqueue or
+    // RunInference may still be in flight -- Enqueue explicitly does not wait.
+    // Reset does not report this: it returns S_OK and corrupts the allocator,
+    // and only the debug layer notices (EXECUTION ERROR #552,
+    // COMMAND_ALLOCATOR_SYNC), which with break-on-error makes it fatal.
+    if (!impl.WaitForGpu(error)) {
+        return false;
+    }
     if (FAILED(impl.allocator->Reset()) ||
         FAILED(impl.commandList->Reset(impl.allocator.Get(), nullptr))) {
         SetError(error, "command list reset failed");
@@ -369,17 +372,17 @@ bool OrtModelRunner::RunInference(const void* input,
     }
 
     // Queue order guarantees the upload ran before ORT's work and that ORT's
-    // work ran before this copy, so no barriers between them are needed -- only
-    // this wait, because the result has to reach the CPU.
+    // work ran before this copy, so no barriers between them are needed.
+    //
+    // Resetting the allocator is a different matter: ordering is not enough,
+    // the earlier submissions have to have finished. So drain here too, before
+    // reusing the allocator for the readback copy.
+    if (!impl.WaitForGpu(error)) {
+        return false;
+    }
     if (FAILED(impl.allocator->Reset())) {
-        // The allocator is still in use by the submissions above; drain first.
-        if (!impl.WaitForGpu(error)) {
-            return false;
-        }
-        if (FAILED(impl.allocator->Reset())) {
-            SetError(error, "command allocator reset failed");
-            return false;
-        }
+        SetError(error, "command allocator reset failed");
+        return false;
     }
     if (FAILED(impl.commandList->Reset(impl.allocator.Get(), nullptr))) {
         SetError(error, "command list reset failed");

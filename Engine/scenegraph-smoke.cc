@@ -8,11 +8,15 @@
 // for primitives, and this asset has no meshes.
 #include "pch.h"
 
+#include "MotionRetarget.hpp"
 #include "SceneGraph.hpp"
+
+#include <filesystem>
 
 #include <fastgltf/core.hpp>
 #include <fastgltf/types.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <iostream>
@@ -402,6 +406,523 @@ fastgltf::Expected<fastgltf::Asset> Parse(
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Retargeting: the rotation port, the configuration, and binding to the real
+// Mixamo character.
+// ---------------------------------------------------------------------------
+
+// utils/paramUtil.py, momask-codes: the rest direction of each HumanML3D bone.
+const DirectX::SimpleMath::Vector3 kRawOffsets[22] = {
+    {0, 0, 0},  {1, 0, 0},  {-1, 0, 0}, {0, 1, 0},  {0, -1, 0}, {0, -1, 0},
+    {0, 1, 0},  {0, -1, 0}, {0, -1, 0}, {0, 1, 0},  {0, 0, 1},  {0, 0, 1},
+    {0, 1, 0},  {1, 0, 0},  {-1, 0, 0}, {0, 0, 1},  {0, -1, 0}, {0, -1, 0},
+    {0, -1, 0}, {0, -1, 0}, {0, -1, 0}, {0, -1, 0},
+};
+
+// A deterministic pose: every joint gets a distinct local rotation, written as
+// the cont6d the feature vector would carry. Built by rotating the identity
+// frame, so the ground truth is known independently of the decoder.
+void BuildSyntheticFeature(std::vector<float>& feature, int joints,
+                           std::vector<DirectX::SimpleMath::Quaternion>& locals,
+                           float rootAngle) {
+    using DirectX::SimpleMath::Matrix;
+    using DirectX::SimpleMath::Quaternion;
+    using DirectX::SimpleMath::Vector3;
+
+    const int motionDim = 4 + 9 * (joints - 1) + 3 * joints + 4;
+    feature.assign(static_cast<std::size_t>(motionDim), 0.0f);
+    locals.assign(static_cast<std::size_t>(joints), Quaternion::Identity);
+
+    const int rotationOffset = 4 + (joints - 1) * 3;
+    for (int joint = 1; joint < joints; ++joint) {
+        // Oblique axis and a distinct angle per joint, so a transposed or
+        // mis-ordered composition cannot pass by symmetry.
+        Vector3 axis(0.3f + 0.01f * joint, 0.5f, -0.8f + 0.02f * joint);
+        axis.Normalize();
+        const float angle = 0.15f + 0.05f * static_cast<float>(joint);
+        const Quaternion local = Quaternion::CreateFromAxisAngle(axis, angle);
+        locals[static_cast<std::size_t>(joint)] = local;
+
+        // cont6d is the first two COLUMNS of the column-vector rotation, which
+        // in DirectXMath's row-vector matrix are the first two ROWS.
+        const Matrix m = Matrix::CreateFromQuaternion(local);
+        float* c = feature.data() + rotationOffset + (joint - 1) * 6;
+        c[0] = m._11; c[1] = m._12; c[2] = m._13;
+        c[3] = m._21; c[4] = m._22; c[5] = m._23;
+    }
+    (void)rootAngle;
+}
+
+// Which order does SimpleMath's Quaternion::Concatenate compose in?
+//
+// Every rotation chain in the retargeter depends on this, and the two readings
+// differ by exactly the kind of error that leaves a character folded rather
+// than obviously broken. SimpleMath follows XNA here rather than DirectXMath's
+// own XMQuaternionMultiply, so it is worth pinning down in a test rather than
+// inferring from a doc comment.
+void TestConcatenateOrder() {
+    using DirectX::SimpleMath::Quaternion;
+    using DirectX::SimpleMath::Vector3;
+
+    std::cout << "quaternion composition order" << std::endl;
+
+    // Rotate +X by 90 degrees about Z -> +Y. Then 90 degrees about X -> +Z.
+    const Quaternion aboutZ =
+        Quaternion::CreateFromAxisAngle(Vector3::UnitZ, DirectX::XM_PIDIV2);
+    const Quaternion aboutX =
+        Quaternion::CreateFromAxisAngle(Vector3::UnitX, DirectX::XM_PIDIV2);
+
+    const Vector3 start = Vector3::UnitX;
+    const Vector3 stepwise =
+        Vector3::Transform(Vector3::Transform(start, aboutZ), aboutX);
+
+    const Vector3 zThenX = Vector3::Transform(start, Quaternion::Concatenate(aboutZ, aboutX));
+    const Vector3 xThenZ = Vector3::Transform(start, Quaternion::Concatenate(aboutX, aboutZ));
+
+    std::printf("  stepwise (Z then X)      (%.3f, %.3f, %.3f)\n", stepwise.x,
+                stepwise.y, stepwise.z);
+    std::printf("  Concatenate(Z, X)        (%.3f, %.3f, %.3f)\n", zThenX.x,
+                zThenX.y, zThenX.z);
+    std::printf("  Concatenate(X, Z)        (%.3f, %.3f, %.3f)\n", xThenZ.x,
+                xThenZ.y, xThenZ.z);
+
+    const bool firstArgFirst = (zThenX - stepwise).Length() < 1e-5f;
+    const bool secondArgFirst = (xThenZ - stepwise).Length() < 1e-5f;
+    Expect("exactly one ordering matches stepwise application",
+           firstArgFirst != secondArgFirst);
+    if (firstArgFirst) {
+        std::printf("  Concatenate(a, b) applies A FIRST, then b\n");
+    } else {
+        std::printf("  Concatenate(a, b) applies B FIRST, then a\n");
+    }
+    // Recorded so a change in SimpleMath's convention breaks here, loudly,
+    // rather than silently folding every retargeted limb. Measured: the SECOND
+    // argument is applied first.
+    Expect("Concatenate(a, b) applies b first", secondArgFirst);
+}
+
+void TestRetargetRotations() {
+    using DirectX::SimpleMath::Quaternion;
+    using DirectX::SimpleMath::Vector3;
+
+    std::cout << "retarget: source world rotations" << std::endl;
+
+    NeuralModelIntegrateTestbed::MotionRetargeter retargeter;
+    std::string error;
+    const std::filesystem::path config = "resources/retarget/mixamo.txt";
+    if (!std::filesystem::exists(config)) {
+        std::printf("  %-52s skipped\n", "resources/retarget/mixamo.txt absent");
+        return;
+    }
+    if (!retargeter.LoadConfig(config, &error)) {
+        std::printf("  loading failed: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    const int joints = retargeter.SourceJointCount();
+    Expect("22 source joints", joints == 22);
+    Expect("18 mapped bones", retargeter.Bones().size() == 18);
+    Expect("five kinematic chains", retargeter.Chains().size() == 5);
+
+    // The hips correction is a 150-degree turn about X, which is what
+    // momask's mapping specifies and what the file's own quaternion field
+    // independently agrees with.
+    const NeuralModelIntegrateTestbed::RetargetBone& hips = retargeter.Bones()[0];
+    Expect("the first bone is the hips", hips.sourceJoint == 0 &&
+                                             hips.destinationName == "mixamorig:Hips");
+    Expect("only the hips carry position", hips.setPosition);
+    const float hipsAngle = 2.0f * std::acos(std::min(1.0f, std::fabs(hips.correction.w)));
+    Expect("hips correction is 150 degrees",
+           std::fabs(DirectX::XMConvertToDegrees(hipsAngle) - 150.0f) < 0.5f);
+
+    // --- the port itself ---------------------------------------------------
+    // Forward kinematics from the recovered world rotations has to reproduce
+    // the positions the same pose implies. This is the check that catches a
+    // wrong cont6d column order, a transposed rotation, or a reversed
+    // quaternion composition -- all of which still produce a moving skeleton.
+    std::vector<float> feature;
+    std::vector<Quaternion> locals;
+    const float rootAngle = 0.7f;
+    BuildSyntheticFeature(feature, joints, locals, rootAngle);
+
+    std::vector<Quaternion> world;
+    Expect("source rotations recovered",
+           retargeter.SourceWorldRotations(feature.data(),
+                                           static_cast<int>(feature.size()), rootAngle,
+                                           world));
+    Expect("one rotation per joint", world.size() == static_cast<std::size_t>(joints));
+
+    // Independent reference: accumulate the same locals down each chain.
+    std::vector<Quaternion> expected(static_cast<std::size_t>(joints),
+                                     Quaternion::Identity);
+    expected[0] = Quaternion::CreateFromAxisAngle(Vector3::UnitY, rootAngle);
+    float worstRotation = 0.0f;
+    for (const auto& chain : retargeter.Chains()) {
+        Quaternion accumulated = expected[static_cast<std::size_t>(chain.front())];
+        for (std::size_t k = 1; k < chain.size(); ++k) {
+            const int joint = chain[k];
+            accumulated = Quaternion::Concatenate(
+                accumulated, locals[static_cast<std::size_t>(joint)]);
+            expected[static_cast<std::size_t>(joint)] = accumulated;
+        }
+    }
+    for (int joint = 0; joint < joints; ++joint) {
+        // Compare by what the rotation DOES to an oblique vector, so a sign
+        // flip on the quaternion is not counted as a difference.
+        const Vector3 probe(0.37f, -0.62f, 0.69f);
+        const Vector3 a = Vector3::Transform(probe, world[static_cast<std::size_t>(joint)]);
+        const Vector3 b =
+            Vector3::Transform(probe, expected[static_cast<std::size_t>(joint)]);
+        worstRotation = std::max(worstRotation, (a - b).Length());
+    }
+    std::printf("  %-52s %.6f\n", "worst world-rotation disagreement", worstRotation);
+    Expect("world rotations match a chain-accumulated reference",
+           worstRotation < 1e-4f);
+
+    // Every recovered rotation must be a rotation: unit quaternion, so the
+    // Gram-Schmidt in the port produced an orthonormal frame.
+    float worstNorm = 0.0f;
+    for (const Quaternion& q : world) {
+        const float length =
+            std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        worstNorm = std::max(worstNorm, std::fabs(length - 1.0f));
+    }
+    Expect("every rotation is unit length", worstNorm < 1e-4f);
+
+    // A degenerate cont6d (two parallel vectors) describes no frame. It must
+    // come back as identity rather than NaN, which would otherwise propagate
+    // along the whole chain and poison every descendant.
+    std::vector<float> degenerate = feature;
+    const int rotationOffset = 4 + (joints - 1) * 3;
+    for (int i = 0; i < 6; ++i) {
+        degenerate[static_cast<std::size_t>(rotationOffset + i)] = (i % 3 == 0) ? 1.0f : 0.0f;
+    }
+    std::vector<Quaternion> fromDegenerate;
+    retargeter.SourceWorldRotations(degenerate.data(),
+                                    static_cast<int>(degenerate.size()), rootAngle,
+                                    fromDegenerate);
+    bool finite = true;
+    for (const Quaternion& q : fromDegenerate) {
+        if (!std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z) ||
+            !std::isfinite(q.w)) {
+            finite = false;
+        }
+    }
+    Expect("a degenerate rotation does not produce NaN", finite);
+
+    // A short feature vector has to be refused, not read past.
+    std::vector<Quaternion> ignored;
+    Expect("a too-short feature frame is refused",
+           !retargeter.SourceWorldRotations(feature.data(), 10, rootAngle, ignored));
+    Expect("a null feature frame is refused",
+           !retargeter.SourceWorldRotations(nullptr, static_cast<int>(feature.size()),
+                                            rootAngle, ignored));
+}
+
+void TestRetargetBinding() {
+    std::cout << "retarget: binding to the character" << std::endl;
+
+    const std::filesystem::path character =
+        "resources/microphone_and_animated_char/scene_withlight_animated_char.gltf";
+    const std::filesystem::path config = "resources/retarget/mixamo.txt";
+    if (!std::filesystem::exists(character) || !std::filesystem::exists(config)) {
+        std::printf("  %-52s skipped\n", "character or config absent");
+        return;
+    }
+
+    NeuralModelIntegrateTestbed::MotionRetargeter retargeter;
+    std::string error;
+    if (!retargeter.LoadConfig(config, &error)) {
+        std::printf("  loading failed: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+
+    fastgltf::Parser parser(fastgltf::Extensions::KHR_lights_punctual);
+    auto data = fastgltf::GltfDataBuffer::FromPath(character);
+    if (data.error() != fastgltf::Error::None) {
+        std::printf("  cannot read the character: %s\n",
+                    fastgltf::getErrorMessage(data.error()).data());
+        ++g_failures;
+        return;
+    }
+    auto asset = parser.loadGltf(data.get(), character.parent_path(),
+                                 fastgltf::Options::LoadExternalBuffers);
+    if (asset.error() != fastgltf::Error::None) {
+        std::printf("  cannot parse the character: %s\n",
+                    fastgltf::getErrorMessage(asset.error()).data());
+        ++g_failures;
+        return;
+    }
+
+    SceneGraph graph;
+    const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> noBuffers;
+    graph.Build(asset.get(), asset->defaultScene.value_or(0), noBuffers, 0);
+    std::printf("  %-52s %zu\n", "character nodes", graph.NodeCount());
+    std::printf("  %-52s %zu\n", "skins", graph.Skins().size());
+
+    // --- discovery ---------------------------------------------------------
+    const std::vector<NeuralModelIntegrateTestbed::RetargetTarget> targets =
+        retargeter.DiscoverTargets(graph);
+    std::printf("  %-52s %zu\n", "retarget targets discovered", targets.size());
+    Expect("one target per skin", targets.size() == graph.Skins().size());
+    if (!targets.empty()) {
+        const NeuralModelIntegrateTestbed::RetargetTarget& first = targets[0];
+        std::printf("    %s: %d joints, %d/%zu bones matched\n", first.name.c_str(),
+                    first.jointCount, first.matchedBones,
+                    retargeter.Bones().size());
+        // Named after the node instancing the skin, which is what Mixamo names
+        // after the character.
+        Expect("the target is named after the character node", first.name == "Ch43");
+        Expect("the target reports the skin's joint count", first.jointCount == 65);
+        Expect("the mapping covers the whole rig",
+               first.matchedBones == static_cast<int>(retargeter.Bones().size()));
+        Expect("the target knows its mesh node", first.meshNode.has_value());
+    }
+
+    // --- scoped binding ----------------------------------------------------
+    // Every Mixamo rig names its bones "mixamorig:*", so an unscoped search
+    // would bind to whichever character came first. BindTo must only ever
+    // resolve to joints of the skin it was given.
+    {
+        std::vector<std::string> scopedMissing;
+        const int scoped = retargeter.BindTo(graph, 0, &scopedMissing);
+        std::printf("  %-52s %d\n", "bones bound within skin 0", scoped);
+        Expect("BindTo bound the whole rig",
+               scoped == static_cast<int>(retargeter.Bones().size()));
+        Expect("BoundSkin reports the skin",
+               retargeter.BoundSkin().has_value() && *retargeter.BoundSkin() == 0);
+
+        const std::vector<std::size_t>& joints = graph.Skins()[0].joints;
+        bool allWithinSkin = true;
+        for (const NeuralModelIntegrateTestbed::RetargetBone& bone :
+             retargeter.Bones()) {
+            if (!bone.destinationNode.has_value()) continue;
+            if (std::find(joints.begin(), joints.end(), *bone.destinationNode) ==
+                joints.end()) {
+                allWithinSkin = false;
+            }
+        }
+        Expect("every bound node is a joint of that skin", allWithinSkin);
+
+        std::vector<std::string> badMissing;
+        Expect("binding to a skin that does not exist binds nothing",
+               retargeter.BindTo(graph, 99, &badMissing) == 0);
+        Expect("  and clears the bound skin", !retargeter.BoundSkin().has_value());
+        Expect("  and leaves no bone bound", retargeter.BoundCount() == 0);
+    }
+
+    std::vector<std::string> missing;
+    const int bound = retargeter.Bind(graph, &missing);
+    std::printf("  %-52s %d of %zu\n", "bones bound by name", bound,
+                retargeter.Bones().size());
+    for (const std::string& name : missing) {
+        std::printf("    unmatched: %s\n", name.c_str());
+    }
+    Expect("every mapped bone found its node",
+           bound == static_cast<int>(retargeter.Bones().size()));
+    Expect("BoundCount agrees", retargeter.BoundCount() == bound);
+
+    // Posing has to run end to end on the real hierarchy.
+    std::vector<float> feature;
+    std::vector<DirectX::SimpleMath::Quaternion> locals;
+    BuildSyntheticFeature(feature, retargeter.SourceJointCount(), locals, 0.3f);
+    // --- bind-pose measurement, which is what sizes the character ----------
+    const NeuralModelIntegrateTestbed::BindPoseMetrics metrics =
+        retargeter.MeasureBindPose(graph, 0);
+    Expect("the bind pose measured", metrics.valid);
+    std::printf("  %-52s %.4f\n", "hips height above the lowest joint",
+                metrics.hipsHeight);
+    std::printf("  %-52s %.4f .. %.4f\n", "joint Y range", metrics.lowestY,
+                metrics.highestY);
+    // This character stands on its own ground plane already, so the lowest
+    // joint is at zero and the hips are a leg's length above it. Measured from
+    // the asset, so a change here means the asset changed.
+    Expect("the character stands at about zero", std::fabs(metrics.lowestY) < 0.02f);
+    Expect("the hips are about 0.77 m up",
+           std::fabs(metrics.hipsHeight - 0.774f) < 0.02f);
+    Expect("the measurement excludes the scene placement",
+           std::fabs(metrics.hipsY - 0.776f) < 0.02f);
+
+    // Measuring must not depend on the current pose: a retarget already
+    // applied to the graph must not change what the rest pose measures.
+    std::vector<float> posed;
+    std::vector<DirectX::SimpleMath::Quaternion> posedLocals;
+    BuildSyntheticFeature(posed, retargeter.SourceJointCount(), posedLocals, 1.1f);
+    retargeter.ApplyFrame(graph, posed.data(), static_cast<int>(posed.size()), 1.1f,
+                          DirectX::SimpleMath::Vector3(0.0f, 0.9f, 0.0f), 1.0f,
+                          DirectX::SimpleMath::Matrix::Identity, &error);
+    const NeuralModelIntegrateTestbed::BindPoseMetrics again =
+        retargeter.MeasureBindPose(graph, 0);
+    Expect("the rest pose measures the same after posing",
+           std::fabs(again.hipsHeight - metrics.hipsHeight) < 1e-4f);
+
+    // --- aiming at a world position ----------------------------------------
+    // The hips translation is written in parent space, so a scene placement
+    // has to be cancelled. With a placement applied, the hips must still land
+    // at the requested WORLD position -- that is what puts the feet on the
+    // grid whatever the scene placement is.
+    const DirectX::SimpleMath::Matrix placement =
+        DirectX::SimpleMath::Matrix::CreateTranslation(3.0f, -2.0f, -4.0f);
+    const DirectX::SimpleMath::Vector3 wanted(0.5f, 0.9f, -0.25f);
+    Expect("a frame applies with a scene placement",
+           retargeter.ApplyFrame(graph, feature.data(),
+                                 static_cast<int>(feature.size()), 0.0f, wanted, 1.0f,
+                                 placement, &error));
+    graph.UpdateTransforms(placement);
+    for (const NeuralModelIntegrateTestbed::RetargetBone& bone : retargeter.Bones()) {
+        if (bone.sourceJoint != 0 || !bone.destinationNode.has_value()) continue;
+        const DirectX::SimpleMath::Matrix& m =
+            graph.Nodes()[*bone.destinationNode].worldTransform;
+        const DirectX::SimpleMath::Vector3 got(m._41, m._42, m._43);
+        std::printf("  %-52s (%.3f, %.3f, %.3f)\n", "hips world after placement",
+                    got.x, got.y, got.z);
+        Expect("the hips landed at the requested world position",
+               (got - wanted).Length() < 1e-3f);
+    }
+
+    const bool applied = retargeter.ApplyFrame(
+        graph, feature.data(), static_cast<int>(feature.size()), 0.3f,
+        DirectX::SimpleMath::Vector3(0.0f, 0.9f, 0.0f), 1.0f,
+        DirectX::SimpleMath::Matrix::Identity, &error);
+    Expect("a frame applies to the real character", applied);
+    if (!applied) {
+        std::printf("    %s\n", error.c_str());
+    }
+
+    // The driven nodes' transforms must be finite and must actually have
+    // changed -- a retarget that silently leaves the bind pose alone would
+    // otherwise look like success.
+    graph.UpdateTransforms(DirectX::SimpleMath::Matrix::Identity);
+    bool finite = true;
+    int moved = 0;
+    for (const NeuralModelIntegrateTestbed::RetargetBone& bone : retargeter.Bones()) {
+        if (!bone.destinationNode.has_value()) continue;
+        const SceneNode& node = graph.Nodes()[*bone.destinationNode];
+        const DirectX::SimpleMath::Matrix& m = node.localTransform;
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                if (!std::isfinite(m.m[row][col])) finite = false;
+            }
+        }
+        DirectX::SimpleMath::Matrix copy = node.localTransform;
+        DirectX::SimpleMath::Vector3 scale;
+        DirectX::SimpleMath::Quaternion rotation;
+        DirectX::SimpleMath::Vector3 translation;
+        if (copy.Decompose(scale, rotation, translation)) {
+            DirectX::SimpleMath::Quaternion delta = node.baseTransform.rotation;
+            delta.Conjugate();
+            delta = DirectX::SimpleMath::Quaternion::Concatenate(rotation, delta);
+            if (std::fabs(delta.w) < 0.9999f) ++moved;
+        }
+    }
+    Expect("every driven transform is finite", finite);
+
+    // --- the property that decides whether the pose is right ---------------
+    // Each driven bone must end up pointing where the motion points it. This
+    // is what momask's correction constants failed at (about 90 degrees out,
+    // because they were tuned for a Blender BVH armature's bone axes) and what
+    // the derived rest alignment fixes. A character whose bones point the wrong
+    // way still animates, and still looks like a character -- it just folds its
+    // limbs and floats above the ground, which is exactly how this surfaced.
+    {
+        std::vector<DirectX::SimpleMath::Quaternion> sourceWorld;
+        retargeter.SourceWorldRotations(feature.data(),
+                                        static_cast<int>(feature.size()), 0.3f,
+                                        sourceWorld);
+        float worstAngle = 0.0f;
+        int compared = 0;
+        for (const NeuralModelIntegrateTestbed::RetargetBone& bone :
+             retargeter.Bones()) {
+            if (!bone.restResolved || !bone.destinationNode.has_value() ||
+                !bone.childDestinationNode.has_value() || bone.childJoint < 0) {
+                continue;
+            }
+            // Where the motion puts this bone: the child joint's world rotation
+            // applied to the child's rest offset.
+            DirectX::SimpleMath::Vector3 want = DirectX::SimpleMath::Vector3::Transform(
+                kRawOffsets[bone.childJoint],
+                sourceWorld[static_cast<std::size_t>(bone.childJoint)]);
+            if (want.Length() < 1e-6f) continue;
+            want.Normalize();
+
+            const DirectX::SimpleMath::Matrix& a =
+                graph.Nodes()[*bone.destinationNode].worldTransform;
+            const DirectX::SimpleMath::Matrix& b =
+                graph.Nodes()[*bone.childDestinationNode].worldTransform;
+            DirectX::SimpleMath::Vector3 got(b._41 - a._41, b._42 - a._42,
+                                             b._43 - a._43);
+            if (got.Length() < 1e-6f) continue;
+            got.Normalize();
+
+            const float dot = std::max(-1.0f, std::min(1.0f, got.Dot(want)));
+            worstAngle = std::max(worstAngle,
+                                  DirectX::XMConvertToDegrees(std::acos(dot)));
+            ++compared;
+        }
+        // Bisection: does the FORMULA predict the right direction, and does the
+        // applied pose match the formula? Separating the two says whether a
+        // disagreement lives in the composition or in how the local rotation is
+        // derived from it.
+        float worstFormula = 0.0f;
+        float worstApplied = 0.0f;
+        for (const NeuralModelIntegrateTestbed::RetargetBone& bone :
+             retargeter.Bones()) {
+            if (!bone.restResolved || !bone.destinationNode.has_value() ||
+                !bone.childDestinationNode.has_value()) {
+                continue;
+            }
+            DirectX::SimpleMath::Vector3 want =
+                DirectX::SimpleMath::Vector3::Transform(
+                    kRawOffsets[bone.childJoint],
+                    sourceWorld[static_cast<std::size_t>(bone.childJoint)]);
+            want.Normalize();
+
+            const DirectX::SimpleMath::Quaternion W =
+                DirectX::SimpleMath::Quaternion::Concatenate(
+                    sourceWorld[static_cast<std::size_t>(bone.childJoint)],
+                    DirectX::SimpleMath::Quaternion::Concatenate(
+                        bone.restAlignment, bone.restRotation));
+
+            DirectX::SimpleMath::Quaternion inverseRest = bone.restRotation;
+            inverseRest.Conjugate();
+            const DirectX::SimpleMath::Vector3 localDir =
+                DirectX::SimpleMath::Vector3::Transform(bone.restDirection,
+                                                        inverseRest);
+            DirectX::SimpleMath::Vector3 predicted =
+                DirectX::SimpleMath::Vector3::Transform(localDir, W);
+            predicted.Normalize();
+            worstFormula = std::max(
+                worstFormula, DirectX::XMConvertToDegrees(std::acos(std::max(
+                                  -1.0f, std::min(1.0f, predicted.Dot(want))))));
+
+            const DirectX::SimpleMath::Matrix& fromNode =
+                graph.Nodes()[*bone.destinationNode].worldTransform;
+            const DirectX::SimpleMath::Matrix& toNode =
+                graph.Nodes()[*bone.childDestinationNode].worldTransform;
+            DirectX::SimpleMath::Vector3 actual(toNode._41 - fromNode._41,
+                                                toNode._42 - fromNode._42,
+                                                toNode._43 - fromNode._43);
+            if (actual.Length() > 1e-6f) {
+                actual.Normalize();
+                worstApplied = std::max(
+                    worstApplied,
+                    DirectX::XMConvertToDegrees(std::acos(std::max(
+                        -1.0f, std::min(1.0f, actual.Dot(predicted))))));
+            }
+        }
+        std::printf("  %-52s %.4f deg\n", "formula vs motion", worstFormula);
+        std::printf("  %-52s %.4f deg\n", "applied pose vs formula", worstApplied);
+
+        std::printf("  %-52s %d\n", "bones compared against the motion", compared);
+        std::printf("  %-52s %.4f deg\n", "worst bone-direction error", worstAngle);
+        Expect("enough bones to be meaningful", compared >= 12);
+        Expect("every bone points where the motion points it", worstAngle < 0.5f);
+    }
+    std::printf("  %-52s %d\n", "driven bones that left the bind pose", moved);
+    Expect("the pose actually changed the rig", moved >= 12);
+}
 
 int main() {
     auto asset = Parse(kGltf);
@@ -1445,6 +1966,10 @@ int main() {
         still.Build(csAsset.get(), 0, noBuffers, 0);
         Expect("an unanimated asset yields no animations", still.Animations().empty());
     }
+
+    TestConcatenateOrder();
+    TestRetargetRotations();
+    TestRetargetBinding();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed" << std::endl;

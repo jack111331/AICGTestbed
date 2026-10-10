@@ -630,6 +630,34 @@ public:
     // Restores every node to the TRS the asset authored.
     void ResetToBasePose();
 
+    // One node's pose, replacing what the asset authored. Used by retargeting,
+    // which computes a pose from outside the asset's own animations.
+    struct PoseOverride {
+        std::size_t nodeIndex = 0;
+        DirectX::SimpleMath::Quaternion rotation = {0.0f, 0.0f, 0.0f, 1.0f};
+
+        // Translation is optional because a retarget drives rotation on every
+        // bone but position on only the root -- letting the rest translate
+        // would stretch the character's own bone lengths.
+        bool hasTranslation = false;
+        DirectX::SimpleMath::Vector3 translation = {0.0f, 0.0f, 0.0f};
+
+        // Scale is optional for the same reason, and is normally set on one
+        // node only: the root of a joint hierarchy, to resize a whole
+        // character. Setting it per bone would change bone lengths.
+        bool hasScale = false;
+        DirectX::SimpleMath::Vector3 scale = {1.0f, 1.0f, 1.0f};
+    };
+
+    // Replaces the rotation (and optionally translation) of specific nodes,
+    // keeping each one's authored scale. Like ApplyAnimation this writes LOCAL
+    // transforms, so it must run BEFORE UpdateTransforms.
+    //
+    // Returns false if any index is out of range, having applied nothing --
+    // a partially applied pose is worse than none, because the result is a
+    // character bent into a shape no frame ever described.
+    bool ApplyPoseOverrides(const std::vector<PoseOverride>& overrides);
+
     // The asset's skins, parallel to Asset::skins.
     const std::vector<SceneSkin>& Skins() const { return m_skins; }
 

@@ -309,7 +309,7 @@ float4 PSStraight(VSOutput pin) : SV_Target0
         float Distance = length(LightVector);
         float3 LightDirection = normalize(LightVector); // Object to light direction
         float Attenuation = 1.0 / (Distance * Distance);
-        float3 PerLightRadiance = LightColor * Attenuation;
+        float3 PerLightRadiance = 10.0 * LightColor * Attenuation;
 
 
         float3 HalfwayDirection = normalize(LightDirection + ViewDirection);

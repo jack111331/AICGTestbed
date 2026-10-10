@@ -100,14 +100,21 @@ cc_library(
     deps = [":pch"],
 )
 
+# Retargeting HumanML3D motion onto a rigged glTF character: a port of the
+# KeeMap Blender addon that momask-codes' README uses, driven by the bone
+# mapping tools/prepare_retarget.py converts from momask's assets/mapping.json.
 cc_library(
     name = "GLTFAdapter",
     srcs = [
         "GLTFAdapter.cc",
+        # Retargeting poses the SceneGraph, so it lives with it. SceneGraph has
+        # no target of its own to depend on.
+        "MotionRetarget.cc",
         "SceneGraph.cc",
     ],
     hdrs = [
         "GLTFAdapter.hpp",
+        "MotionRetarget.hpp",
         "SceneGraph.hpp",
     ],
     defines = SAMPLE_DEFINES,
@@ -146,10 +153,68 @@ cc_binary(
     ],
 )
 
+# Measures which FloodDiffusion input shapes should be fixed at export time,
+# using ORT free dimension overrides so no re-export is needed to find out.
+cc_binary(
+    name = "fd-probe",
+    srcs = ["fd-probe.cc"],
+    deps = ["//third:onnxruntime"],
+)
+
 cc_binary(
     name = "onnx-smoke",
     srcs = ["onnx-smoke.cc"],
     deps = ["@vcpkg_directxtk12//:onnx"],
+)
+
+cc_library(
+    name = "OrtEnv",
+    srcs = ["OrtEnv.cc"],
+    hdrs = ["OrtEnv.hpp"],
+    defines = SAMPLE_DEFINES,
+    deps = [
+        ":pch",
+        "//third:onnxruntime",
+    ],
+)
+
+# The FloodDiffusion text-to-motion pipeline: a Unigram tokenizer, the four ONNX
+# sessions, the diffusion-forcing sampler and HumanML3D joint recovery.
+#
+# MotionFeatures and Tokenizer carry no D3D12 or ONNX Runtime dependency on
+# purpose, so //Engine:motionfeatures-smoke can exercise the parts that are
+# pure arithmetic without a device.
+cc_library(
+    name = "FloodDiffusion",
+    srcs = [
+        "FloodDiffusion.cc",
+        "MotionFeatures.cc",
+        "Tokenizer.cc",
+    ],
+    hdrs = [
+        "FloodDiffusion.hpp",
+        "MotionFeatures.hpp",
+        "Tokenizer.hpp",
+    ],
+    defines = SAMPLE_DEFINES,
+    deps = [
+        ":OrtEnv",
+        ":pch",
+        "//third:onnxruntime",
+    ],
+)
+
+cc_binary(
+    name = "motionfeatures-smoke",
+    srcs = ["motionfeatures-smoke.cc"],
+    deps = [":FloodDiffusion"],
+)
+
+cc_binary(
+    name = "flooddiffusion-smoke",
+    srcs = ["flooddiffusion-smoke.cc"],
+    data = ["//:media"],
+    deps = [":FloodDiffusion"],
 )
 
 cc_library(
@@ -169,6 +234,7 @@ cc_library(
     deps = [
         ":DeviceResources",
         ":Descriptors",
+        ":OrtEnv",
         ":pch",
         # The ONNX protobuf schema, for OnnxModel.cc. Only the schema -- the
         # graph is translated to DirectML here rather than run by ONNX Runtime.
@@ -182,16 +248,24 @@ cc_library(
 
 cc_library(
     name = "Application",
-    srcs = ["Application.cc"],
+    srcs = [
+        "Application.cc",
+        # The view over the FloodDiffusion pipeline: playback, the skeleton
+        # lines and the UI. Here rather than in :FloodDiffusion because it is
+        # the only part that needs ImGui and DirectXTK12's PrimitiveBatch.
+        "MotionStreamView.cc",
+    ],
     hdrs = [
         "Application.hpp",
         "FindMedia.h",
+        "MotionStreamView.hpp",
     ],
     defines = SAMPLE_DEFINES,
     deps = [
         ":Camera",
         ":Descriptors",
         ":DeviceResources",
+        ":FloodDiffusion",
         ":GLTFAdapter",
         ":ModelManager",
         ":pch",

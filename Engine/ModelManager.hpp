@@ -187,6 +187,13 @@ public:
 
     void ShowImgui();
 
+    // The DirectML device this manager created on the renderer's D3D12 device,
+    // or null if Initialize has not run or DirectML was unavailable. Exposed so
+    // another ONNX Runtime consumer -- FloodDiffusionPipeline -- can attach its
+    // DirectML execution provider to the SAME device rather than creating a
+    // second one on the same adapter.
+    IDMLDevice* DmlDevice() const { return m_dmlDevice.Get(); }
+
 private:
     std::shared_ptr<DX::DeviceResources> m_deviceResources;
     Microsoft::WRL::ComPtr<IDMLDevice> m_dmlDevice;

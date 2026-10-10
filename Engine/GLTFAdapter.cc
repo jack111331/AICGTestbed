@@ -630,10 +630,9 @@ namespace NeuralModelIntegrateTestbed {
         // The scene placement, unchanged: this is now the root transform that
         // every node's own transform is composed onto, rather than the single
         // matrix every mesh was drawn with.
-        const XMVECTORF32 scale = { 1.0f, 1.0f, 1.0f };
-        const XMVECTORF32 translate = { m_position[0], m_position[1], m_position[2] };
-        XMVECTOR rotate = DirectX::SimpleMath::Quaternion::CreateFromYawPitchRoll(.0f, 0.f, .0f);
-        XMMATRIX placement = XMMatrixTransformation(g_XMZero, DirectX::SimpleMath::Quaternion::Identity, scale, g_XMZero, rotate, translate);
+        // Via ScenePlacement so retargeting, which has to aim through this
+        // same transform, cannot drift from what is actually drawn.
+        const DirectX::SimpleMath::Matrix placement = ScenePlacement();
 
         // Top-down pass: each node's world transform is its local transform
         // composed with its parent's, and hidden subtrees drop out of the draw

@@ -38,6 +38,17 @@
 /third/onnxruntime/
 
 # ---------------------------------------------------------------------------
+# FloodDiffusion ONNX models
+# ---------------------------------------------------------------------------
+
+# Staged from a FloodDiffusion export by
+# `python tools/prepare_flooddiffusion.py <onnx_models/tiny>`. 1.2 GB, almost
+# all of it text_encoder.onnx, and the weights are not ours to redistribute.
+# The script regenerates the whole tree, tokenizer.bin and pipeline.txt
+# included. See README.md.
+/resources/FloodDiffusion/
+
+# ---------------------------------------------------------------------------
 # Generated / runtime files
 # ---------------------------------------------------------------------------
 
@@ -90,3 +101,6 @@ desktop.ini
 
 # Shader analysis files
 *.wpix
+
+# Python codes
+*.pyc

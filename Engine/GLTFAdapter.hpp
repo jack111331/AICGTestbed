@@ -120,6 +120,20 @@ namespace NeuralModelIntegrateTestbed {
         // The loaded scene as a hierarchy of SceneNode, each carrying its own
         // transform and the buffer views needed to draw it.
         const SceneGraph &Scene() const { return m_sceneGraph; }
+
+        // Where the whole scene sits. Retargeting needs this to aim at a WORLD
+        // position: the hips translation it writes is in the hips' parent
+        // space, and this placement is the outermost part of that chain, so
+        // ignoring it would offset the character by exactly this much.
+        DirectX::SimpleMath::Matrix ScenePlacement() const {
+            return DirectX::SimpleMath::Matrix::CreateTranslation(
+                m_position[0], m_position[1], m_position[2]);
+        }
+
+        // Retargeting poses the graph from outside, so it needs write access.
+        // Like ApplyAnimation, anything it writes must happen before Render
+        // composes the world transforms.
+        SceneGraph &Scene() { return m_sceneGraph; }
     private:
         fastgltf::Asset m_gltf;
         Microsoft::WRL::ComPtr<ID3D12PipelineState> m_pso;

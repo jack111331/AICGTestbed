@@ -1,0 +1,29 @@
+# Written by tools/prepare_retarget.py from
+# momask-codes assets/mapping.json
+# Correction resolved from the Euler fields, which is what the
+# KeeMap addon uses in EULER mode.
+joints 22
+rotation_mode EULER
+chain 0 2 5 8 11
+chain 0 1 4 7 10
+chain 0 3 6 9 12 15
+chain 9 14 17 19 21
+chain 9 13 16 18 20
+bone 0 Hips mixamorig:Hips 1 1 0.258819067 0.96592582 0 0 3 mixamorig:Spine 0 1 0
+bone 2 RightUpLeg mixamorig:RightUpLeg 1 0 1 0 0 0 5 mixamorig:RightLeg 0 -1 0
+bone 1 LeftUpLeg mixamorig:LeftUpLeg 1 0 1 0 0 0 4 mixamorig:LeftLeg 0 -1 0
+bone 5 RightLeg mixamorig:RightLeg 1 0 0.499999975 0 0.866025418 0 8 mixamorig:RightFoot 0 -1 0
+bone 4 LeftLeg mixamorig:LeftLeg 1 0 -0.258819037 0 0.965925829 0 7 mixamorig:LeftFoot 0 -1 0
+bone 14 RightShoulder mixamorig:RightShoulder 1 0 1 0 0 0 17 mixamorig:RightArm 0 -1 0
+bone 13 LeftShoulder mixamorig:LeftShoulder 1 0 1 0 0 0 16 mixamorig:LeftArm 0 -1 0
+bone 17 RightArm mixamorig:RightArm 1 0 0.862729909 -0.0435778712 -0.498097362 -0.0754790845 19 mixamorig:RightForeArm 0 -1 0
+bone 16 LeftArm mixamorig:LeftArm 1 0 0.862729909 -0.0435778712 0.498097362 0.0754790845 18 mixamorig:LeftForeArm 0 -1 0
+bone 19 RightForeArm mixamorig:RightForeArm 1 0 0.499999975 0 -0.866025418 0 21 mixamorig:RightHand 0 -1 0
+bone 18 LeftForeArm mixamorig:LeftForeArm 1 0 0.707106766 0 0.707106797 0 20 mixamorig:LeftHand 0 -1 0
+bone 3 Spine mixamorig:Spine 1 0 1 0 0 0 6 mixamorig:Spine1 0 1 0
+bone 6 Spine1 mixamorig:Spine1 1 0 1 0 0 0 9 mixamorig:Spine2 0 1 0
+bone 9 Spine2 mixamorig:Spine2 1 0 1 0 0 0 12 mixamorig:Neck 0 1 0
+bone 12 Neck mixamorig:Neck 1 0 1 0 0 0 15 mixamorig:Head 0 0 1
+bone 15 Head mixamorig:Head 1 0 0.984807754 0.173648173 0 0 -1 - 0 0 0
+bone 8 RightFoot mixamorig:RightFoot 1 0 0.0827714876 0.0177357957 0.992022896 0.0934071553 11 mixamorig:RightToeBase 0 0 1
+bone 7 LeftFoot mixamorig:LeftFoot 1 0 0.116090056 0.107660983 -0.980829013 -0.113607478 10 mixamorig:LeftToeBase 0 0 1

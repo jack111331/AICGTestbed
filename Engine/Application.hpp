@@ -11,6 +11,7 @@
 #include "StepTimer.hpp"
 #include "GLTFAdapter.hpp"
 #include "ModelManager.hpp"
+#include "MotionStreamView.hpp"
 #include "Camera.hpp"
 
 // Simple free list based allocator
@@ -110,6 +111,10 @@ private:
 
     void XM_CALLCONV DrawGrid(DirectX::FXMVECTOR xAxis, DirectX::FXMVECTOR yAxis, DirectX::FXMVECTOR origin, size_t xdivs, size_t ydivs, DirectX::GXMVECTOR color);
 
+    // The streamed FloodDiffusion skeleton, drawn with the same line batch as
+    // the grid.
+    void DrawMotionSkeleton();
+
     // Device resources.
     std::shared_ptr<DX::DeviceResources>        m_deviceResources;
 
@@ -159,6 +164,7 @@ private:
 
     NeuralModelIntegrateTestbed::GLTFAdapter m_gltfAdapter;
     NeuralModelIntegrateTestbed::ModelManager m_nnModelManager;
+    NeuralModelIntegrateTestbed::MotionStreamView m_motionStream;
     std::shared_ptr<Camera>                                                 m_camera;
 
     ID3D12DescriptorHeap*        m_imguiSrvDescHeap = nullptr;

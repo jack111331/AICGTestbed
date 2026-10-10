@@ -897,6 +897,40 @@ void SceneGraph::BuildAnimations(const fastgltf::Asset& asset) {
     }
 }
 
+bool SceneGraph::ApplyPoseOverrides(const std::vector<PoseOverride>& overrides) {
+    for (const PoseOverride& entry : overrides) {
+        if (entry.nodeIndex >= m_nodes.size()) {
+            return false;
+        }
+    }
+
+    using DirectX::SimpleMath::Matrix;
+    for (const PoseOverride& entry : overrides) {
+        SceneNode& node = m_nodes[entry.nodeIndex];
+
+        // A node that stored a matrix rather than TRS has no authored scale or
+        // translation to preserve, so the override supplies the whole
+        // transform. glTF forbids animating such a node for the same reason.
+        DirectX::SimpleMath::Vector3 scale =
+            node.hasTrs ? node.baseTransform.scale
+                        : DirectX::SimpleMath::Vector3(1.0f, 1.0f, 1.0f);
+        if (entry.hasScale) {
+            scale = entry.scale;
+        }
+        const DirectX::SimpleMath::Vector3 translation =
+            entry.hasTranslation ? entry.translation
+                                 : (node.hasTrs ? node.baseTransform.translation
+                                                : DirectX::SimpleMath::Vector3::Zero);
+
+        // Same composition order as NodeTransform::ToMatrix: scale, then
+        // rotate, then translate, in the row-vector convention.
+        node.localTransform = Matrix::CreateScale(scale) *
+                              Matrix::CreateFromQuaternion(entry.rotation) *
+                              Matrix::CreateTranslation(translation);
+    }
+    return true;
+}
+
 void SceneGraph::ResetToBasePose() {
     for (SceneNode& node : m_nodes) {
         if (node.hasTrs) {

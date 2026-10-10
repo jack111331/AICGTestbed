@@ -132,6 +132,35 @@ void Sample::Initialize(HWND window, int width, int height)
         }
     }
 
+    // The FloodDiffusion text-to-motion pipeline. Its own object rather than a
+    // ModelManager entry: it is four ONNX sessions driven by a host-side
+    // sampling loop, not one model dispatched by name. A missing
+    // resources/FloodDiffusion is not an error -- the weights are 1.2 GB and
+    // gitignored.
+    //
+    // It is handed this renderer's device and queue plus the IDMLDevice the
+    // ModelManager already made, so the DirectML provider runs on the same
+    // adapter and queue as rendering and there is one IDMLDevice, not two.
+    // Hence this must follow m_nnModelManager.Initialize above.
+    {
+        // The retarget target lives in the glTF scene, so this has to follow
+        // BuildSceneGraph above.
+        m_motionStream.AttachScene(&m_gltfAdapter.Scene(),
+                                   "resources/retarget/mixamo.txt");
+
+        std::string motionError;
+        if (m_motionStream.Load("resources/FloodDiffusion",
+                                m_deviceResources->GetD3DDevice(),
+                                m_deviceResources->GetCommandQueue(),
+                                m_nnModelManager.DmlDevice(),
+                                &motionError)) {
+            std::printf("FloodDiffusion motion pipeline ready\n");
+        } else if (!motionError.empty()) {
+            std::printf("FloodDiffusion motion pipeline unavailable: %s\n",
+                        motionError.c_str());
+        }
+    }
+
     // Setup Dear ImGui context
     ImGui_ImplWin32_EnableDpiAwareness();
     float main_scale = ImGui_ImplWin32_GetDpiScaleForMonitor(::MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
@@ -220,6 +249,15 @@ void Sample::Update(DX::StepTimer const& timer)
     // Before Render, which composes the posed nodes into world transforms and
     // the joint matrices the vertex shader skins with.
     m_gltfAdapter.UpdateAnimation((float)timer.GetElapsedSeconds());
+
+    // Advances the sampler by a bounded number of denoising steps and walks
+    // playback over whatever has been decoded, so the skeleton moves while the
+    // rest of the take is still being generated.
+    // The scene placement is a UI-driven value, so the retarget is told it
+    // every frame rather than at attach time; it has to aim through the same
+    // transform the adapter draws with.
+    m_motionStream.SetScenePlacement(m_gltfAdapter.ScenePlacement());
+    m_motionStream.Update((float)timer.GetElapsedSeconds());
 
     m_audioTimerAcc -= (float)timer.GetElapsedSeconds();
     if (m_audioTimerAcc < 0)
@@ -322,6 +360,7 @@ void Sample::Render()
     const XMVECTORF32 xaxis = { 20.f, 0.f, 0.f };
     const XMVECTORF32 yaxis = { 0.f, 0.f, 20.f };
     DrawGrid(xaxis, yaxis, g_XMZero, 20, 20, Colors::Gray);
+    DrawMotionSkeleton();
 
     // Set the descriptor heaps
     ID3D12DescriptorHeap* heaps[] = { m_resourceDescriptors->Heap(), m_states->Heap() };
@@ -367,6 +406,7 @@ void Sample::Render()
         ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
         m_gltfAdapter.ShowImgui();
         m_nnModelManager.ShowImgui();
+        m_motionStream.ShowImgui();
 
         ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
         ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
@@ -482,6 +522,26 @@ void XM_CALLCONV Sample::DrawGrid(FXMVECTOR xAxis, FXMVECTOR yAxis, FXMVECTOR or
         m_batch->DrawLine(v1, v2);
     }
 
+    m_batch->End();
+
+    PIXEndEvent(commandList);
+}
+
+void Sample::DrawMotionSkeleton()
+{
+    if (!m_motionStream.IsLoaded())
+    {
+        return;
+    }
+
+    auto commandList = m_deviceResources->GetCommandList();
+    PIXBeginEvent(commandList, PIX_COLOR_DEFAULT, L"Draw motion skeleton");
+
+    // Same effect and batch as the grid: vertex-coloured lines in world space,
+    // and m_lineEffect already has this frame's view and projection.
+    m_lineEffect->Apply(commandList);
+    m_batch->Begin(commandList);
+    m_motionStream.Draw(*m_batch);
     m_batch->End();
 
     PIXEndEvent(commandList);
