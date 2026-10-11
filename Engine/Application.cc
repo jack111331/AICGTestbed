@@ -340,6 +340,7 @@ void Sample::Update(DX::StepTimer const& timer)
 
 #pragma region Frame Render
 // Draws the scene.
+
 void Sample::Render()
 {
     // Don't try to render anything before the first Update.
@@ -348,14 +349,151 @@ void Sample::Render()
         return;
     }
 
-    // Prepare the command list to render a new frame.
-    // TODO since we render gltf first, we change the beforeState from D3D12_RESOURCE_STATE_PRESENT to D3D12_RESOURCE_STATE_RENDER_TARGET already
+    // Resets this frame's command allocator and list and transitions the back
+    // buffer out of PRESENT. The list is left open; Present() closes it, so
+    // everything below records into one list -- which is what lets the render
+    // graph put a barrier between the geometry pass and the lighting pass that
+    // reads what it wrote.
     m_deviceResources->Prepare();
-    Clear();
-
     auto commandList = m_deviceResources->GetCommandList();
-    PIXBeginEvent(commandList, PIX_COLOR_DEFAULT, L"Render");
 
+    // Before the graph: the ImGui pass only submits draw data, so the draw data
+    // has to already exist. Panels that inspect this frame's graph therefore
+    // show the PREVIOUS frame's plan, which is why the plan description is kept
+    // from frame to frame rather than cleared.
+    BuildUserInterface();
+
+    // Composes world transforms and places the lights. The lighting pass needs
+    // both and runs inside the graph, so this cannot wait until recording.
+    m_gltfAdapter.UpdateSceneTransforms();
+
+    BuildFrameGraph();
+
+    std::string graphError;
+    if (m_frameGraph.Compile(&graphError))
+    {
+        m_deferred.SetPlanDescription(m_frameGraph.DescribePlan());
+        if (!m_frameGraph.Execute(commandList, &graphError))
+        {
+            // Recording stopped part way, so the frame is incomplete -- but the
+            // command list is still valid and Present() will submit what there
+            // is. Reporting it in the UI beats throwing: a frame that cannot be
+            // recorded is usually a pass that was just edited, and killing the
+            // app loses the message.
+            m_deferred.SetPlanDescription("execute failed: " + graphError);
+        }
+    }
+    else
+    {
+        m_deferred.SetPlanDescription("compile failed: " + graphError);
+    }
+
+    // Outside the graph: a compute dispatch on the same queue that touches
+    // none of the frame's render targets. It would belong in the graph the
+    // moment it produced something a pass reads.
+    //
+    // Dispatched by name. An unregistered name records nothing and returns
+    // false rather than asserting, so a model that failed to load does not
+    // take the frame down with it.
+    m_nnModelManager.RecordModelDispatch(commandList, kNeuralModelName);
+
+    // Show the new frame. Present closes and submits the command list.
+    PIXBeginEvent(m_deviceResources->GetCommandQueue(), PIX_COLOR_DEFAULT, L"Present");
+    m_deviceResources->Present();
+    m_graphicsMemory->Commit(m_deviceResources->GetCommandQueue());
+    PIXEndEvent(m_deviceResources->GetCommandQueue());
+
+    // Advance the descriptor frame clock, then reclaim descriptors retired long
+    // enough ago that the GPU cannot still be reading them. Present() has
+    // already waited for the frame BACK_BUFFER_COUNT ago to complete, so
+    // anything retired before that point is safe; subtracting the back buffer
+    // count keeps a conservative margin rather than plumbing fence values in.
+    auto& descriptorContext = NeuralModelIntegrateTestbed::Descriptors::Context();
+    descriptorContext.AdvanceFrame();
+    const uint64_t frameCount = descriptorContext.GetFrameCount();
+    constexpr uint64_t kInFlightMargin = 3;  // back buffer count + 1
+    if (frameCount > kInFlightMargin) {
+        m_gltfAdapter.ReleaseStaleDescriptors(frameCount - kInFlightMargin);
+    }
+}
+
+// The frame, as a pass list:
+//
+//   GBuffer           geometry -> four material targets + depth
+//   DeferredLighting  those targets -> the back buffer, one light loop per pixel
+//   ForwardOverlay    grid, skeleton, sprites, teapot, depth-tested against the
+//                     deferred geometry because they share its depth buffer
+//   ImGui             last, so the UI is never occluded
+//
+// Order here is execution order; the graph derives the barriers from the
+// accesses each pass declares, not from this list.
+void Sample::BuildFrameGraph()
+{
+    m_frameGraph.BeginFrame();
+
+    // What shows wherever no geometry was drawn: the lighting pass clears the
+    // back buffer and then discards on far-plane depth.
+    const float clearColor[4] = {Colors::CornflowerBlue.f[0], Colors::CornflowerBlue.f[1],
+                                 Colors::CornflowerBlue.f[2], Colors::CornflowerBlue.f[3]};
+    const NeuralModelIntegrateTestbed::DeferredRenderer::FrameTargets targets =
+        m_deferred.ImportFrameTargets(m_frameGraph, *m_deviceResources, clearColor);
+
+    NeuralModelIntegrateTestbed::DeferredRenderer::FrameInputs inputs;
+    inputs.view = m_view;
+    inputs.projection = m_projection;
+    XMStoreFloat3(&inputs.eyePosition, m_camera->mEye);
+
+    // Up to kMaxDeferredLights of them, against the forward path's 4. Gathered
+    // here because the lights belong to the scene, not to the renderer; stored
+    // in a member because the pass holds a pointer to it until Execute runs.
+    inputs.lightCount = m_gltfAdapter.Scene().GatherShaderLights(
+        m_frameLights, NeuralModelIntegrateTestbed::kMaxDeferredLights);
+    inputs.lights = m_frameLights;
+
+    m_deferred.AddPasses(m_frameGraph, targets, inputs,
+                         [this](ID3D12GraphicsCommandList* commandList) {
+                             m_gltfAdapter.RecordGeometry(commandList, m_view, m_projection);
+                         });
+
+    {
+        NeuralModelIntegrateTestbed::Render::RenderPassDesc overlay;
+        overlay.name = "ForwardOverlay";
+        overlay.writes = {
+            {targets.color, NeuralModelIntegrateTestbed::Render::Access::RenderTarget},
+            // Depth-tested, so the graph has to transition depth back out of
+            // the readable state the lighting pass left it in.
+            {targets.depth, NeuralModelIntegrateTestbed::Render::Access::DepthWrite},
+        };
+        overlay.execute = [this](ID3D12GraphicsCommandList* commandList,
+                                 const NeuralModelIntegrateTestbed::Render::PassResources&) {
+            RecordForwardOverlays(commandList);
+        };
+        m_frameGraph.AddPass(std::move(overlay));
+    }
+
+
+    {
+        NeuralModelIntegrateTestbed::Render::RenderPassDesc ui;
+        ui.name = "ImGui";
+        ui.writes = {
+            {targets.color, NeuralModelIntegrateTestbed::Render::Access::RenderTarget}};
+        // ImGui's D3D12 backend sets its own render target and descriptor heap,
+        // so the graph only needs to have the back buffer in the right state --
+        // which is why the write is still declared.
+        ui.bindRenderTargets = false;
+        ui.execute = [this](ID3D12GraphicsCommandList* commandList,
+                            const NeuralModelIntegrateTestbed::Render::PassResources&) {
+            commandList->OMSetRenderTargets(1, &m_deviceResources->GetRenderTargetView(),
+                                            FALSE, nullptr);
+            commandList->SetDescriptorHeaps(1, &m_imguiSrvDescHeap);
+            ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
+        };
+        m_frameGraph.AddPass(std::move(ui));
+    }
+}
+
+void Sample::RecordForwardOverlays(ID3D12GraphicsCommandList* commandList)
+{
     // Draw procedurally generated dynamic grid
     const XMVECTORF32 xaxis = { 20.f, 0.f, 0.f };
     const XMVECTORF32 yaxis = { 0.f, 0.f, 20.f };
@@ -383,9 +521,10 @@ void Sample::Render()
     m_shapeEffect->Apply(commandList);
     m_shape->Draw(commandList);
     PIXEndEvent(commandList);
+}
 
-    PIXEndEvent(commandList);
-
+void Sample::BuildUserInterface()
+{
     // Start the Dear ImGui frame
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -404,6 +543,7 @@ void Sample::Render()
         ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
 
         ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
+        m_deferred.ShowImgui();
         m_gltfAdapter.ShowImgui();
         m_nnModelManager.ShowImgui();
         m_motionStream.ShowImgui();
@@ -422,68 +562,6 @@ void Sample::Render()
 
     // Rendering
     ImGui::Render();
-
-    DX::ThrowIfFailed(commandList->Close());
-    m_deviceResources->GetCommandQueue()->ExecuteCommandLists(1, CommandListCast(&commandList));
-
-    m_gltfAdapter.Render(m_deviceResources, m_world, m_view, m_projection);
-
-    DX::ThrowIfFailed(commandList->Reset(m_deviceResources->GetCommandAllocator(), nullptr));
-
-    // Render Dear ImGui graphics
-    commandList->OMSetRenderTargets(1, &m_deviceResources->GetRenderTargetView(), FALSE, nullptr);
-    commandList->SetDescriptorHeaps(1, &m_imguiSrvDescHeap);
-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
-
-    // Dispatched by name. An unregistered name records nothing and returns
-    // false rather than asserting, so a model that failed to load does not
-    // take the frame down with it.
-    m_nnModelManager.RecordModelDispatch(commandList, kNeuralModelName);
-    // commandList->Close();
-
-    // m_deviceResources->GetCommandQueue()->ExecuteCommandLists(1, CommandListCast(&commandList));
-
-    // Show the new frame.
-    PIXBeginEvent(m_deviceResources->GetCommandQueue(), PIX_COLOR_DEFAULT, L"Present");
-    m_deviceResources->Present();
-    m_graphicsMemory->Commit(m_deviceResources->GetCommandQueue());
-    PIXEndEvent(m_deviceResources->GetCommandQueue());
-
-    // Advance the descriptor frame clock, then reclaim descriptors retired long
-    // enough ago that the GPU cannot still be reading them. Present() has
-    // already waited for the frame BACK_BUFFER_COUNT ago to complete, so
-    // anything retired before that point is safe; subtracting the back buffer
-    // count keeps a conservative margin rather than plumbing fence values in.
-    auto& descriptorContext = NeuralModelIntegrateTestbed::Descriptors::Context();
-    descriptorContext.AdvanceFrame();
-    const uint64_t frameCount = descriptorContext.GetFrameCount();
-    constexpr uint64_t kInFlightMargin = 3;  // back buffer count + 1
-    if (frameCount > kInFlightMargin) {
-        m_gltfAdapter.ReleaseStaleDescriptors(frameCount - kInFlightMargin);
-    }
-}
-
-// Helper method to clear the back buffers.
-void Sample::Clear()
-{
-    auto commandList = m_deviceResources->GetCommandList();
-    PIXBeginEvent(commandList, PIX_COLOR_DEFAULT, L"Clear");
-
-    // Clear the views.
-    auto rtvDescriptor = m_deviceResources->GetRenderTargetView();
-    auto dsvDescriptor = m_deviceResources->GetDepthStencilView();
-
-    commandList->OMSetRenderTargets(1, &rtvDescriptor, FALSE, &dsvDescriptor);
-    commandList->ClearRenderTargetView(rtvDescriptor, Colors::CornflowerBlue, 0, nullptr);
-    commandList->ClearDepthStencilView(dsvDescriptor, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-
-    // Set the viewport and scissor rect.
-    auto viewport = m_deviceResources->GetScreenViewport();
-    auto scissorRect = m_deviceResources->GetScissorRect();
-    commandList->RSSetViewports(1, &viewport);
-    commandList->RSSetScissorRects(1, &scissorRect);
-
-    PIXEndEvent(commandList);
 }
 
 void XM_CALLCONV Sample::DrawGrid(FXMVECTOR xAxis, FXMVECTOR yAxis, FXMVECTOR origin, size_t xdivs, size_t ydivs, GXMVECTOR color)
@@ -605,6 +683,12 @@ void Sample::CreateDeviceDependentResources()
 
     m_graphicsMemory = std::make_unique<GraphicsMemory>(device);
 
+    // The frame graph and the G-buffer it owns. Declared here rather than per
+    // frame: the targets survive across frames, and the graph remembers the
+    // state each one was left in so the next frame's barriers come out right.
+    m_frameGraph.SetDevice(device);
+    m_deferred.CreateDeviceDependentResources(device, m_frameGraph);
+
     m_states = std::make_shared<CommonStates>(device);
 
     m_resourceDescriptors = std::make_shared<DescriptorHeap>(device, Descriptors::Count);
@@ -661,10 +745,18 @@ void Sample::CreateDeviceDependentResources()
         }
 
         {
+            // DepthRead, not DepthNone. The grid and the motion skeleton are
+            // world-space geometry drawn in the forward overlay pass, which now
+            // runs AFTER the deferred lighting resolve rather than before the
+            // scene was drawn. Without a depth test they would paint over the
+            // character instead of being hidden behind it -- the old ordering
+            // got that for free by drawing the lines first and letting the
+            // scene paint over them. Read rather than write, so the lines do
+            // not occlude the overlays that follow.
             EffectPipelineStateDescription pd(
                 &VertexPositionColor::InputLayout,
                 CommonStates::Opaque,
-                CommonStates::DepthNone,
+                CommonStates::DepthRead,
                 CommonStates::CullNone,
                 rtState,
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
@@ -723,6 +815,14 @@ void Sample::CreateDeviceDependentResources()
 void Sample::CreateWindowSizeDependentResources()
 {
     auto size = m_deviceResources->GetOutputSize();
+
+    // Recreates every G-buffer target at the new size, and rewrites the view
+    // onto DeviceResources' depth buffer -- which is a different resource after
+    // a resize, so the old descriptor would point at freed memory.
+    m_frameGraph.Resize(static_cast<std::uint32_t>(size.right),
+                        static_cast<std::uint32_t>(size.bottom));
+    m_deferred.CreateWindowSizeDependentResources(*m_deviceResources);
+
     float aspectRatio = float(size.right) / float(size.bottom);
     float fovAngleY = 70.0f * XM_PI / 180.0f;
 
@@ -750,6 +850,12 @@ void Sample::CreateWindowSizeDependentResources()
 
 void Sample::OnDeviceLost()
 {
+    // Reset() drops the declared G-buffer targets and their views as well as
+    // the pass list, so CreateDeviceDependentResources re-declares them. The
+    // deferred renderer's own PSO and descriptors go with it.
+    m_frameGraph.Reset();
+    m_deferred.OnDeviceLost();
+
     m_texture1.Reset();
     m_texture2.Reset();
 

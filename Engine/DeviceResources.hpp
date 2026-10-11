@@ -54,7 +54,22 @@ namespace DX
         ID3D12CommandAllocator*     GetCommandAllocator() const     { return m_commandAllocators[m_backBufferIndex].Get(); }
         ID3D12GraphicsCommandList*  GetCommandList() const          { return m_commandList.Get(); }
         DXGI_FORMAT                 GetBackBufferFormat() const     { return m_backBufferFormat; }
-        DXGI_FORMAT                 GetDepthBufferFormat() const    { return m_depthBufferFormat; }
+        DXGI_FORMAT                 GetDepthBufferFormat() const     { return m_depthBufferFormat; }
+
+        // The depth buffer is created TYPELESS so the deferred lighting pass can
+        // put a shader resource view on the same bits the depth-stencil view
+        // writes. D3D12 forbids an SRV on a resource created as D32_FLOAT -- the
+        // resource has to be R32_TYPELESS and each view names its own typed
+        // interpretation. GetDepthBufferFormat() still returns the DSV's format,
+        // which is what a PSO and DirectXTK's RenderTargetState want.
+        DXGI_FORMAT                 GetDepthResourceFormat() const  { return TypelessDepthFormat(m_depthBufferFormat); }
+        DXGI_FORMAT                 GetDepthShaderResourceFormat() const { return ShaderResourceDepthFormat(m_depthBufferFormat); }
+
+        // The typeless resource format a depth view format needs, and the
+        // single-channel typed format that reads the depth back. Static so a
+        // caller sizing a PSO or a view does not need a live DeviceResources.
+        static DXGI_FORMAT TypelessDepthFormat(DXGI_FORMAT depthFormat) noexcept;
+        static DXGI_FORMAT ShaderResourceDepthFormat(DXGI_FORMAT depthFormat) noexcept;
         D3D12_VIEWPORT              GetScreenViewport() const       { return m_screenViewport; }
         D3D12_RECT                  GetScissorRect() const          { return m_scissorRect; }
         UINT                        GetCurrentFrameIndex() const    { return m_backBufferIndex; }

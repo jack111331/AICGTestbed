@@ -104,7 +104,27 @@ namespace NeuralModelIntegrateTestbed {
         // reach it through the joint matrices already bound at b2, and through
         // PBR_World for an animated node that is not skinned.
         void UpdateAnimation(float deltaSeconds);
-        void Render(std::shared_ptr<DX::DeviceResources> deviceResources, const DirectX::SimpleMath::Matrix &worldMatrix, const DirectX::SimpleMath::Matrix &viewMatrix, const DirectX::SimpleMath::Matrix &projectionMatrix);
+
+        // Composes every node's world transform and places the scene's lights.
+        // Split out of the old Render because the deferred frame needs the
+        // results before it starts recording: the lighting pass wants the lights
+        // and retargeting wants the transforms, and both run outside the
+        // geometry pass.
+        void UpdateSceneTransforms();
+
+        // Records the geometry draws for the G-buffer pass into the caller's
+        // command list.
+        //
+        // Deliberately does not touch render targets, viewports or barriers --
+        // the render graph owns those, and a pass that re-binds them behind the
+        // graph's back is how a frame ends up with the right draws going to the
+        // wrong place. It also no longer owns a command list: one list per frame
+        // means the graph can put a barrier between this and the lighting pass.
+        //
+        // UpdateSceneTransforms must have run first.
+        void RecordGeometry(ID3D12GraphicsCommandList *commandList,
+                            const DirectX::SimpleMath::Matrix &viewMatrix,
+                            const DirectX::SimpleMath::Matrix &projectionMatrix);
         void ShowImgui();
         // Only the sampler heap comes from the caller now. SRV descriptors for
         // glTF images are allocated from this class's own DescriptorAllocator
@@ -139,8 +159,6 @@ namespace NeuralModelIntegrateTestbed {
         Microsoft::WRL::ComPtr<ID3D12PipelineState> m_pso;
         std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> buffers;
         std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> images;
-        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> commandAllocs[kBackBufferSize][kWorkerThreadSize];
-        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList;
         Microsoft::WRL::ComPtr<ID3D12Resource> cbuffer;
         std::size_t m_currentSceneIdx = 0;
         // Built once in PrepareImage, walked top-down every frame in Render.

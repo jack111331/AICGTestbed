@@ -9,9 +9,11 @@
 
 #include "DeviceResources.hpp"
 #include "StepTimer.hpp"
+#include "DeferredRenderer.hpp"
 #include "GLTFAdapter.hpp"
 #include "ModelManager.hpp"
 #include "MotionStreamView.hpp"
+#include "RenderGraph.hpp"
 #include "Camera.hpp"
 
 // Simple free list based allocator
@@ -104,7 +106,20 @@ private:
     void Update(DX::StepTimer const& timer);
     void Render();
 
-    void Clear();
+    // Builds this frame's pass list. Rebuilt every frame rather than once,
+    // which is what lets a pass be added or dropped by a UI toggle without any
+    // of the other passes' barriers needing to change.
+    void BuildFrameGraph();
+
+    // The forward draws that run after the lighting resolve: the grid, the
+    // motion skeleton, the sprites and the sample's teapot. They share the
+    // deferred depth buffer, so they occlude against the deferred geometry.
+    void RecordForwardOverlays(ID3D12GraphicsCommandList* commandList);
+
+    // Everything between ImGui::NewFrame and ImGui::Render. Called before the
+    // graph records, because the draw data has to exist before the pass that
+    // submits it runs.
+    void BuildUserInterface();
 
     void CreateDeviceDependentResources();
     void CreateWindowSizeDependentResources();
@@ -162,6 +177,14 @@ private:
     DirectX::SimpleMath::Matrix                                             m_view;
     DirectX::SimpleMath::Matrix                                             m_projection;
 
+    NeuralModelIntegrateTestbed::Render::RenderGraph m_frameGraph;
+    NeuralModelIntegrateTestbed::DeferredRenderer m_deferred;
+    // This frame's lights, gathered from the scene. A member rather than a
+    // local in BuildFrameGraph because the lighting pass's callback holds a
+    // pointer to it and does not run until the graph executes, by which time a
+    // local would be gone.
+    NeuralModelIntegrateTestbed::ShaderLight
+        m_frameLights[NeuralModelIntegrateTestbed::kMaxDeferredLights] = {};
     NeuralModelIntegrateTestbed::GLTFAdapter m_gltfAdapter;
     NeuralModelIntegrateTestbed::ModelManager m_nnModelManager;
     NeuralModelIntegrateTestbed::MotionStreamView m_motionStream;

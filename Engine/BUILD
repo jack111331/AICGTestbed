@@ -17,10 +17,17 @@ SAMPLE_DEFINES = [
 # depend on :pch, instead of rediscovering pch.h's transitive needs.
 load("//:shaders.bzl", "hlsl_shader")
 
+# Two entry pairs: the G-buffer write and the deferred lighting resolve. Both
+# live in one .fx file so they share the PBR helpers, the light struct and the
+# material constants -- see the register note in no_texture.fx for why their
+# cbuffers do not overlap.
 hlsl_shader(
     name = "no_texture",
     src = "shaders/no_texture.fx",
-    entry = "Straight",
+    entries = {
+        "GBuffer": "g_gbuffer",
+        "Lighting": "g_deferred_lighting",
+    },
     profile = "6_0", # Shader Model 6.0 for DX12
     out = "no_texture.h"
 )
@@ -124,11 +131,70 @@ cc_library(
         ":Camera",
         ":DeviceResources",
         ":Descriptors",
+        ":GBuffer",
         ":pch",
         "@fastgltf//:fastgltf",
         "//third:stb",
         "@vcpkg_directxtk12//:imgui",
         ":shader_bytecode"
+    ],
+)
+
+# The G-buffer layout. Its own target because three places have to agree on it:
+# the shader that writes it, GLTFAdapter's PSO, and DeferredRenderer's targets.
+cc_library(
+    name = "GBuffer",
+    hdrs = ["GBuffer.hpp"],
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+    deps = [":pch"],
+)
+
+# The render graph: passes declare their resource accesses, the graph places the
+# barriers and records the frame. No D3D12 device is needed to compile a plan,
+# which is what //Engine:rendergraph-smoke exercises.
+cc_library(
+    name = "RenderGraph",
+    srcs = ["RenderGraph.cc"],
+    hdrs = ["RenderGraph.hpp"],
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+    deps = [
+        ":Descriptors",
+        ":pch",
+    ],
+)
+
+cc_binary(
+    name = "rendergraph-smoke",
+    srcs = ["rendergraph-smoke.cc"],
+    defines = SAMPLE_DEFINES,
+    deps = [
+        ":RenderGraph",
+        ":pch",
+    ],
+)
+
+# Deferred shading on top of the render graph: the G-buffer targets, the
+# lighting pipeline and the two passes. Depends on :GLTFAdapter only for
+# ShaderLight out of SceneGraph.hpp -- the geometry itself arrives as a
+# callback, so this does not know what it is drawing.
+cc_library(
+    name = "DeferredRenderer",
+    srcs = ["DeferredRenderer.cc"],
+    hdrs = ["DeferredRenderer.hpp"],
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+    deps = [
+        ":Descriptors",
+        ":DeviceResources",
+        ":GBuffer",
+        ":GLTFAdapter",
+        ":RenderGraph",
+        ":pch",
+        ":shader_bytecode",
+        "@vcpkg_directxtk12//:directxtk12",
+        "@vcpkg_directxtk12//:imgui",
     ],
 )
 
@@ -263,11 +329,13 @@ cc_library(
     defines = SAMPLE_DEFINES,
     deps = [
         ":Camera",
+        ":DeferredRenderer",
         ":Descriptors",
         ":DeviceResources",
         ":FloodDiffusion",
         ":GLTFAdapter",
         ":ModelManager",
+        ":RenderGraph",
         ":pch",
         "@vcpkg_directxtk12//:directxtk12",
         "@vcpkg_directxtk12//:imgui"

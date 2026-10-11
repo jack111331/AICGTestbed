@@ -25,6 +25,41 @@ namespace
 };
 
 // Constructor for DeviceResources.
+// The typeless resource format each depth view format lives in. A depth
+// resource may only be created typeless if something is going to read it as a
+// colour format -- which the deferred lighting pass does -- and the pairing is
+// fixed by D3D12 rather than chosen: see the "DXGI Format Casting Rules" table.
+DXGI_FORMAT DeviceResources::TypelessDepthFormat(DXGI_FORMAT depthFormat) noexcept
+{
+    switch (depthFormat)
+    {
+    case DXGI_FORMAT_D16_UNORM:         return DXGI_FORMAT_R16_TYPELESS;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24G8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT:         return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
+    default: break;
+    }
+    // Already typeless, or a format with no depth interpretation. Returned
+    // unchanged so an unexpected format fails at resource creation with
+    // something specific rather than being silently remapped.
+    return depthFormat;
+}
+
+// How a shader reads those bits back. The stencil half of a packed format is
+// not exposed here -- nothing needs it, and it would want its own SRV.
+DXGI_FORMAT DeviceResources::ShaderResourceDepthFormat(DXGI_FORMAT depthFormat) noexcept
+{
+    switch (depthFormat)
+    {
+    case DXGI_FORMAT_D16_UNORM:         return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_D32_FLOAT:         return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    default: break;
+    }
+    return depthFormat;
+}
+
 DeviceResources::DeviceResources(
     DXGI_FORMAT backBufferFormat,
     DXGI_FORMAT depthBufferFormat,
@@ -380,8 +415,11 @@ void DeviceResources::CreateWindowSizeDependentResources()
         // on this surface.
         CD3DX12_HEAP_PROPERTIES depthHeapProperties(D3D12_HEAP_TYPE_DEFAULT);
 
+        // Typeless, so the deferred lighting pass can read depth through an SRV
+        // while the DSV below still writes it as m_depthBufferFormat. A typed
+        // D32_FLOAT resource cannot carry both views.
         D3D12_RESOURCE_DESC depthStencilDesc = CD3DX12_RESOURCE_DESC::Tex2D(
-            m_depthBufferFormat,
+            TypelessDepthFormat(m_depthBufferFormat),
             backBufferWidth,
             backBufferHeight,
             1, // This depth stencil view has only one texture.

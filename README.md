@@ -140,6 +140,7 @@ bazelisk run //Engine:hello-world
 | `//Engine:imgui-smoke` | Builds an ImGui frame headless; link-checks the DX12 and Win32 backends. |
 | `//Engine:directml-smoke` | Creates a DirectML device and reports the runtime feature level. |
 | `//Engine:stb-smoke` | Decodes a known PNG from memory and from disk, checking pixel values. |
+| `//Engine:rendergraph-smoke` | The render graph's pass compilation and barrier placement. Runs with no D3D12 device at all. |
 | `//Engine:motionfeatures-smoke` | HumanML3D feature decoding and the Unigram tokenizer. No device or model needed. |
 | `//Engine:flooddiffusion-smoke` | Runs the real text-to-motion pipeline end to end on both providers and checks they agree; skips the model sections when `resources/FloodDiffusion/` is absent. |
 
@@ -227,6 +228,121 @@ package declares only its own headers out of the shared vcpkg `include/`.
 - `resources/FloodDiffusion/` — the staged text-to-motion models, written by
   `tools/prepare_flooddiffusion.py` and gitignored. 1.2 GB, almost all of it
   `text_encoder.onnx`, and the weights are not ours to redistribute.
+
+## Rendering
+
+Deferred shading, driven by a render graph.
+
+### Why deferred
+
+Forward shading runs the light loop once per pixel *per primitive covering it*,
+so the cost is `lights x overdraw`. Deferred records each pixel's material
+inputs once and then runs the light loop once per pixel, making the cost
+`lights + overdraw`. That is the only reason to do it, and it is what makes a
+scene with more than a handful of lights affordable: the forward path carried
+four lights in a per-node constant buffer, the deferred path carries 64 in one
+buffer uploaded once a frame.
+
+What it costs in exchange:
+
+- **Bandwidth.** Four render targets written and read back every frame.
+- **One shading model.** Every pixel is shaded by one pixel shader, so a
+  material has to be expressible in the G-buffer's channels.
+- **No transparency.** A blended surface needs the lit colour of what is behind
+  it, and one pixel of G-buffer holds one surface. Nothing in the scene is
+  blended yet; when something is, it belongs in a forward pass after the
+  lighting resolve, sharing the same depth buffer.
+
+### The G-buffer
+
+Four colour targets plus depth. Depth is `DeviceResources`' own depth buffer,
+read back through an SRV rather than duplicated — which is why that resource is
+created `R32_TYPELESS`: D3D12 will not put a shader resource view on a resource
+created as `D32_FLOAT`, so the resource is typeless and each view names its own
+typed interpretation (`DeviceResources::TypelessDepthFormat`).
+
+| Target | Format | Contents |
+|---|---|---|
+| 0 | `R8G8B8A8_UNORM` | base colour rgb (linear), alpha in `a` |
+| 1 | `R16G16B16A16_FLOAT` | world-space shading normal, after normal mapping |
+| 2 | `R8G8B8A8_UNORM` | `r` metallic, `g` roughness, `b` occlusion |
+| 3 | `R11G11B10_FLOAT` | emissive rgb |
+| depth | `D32_FLOAT` | depth; the lighting pass rebuilds a world position from it |
+
+Two of those formats are a judgement rather than an obvious choice, and
+`Engine/GBuffer.hpp` carries the reasoning: normals get 16-bit float because an
+8-bit UNORM normal bands visibly across a smooth specular highlight, and
+emissive gets a float format because it is the one channel legitimately allowed
+above 1.0. Target 0 is deliberately **not** `_SRGB` — it would spend its 8 bits
+where the eye can see them, but it would also apply a transfer function on write
+and undo it on read, silently, which is maddening to debug when a base colour
+does not match its texture.
+
+There is no position target. The lighting pass reconstructs a world position
+from depth and the inverse view-projection, which saves a whole `RGBA16F`
+target for the price of one matrix and a divide.
+
+### The render graph
+
+`Engine/RenderGraph.hpp`. A pass declares which resources it reads and writes
+and in what capacity; the graph works out the resource barriers and records the
+frame into one command list. The frame is currently:
+
+| Pass | Reads | Writes |
+|---|---|---|
+| `GBuffer` | — | 4 G-buffer targets + depth |
+| `DeferredLighting` | 4 G-buffer targets + depth | back buffer |
+| `ForwardOverlay` | — | back buffer + depth |
+| `ImGui` | — | back buffer |
+
+The depth buffer is the reason this is worth having: it is written by the
+geometry pass, **read** by the lighting pass, and written again by the overlays,
+which is two transitions per frame on one resource in an order that depends on
+which passes are enabled. Hand-written barriers get that wrong quietly — the
+symptom of forgetting the transition back to `DEPTH_WRITE` is overlays that
+z-fight, not a validation error.
+
+`Compile()` produces the barrier plan **without a D3D12 device**, which is what
+makes `//Engine:rendergraph-smoke` possible: it asserts on the transitions a
+given frame structure produces, and on the mistakes `Compile()` has to refuse
+(reading a target nothing wrote, reading and writing one resource in one pass,
+using a colour target as depth, clearing a resource the pass did not declare).
+A render graph that silently accepts a mis-ordered pass list is worse than none,
+because the barriers it *does* emit look authoritative.
+
+`DeferredRenderer::ShowImgui` prints the plan the current frame compiled to,
+which is cheaper to read than a capture when the question is only "did the
+transitions happen".
+
+Deliberately not implemented yet, in rough order of value:
+
+- **Transient memory aliasing.** Declared textures are committed resources that
+  live until the next resize. Aliasing needs resource lifetime analysis plus
+  aliasing barriers; the pass list is the hard part and it is already here.
+- **Pass culling.** Every added pass runs. This only matters once passes are
+  added conditionally.
+- **Tiled or clustered light culling.** 64 lights in a flat per-pixel loop is
+  where this stops scaling, and the answer is a pass of its own — which is
+  most of why the light cap is 64 rather than the 1024 a constant buffer would
+  hold.
+- **A G-buffer debug view.** `hlsl_shader` now takes any number of entry pairs,
+  so this is one more pair plus a pass.
+- Split barriers, an async compute queue, multi-threaded recording per pass.
+
+### Where the shading lives
+
+`Engine/shaders/no_texture.fx` holds both entry pairs, so they share the BRDF
+helpers, the light struct and the material constants. The split is exactly the
+old forward pixel shader cut in half: `PSGBuffer` is its material gather
+(texture sampling, normal mapping, occlusion, emissive) writing to four targets
+instead of consuming the values, and `PSLighting` is its shading half reading
+them back. Neither half was rewritten.
+
+Their constant buffers sit at different registers (`b0` for the geometry pass,
+`b3` for lighting) because both entry points live in one file and two `cbuffer`s
+at `b0` collide at declaration even when no single entry point uses both. The
+root signature decides what is actually bound, so the numbers only have to be
+distinct.
 
 ## Text to motion
 
@@ -387,7 +503,9 @@ Known and worth fixing, listed so they do not surprise you:
   the genrule's working directory (there is a `TODO` in the file), which means
   the rule only works for shaders under `Engine/`.
 - **The shader genrule needs `bash`** — it uses `&&` and `cat`. Bazel on Windows
-  invokes MSYS2 bash (`c:\msys64\usr\bin\bash.exe`) for `genrule`.
+  invokes MSYS2 bash (`c:\msys64\usr\bin\bash.exe`) for `genrule`. It now runs
+  `dxc` twice per entry pair and concatenates the generated headers, so a file
+  with more pairs costs more genrule steps but still produces one header.
 - **`@vcpkg_directxtk12` is named after its first package** but now covers the
   whole vcpkg tree including imgui and stb. Renaming it would touch every
   `@vcpkg_directxtk12//:...` label.

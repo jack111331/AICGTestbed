@@ -12,6 +12,7 @@
 #include <directx/d3dx12.h>
 #include <stb_image.h>
 #include "Descriptors/DescriptorContext.hpp"
+#include "GBuffer.hpp"
 #include <no_texture.h>
 
 using namespace DirectX;
@@ -186,19 +187,16 @@ namespace NeuralModelIntegrateTestbed {
         auto uploadEndFuture = resourceUpload.End(deviceResources->GetCommandQueue());
         uploadEndFuture.wait();
 
-        for (size_t i = 0; i < kBackBufferSize; ++i) {
-            for (size_t j = 0; j < kWorkerThreadSize; ++j) {
-                DX::ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(commandAllocs[i][j].ReleaseAndGetAddressOf())));
-                wchar_t name[25] = {};
-                swprintf_s(name, L"Render target %u %u", i, j);
-                commandAllocs[i][j]->SetName(name);
-            }
-        }
-        // After CreateCommandList, the command list is in record state, so we actively close it to turn off its record state
-        DX::ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocs[0][0].Get(), nullptr, IID_PPV_ARGS(commandList.ReleaseAndGetAddressOf()))); // nodeMask set to 0 for single GPU setup
-        DX::ThrowIfFailed(commandList->Close());
-
-        commandList->SetName(L"GLTF command list");
+        // The per-back-buffer, per-worker command allocators and the private
+        // command list this class used to own are gone. The frame is recorded
+        // into one command list now, because the render graph has to be able to
+        // put a resource barrier between the geometry draws and the lighting
+        // pass that reads what they wrote -- which is impossible across two
+        // separately submitted lists without a fence.
+        //
+        // Multi-threaded recording was what the kWorkerThreadSize allocators
+        // were for, and nothing ever used more than [0][0]. When it comes back
+        // it belongs behind the graph, one list per pass, not one per class.
     }
 
     void GLTFAdapter::PrepareImage(std::shared_ptr<DX::DeviceResources> deviceResources) {
@@ -544,9 +542,9 @@ namespace NeuralModelIntegrateTestbed {
         }
 
 
-        const D3D12_SHADER_BYTECODE vertexShader = { g_vertex_shader_bytecode, sizeof(g_vertex_shader_bytecode) };
+        const D3D12_SHADER_BYTECODE vertexShader = { g_gbuffer_vertex_shader_bytecode, sizeof(g_gbuffer_vertex_shader_bytecode) };
         psoDesc.VS = vertexShader;
-        const D3D12_SHADER_BYTECODE pixelShader = { g_pixel_shader_bytecode, sizeof(g_pixel_shader_bytecode) };
+        const D3D12_SHADER_BYTECODE pixelShader = { g_gbuffer_pixel_shader_bytecode, sizeof(g_gbuffer_pixel_shader_bytecode) };
         psoDesc.PS = pixelShader;
         psoDesc.InputLayout = inputLayoutDesc;
         psoDesc.BlendState = CommonStates::Opaque;
@@ -556,12 +554,19 @@ namespace NeuralModelIntegrateTestbed {
         psoDesc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
 
         psoDesc.SampleMask = UINT_MAX;
-        psoDesc.NumRenderTargets = 1;
-        DXGI_FORMAT         rtvFormats[1];
-        rtvFormats[0] = deviceResources->GetBackBufferFormat();
-        DXGI_FORMAT         dsvFormat = deviceResources->GetDepthBufferFormat();
-        memcpy(psoDesc.RTVFormats, rtvFormats, sizeof(DXGI_FORMAT) * 1);
-        psoDesc.DSVFormat = dsvFormat;
+
+        // Four targets now, not the back buffer: this pass writes the G-buffer
+        // and the lighting pass resolves it. The formats have to match the
+        // targets the render graph binds exactly -- a mismatch is a validation
+        // error, which is why both sides read them from GBuffer.hpp.
+        psoDesc.NumRenderTargets = static_cast<UINT>(kGBufferTargetCount);
+        for (std::size_t target = 0; target < kGBufferTargetCount; ++target) {
+            psoDesc.RTVFormats[target] =
+                GBufferFormat(static_cast<GBufferTarget>(target));
+        }
+        // The DSV format, not the resource's: the depth buffer is created
+        // typeless so the lighting pass can also read it through an SRV.
+        psoDesc.DSVFormat = deviceResources->GetDepthBufferFormat();
         psoDesc.SampleDesc.Count = 1;
         psoDesc.NodeMask = 0;
 
@@ -569,12 +574,24 @@ namespace NeuralModelIntegrateTestbed {
         DX::ThrowIfFailed(device->CreateGraphicsPipelineState(&psoDesc, IID_GRAPHICS_PPV_ARGS(&m_pso)));
     }
 
-    void GLTFAdapter::Render(std::shared_ptr<DX::DeviceResources> deviceResources, const DirectX::SimpleMath::Matrix &worldMatrix, const DirectX::SimpleMath::Matrix &viewMatrix, const DirectX::SimpleMath::Matrix &projectionMatrix) {
-        auto device = deviceResources->GetD3DDevice();
+    void GLTFAdapter::UpdateSceneTransforms() {
+        // The scene placement, unchanged: this is the root transform that every
+        // node's own transform is composed onto, rather than the single matrix
+        // every mesh was drawn with.
+        // Via ScenePlacement so retargeting, which has to aim through this
+        // same transform, cannot drift from what is actually drawn.
+        //
+        // Top-down pass: each node's world transform is its local transform
+        // composed with its parent's, and hidden subtrees drop out of the draw
+        // order here rather than being tested per draw.
+        m_sceneGraph.UpdateTransforms(ScenePlacement());
+    }
 
-        DX::ThrowIfFailed(commandAllocs[deviceResources->GetCurrentFrameIndex()][0]->Reset()); // In reality, deviceResource->GetCurrentFrameIndex() will return current back buffer index
-        DX::ThrowIfFailed(commandList->Reset(commandAllocs[deviceResources->GetCurrentFrameIndex()][0].Get(), nullptr));
-        PIXBeginEvent(commandList.Get(), PIX_COLOR_DEFAULT, L"Begin GLTF render");
+    void GLTFAdapter::RecordGeometry(ID3D12GraphicsCommandList *commandList,
+                                     const DirectX::SimpleMath::Matrix &viewMatrix,
+                                     const DirectX::SimpleMath::Matrix &projectionMatrix) {
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        DX::ThrowIfFailed(commandList->GetDevice(IID_PPV_ARGS(device.GetAddressOf())));
         // https://www.reddit.com/r/GraphicsProgramming/comments/1bnb08z/dx12_confusion_about_root_signatures/
         // https://stackoverflow.com/questions/38535725/what-is-the-point-of-d3d12s-setgraphicsrootsignature
         // The "root signature" in DirectX 12 provides the common layout information for sharing data between the CPU data structures and the GPU shader language execution.
@@ -582,31 +599,16 @@ namespace NeuralModelIntegrateTestbed {
         // The setting of pRootSignature through Set*RootSignature() is like holding CPU and GPU function signature along with their constant buffer, texture binding so that when swithcing PSO or partial resources, the other binding doesn't change
         // While the creation of PSO with pRootSignature is like providing hardware and driver info to optimize shader compilation
         // https://learn.microsoft.com/en-us/windows/win32/direct3d12/root-signatures-overview
-        float blendFactor[4] = {0.0, 0.0, 0.0, 0.0};
-        commandList->OMSetBlendFactor(blendFactor); // Set null means (1, 1, 1, 1)
-        
-        commandList->OMSetRenderTargets(1, &deviceResources->GetRenderTargetView(), false, &deviceResources->GetDepthStencilView());
-        // commandList->OMSetStencilRef(0);
-
-        // Application.hpp's Prepare already clear depth and stencil, so we don't need to do it again
-        // D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(deviceResources->GetRenderTarget(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        // commandList->ResourceBarrier(1, &barrier);
-
-        // commandList->ClearDepthStencilView(deviceResources->GetDepthStencilView(), D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, 0, nullptr);
-        // float blackColor[4] = {0.0, 0.0, 0.0, 0.0};
-        // commandList->ClearRenderTargetView(deviceResources->GetRenderTargetView(), blackColor, 0, nullptr);
-
-        auto viewport = deviceResources->GetScreenViewport();
-        auto scissorRect = deviceResources->GetScissorRect();
-        commandList->RSSetViewports(1, &viewport);
-        commandList->RSSetScissorRects(1, &scissorRect);
+        // The render targets, the depth target, the viewport, the scissor rect
+        // and the clears that used to be here are the render graph's: it has
+        // already bound the G-buffer and cleared it before calling this.
 
         // Descriptor heap bindings do not survive a command list reset, and
-        // Application's DirectXTK12 draws rebind their own heaps earlier in the
+        // Application's DirectXTK12 draws rebind their own heaps later in the
         // frame, so re-establish ours here. The sampler heap is registered once;
         // the dynamic SRV heap registers itself as it commits, and the binder
         // reissues SetDescriptorHeaps with both whenever either changes.
-        m_heapBinder.Reset(commandList.Get());
+        m_heapBinder.Reset(commandList);
         m_heapBinder.SetDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, m_commonStates->Heap());
 
         // The dynamic heap has to be reset in step with the command list. It
@@ -627,21 +629,15 @@ namespace NeuralModelIntegrateTestbed {
         commandList->SetPipelineState(m_pso.Get());
         commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-        // The scene placement, unchanged: this is now the root transform that
-        // every node's own transform is composed onto, rather than the single
-        // matrix every mesh was drawn with.
-        // Via ScenePlacement so retargeting, which has to aim through this
-        // same transform, cannot drift from what is actually drawn.
-        const DirectX::SimpleMath::Matrix placement = ScenePlacement();
-
-        // Top-down pass: each node's world transform is its local transform
-        // composed with its parent's, and hidden subtrees drop out of the draw
-        // order here rather than being tested per draw.
-        m_sceneGraph.UpdateTransforms(placement);
-
         // Lights are a property of the scene, not of a node, so they are packed
-        // once and copied into every node's constant buffer. UpdateTransforms
-        // above has just placed them, so this has to follow it.
+        // once and copied into every node's constant buffer.
+        //
+        // Nothing in the G-buffer pass reads them any more -- the deferred
+        // lighting pass has its own, wider, light buffer. They stay filled
+        // because PBR_Constants' layout is pinned by static_asserts either way,
+        // and because a forward pass added later will want them.
+        //
+        // UpdateSceneTransforms must have placed them before this runs.
         ShaderLight frameLights[kMaxShaderLights] = {};
         const std::size_t lightCount =
             m_sceneGraph.GatherShaderLights(frameLights, kMaxShaderLights);
@@ -651,7 +647,7 @@ namespace NeuralModelIntegrateTestbed {
         // is undefined. Unskinned nodes share this one all-identity allocation
         // rather than each paying for 8 KB of identities.
         SharedGraphicsResource identityJoints =
-            GraphicsMemory::Get(device).AllocateConstant<JointMatrixConstants>();
+            GraphicsMemory::Get(device.Get()).AllocateConstant<JointMatrixConstants>();
         {
             auto *joints = static_cast<JointMatrixConstants *>(identityJoints.Memory());
             for (std::size_t j = 0; j < kMaxJointMatrices; ++j) {
@@ -672,7 +668,7 @@ namespace NeuralModelIntegrateTestbed {
         for (const std::size_t nodeIndex : m_sceneGraph.DrawOrder()) {
             const SceneNode &node = m_sceneGraph.Nodes()[nodeIndex];
 
-            PIXBeginEvent(commandList.Get(), PIX_COLOR_DEFAULT, L"Begin GLTF node");
+            PIXBeginEvent(commandList, PIX_COLOR_DEFAULT, L"Begin GLTF node");
 
             PBREffectConstants pbrEffectConstant = {};
             pbrEffectConstant.eyePosition = m_camera->mEye;
@@ -696,7 +692,7 @@ namespace NeuralModelIntegrateTestbed {
             // Therefore, it's suitable for frequently changing resource.
             // https://gamedev.net/forums/topic/678623-d3d12-using-setgraphicsrootview-functions/#post-5291945
             SharedGraphicsResource cBufferResource =
-                GraphicsMemory::Get(device).AllocateConstant(pbrEffectConstant);
+                GraphicsMemory::Get(device.Get()).AllocateConstant(pbrEffectConstant);
             commandList->SetGraphicsRootConstantBufferView(0, cBufferResource.GpuAddress());
 
             // Joint matrices are per (skin, node): the formula divides out this
@@ -707,7 +703,7 @@ namespace NeuralModelIntegrateTestbed {
             SharedGraphicsResource nodeJoints;
             if (node.IsSkinned() && m_sceneGraph.ComputeJointMatrices(nodeIndex, jointMatrices)) {
                 nodeJoints =
-                    GraphicsMemory::Get(device).AllocateConstant<JointMatrixConstants>();
+                    GraphicsMemory::Get(device.Get()).AllocateConstant<JointMatrixConstants>();
                 auto *joints = static_cast<JointMatrixConstants *>(nodeJoints.Memory());
                 const std::size_t count = std::min(jointMatrices.size(), kMaxJointMatrices);
                 for (std::size_t j = 0; j < count; ++j) {
@@ -727,7 +723,7 @@ namespace NeuralModelIntegrateTestbed {
             for (const PrimitiveResource &primitive : node.primitives) {
                 // Per-primitive material factors at b1.
                 SharedGraphicsResource materialResource =
-                    GraphicsMemory::Get(device).AllocateConstant(primitive.material);
+                    GraphicsMemory::Get(device.Get()).AllocateConstant(primitive.material);
                 commandList->SetGraphicsRootConstantBufferView(3, materialResource.GpuAddress());
 
                 // Every slot of the five-wide SRV table gets a descriptor:
@@ -755,16 +751,12 @@ namespace NeuralModelIntegrateTestbed {
                                                 primitive.vertexBufferViews);
                 commandList->IASetIndexBuffer(&primitive.indexBufferView);
 
-                m_srvDynamicHeap->CommitStagedDescriptorsForDraw(commandList.Get(), m_heapBinder);
+                m_srvDynamicHeap->CommitStagedDescriptorsForDraw(commandList, m_heapBinder);
                 commandList->DrawIndexedInstanced(primitive.indexCount, 1, 0, 0, 0);
             }
 
-            PIXEndEvent(commandList.Get());
+            PIXEndEvent(commandList);
         }
-        PIXEndEvent(commandList.Get());
-        DX::ThrowIfFailed(commandList->Close());
-        deviceResources->GetCommandQueue()->ExecuteCommandLists(1, CommandListCast(commandList.GetAddressOf()));
-
     }
 
     void GLTFAdapter::UpdateAnimation(float deltaSeconds) {

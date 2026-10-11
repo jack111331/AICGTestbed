@@ -200,7 +200,7 @@ float3 FresnelSchlick(float cosTheta, float3 F0, float3 F90=float3(1.0, 1.0, 1.0
 
 // Vertex shader: self-created quad.
 [RootSignature(NoTextureRootSignature)]
-VSOutput VSStraight(VSInput v)
+VSOutput VSGBuffer(VSInput v)
 {
     VSOutput vout;
 
@@ -259,8 +259,46 @@ VSOutput VSStraight(VSInput v)
 // Pixel shader: pass-through
 // Reference from https://docs.vulkan.org/tutorial/latest/Building_a_Simple_Engine/Loading_Models/05_pbr_rendering.html
 // and https://github.com/KhronosGroup/glTF-Sample-Renderer/blob/cc27919cacbb235d2f58a0c0203387efce9375f8/source/Renderer/shaders/pbr.frag
+
+// --- the G-buffer -----------------------------------------------------------
+// Deferred shading splits the pixel shader in two: the geometry pass resolves
+// each pixel's material inputs and writes them here, and the lighting pass
+// reads them back once per pixel instead of once per pixel per primitive.
+//
+// Four targets plus depth. The layout is driven by what the shading below
+// actually consumes -- adding a channel is cheap, but a target nothing reads
+// costs bandwidth on every pixel of every frame:
+//
+//   0  R8G8B8A8_UNORM      base colour rgb, alpha in a
+//   1  R16G16B16A16_FLOAT  world-space shading normal (after normal mapping)
+//   2  R8G8B8A8_UNORM      r metallic, g roughness, b occlusion
+//   3  R11G11B10_FLOAT     emissive rgb
+//      D32_FLOAT           depth, which the lighting pass turns back into a
+//                          world position rather than storing one
+//
+// Normals get 16-bit float rather than being packed into 8-bit: a UNORM normal
+// bands visibly on a smooth specular highlight, which is the one place this
+// renderer is going to look at them closely. Octahedral encoding into two
+// channels would be the cheaper fix if bandwidth ever matters.
+//
+// Target 0 stays linear UNORM rather than _SRGB. An sRGB target would spend its
+// 8 bits where the eye can see them, which is the better choice for albedo --
+// but it would also apply a transfer function on write and undo it on read,
+// silently, which is exactly the kind of thing that is maddening to debug when
+// a base colour does not match its texture. Flip both this and the format in
+// DeferredRenderer.cc if the banding in dark albedo ever shows.
+//
+// Mirrors kGBufferTargetCount and the formats in Engine/DeferredRenderer.cc.
+struct GBufferOutput
+{
+    float4 BaseColor : SV_Target0;
+    float4 Normal    : SV_Target1;
+    float4 Material  : SV_Target2;
+    float4 Emissive  : SV_Target3;
+};
+
 [RootSignature(NoTextureRootSignature)]
-float4 PSStraight(VSOutput pin) : SV_Target0
+GBufferOutput PSGBuffer(VSOutput pin)
 {
     // Since GLTF adopt metallic-roughness workflow to model realistic light transportation, we currently implement this lighting model
     // TODO we currently use if-condition in the shader to determine whether the texture is available, future development may require using #ifdef to accelerate it
@@ -294,18 +332,134 @@ float4 PSStraight(VSOutput pin) : SV_Target0
         Emissive = EmissiveTexture.Sample(Sampler, pin.TexCoord).rgb;
     }
 
-    float3 ViewDirection = normalize(PBR_EyePosition - pin.WorldPosition); // Object to camera direction
+    GBufferOutput gbuffer;
+    gbuffer.BaseColor = BaseColor;
+    // Already unit length: both branches above normalise. The lighting pass
+    // normalises again on read, because 16-bit floats do not store a unit
+    // vector exactly.
+    gbuffer.Normal = float4(Normal, 0.0);
+    gbuffer.Material = float4(Metallic, Roughness, AmbientOcclusion, 0.0);
+    gbuffer.Emissive = float4(Emissive, 0.0);
+    return gbuffer;
+}
+
+
+//--------------------------------------------------------------------------------------
+// Deferred lighting
+//
+// One fullscreen draw that reads the G-buffer and runs the shading that used to
+// run per primitive. The body below is the second half of the old PSStraight,
+// unchanged -- only where its inputs come from has changed.
+//
+// Registers do not overlap the geometry pass's on purpose. Both entry points
+// live in one file, so a cbuffer at b0 and another at b0 would collide at
+// declaration even though no single entry point uses both. The root signature
+// decides what is actually bound, so the numbers only have to be distinct.
+//--------------------------------------------------------------------------------------
+
+// How many lights one deferred pass can light a pixel with. The forward path's
+// PBR_MAX_LIGHTS stays at 4 because PBR_Constants is per node -- a 64-light
+// array there would be uploaded once per node per frame. This buffer is
+// uploaded once per frame, so it can afford the room.
+//
+// Mirrors kMaxDeferredLights in Engine/DeferredRenderer.hpp.
+#define DEFERRED_MAX_LIGHTS 64
+
+cbuffer DeferredLightingConstants : register(b3)
+{
+    // Turns a pixel's depth back into a world position. Rebuilding the
+    // position from depth rather than storing it in the G-buffer saves a
+    // full RGBA16F target, at the cost of this matrix and a divide.
+    float4x4 Light_InvViewProj      : packoffset(c0);
+
+    float3   Light_EyePosition      : packoffset(c4);
+    int      Light_Count            : packoffset(c4.w);
+
+    float    Light_TargetWidth      : packoffset(c5.x);
+    float    Light_TargetHeight     : packoffset(c5.y);
+    float2   Light_Pad              : packoffset(c5.z);
+
+    PunctualLight Light_Lights[DEFERRED_MAX_LIGHTS] : packoffset(c6);
+};
+
+// The G-buffer, as written by PSGBuffer above. Read with Load rather than
+// Sample: the lighting pass runs at exactly the G-buffer's resolution, so
+// there is nothing to filter and no sampler to bind.
+Texture2D<float4> GBufferBaseColor : register(t5);
+Texture2D<float4> GBufferNormal    : register(t6);
+Texture2D<float4> GBufferMaterial  : register(t7);
+Texture2D<float4> GBufferEmissive  : register(t8);
+Texture2D<float>  GBufferDepth     : register(t9);
+
+#define DeferredLightingRootSignature \
+    "RootFlags(DENY_DOMAIN_SHADER_ROOT_ACCESS | " \
+              "DENY_GEOMETRY_SHADER_ROOT_ACCESS | " \
+              "DENY_HULL_SHADER_ROOT_ACCESS), " \
+              "CBV(b3), " \
+              "DescriptorTable ( SRV(t5, numDescriptors = 5), visibility = SHADER_VISIBILITY_PIXEL )"
+
+struct LightingVSOutput
+{
+    float4 NDCPosition : SV_Position;
+};
+
+// A fullscreen triangle from three vertices and no vertex buffer. Bigger than
+// the screen, so the parts outside it are clipped rather than rasterised; a
+// quad would need two triangles and would rasterise the diagonal twice.
+[RootSignature(DeferredLightingRootSignature)]
+LightingVSOutput VSLighting(uint vertexId : SV_VertexID)
+{
+    LightingVSOutput vout;
+    const float2 xy = float2((vertexId == 1) ? 3.0 : -1.0,
+                             (vertexId == 2) ? 3.0 : -1.0);
+    vout.NDCPosition = float4(xy, 0.0, 1.0);
+    return vout;
+}
+
+[RootSignature(DeferredLightingRootSignature)]
+float4 PSLighting(LightingVSOutput pin) : SV_Target0
+{
+    const int3 pixel = int3(pin.NDCPosition.xy, 0);
+
+    // Nothing was drawn here, so leave whatever cleared the target. Geometry
+    // that genuinely lands on the far plane is discarded with it, which is the
+    // usual trade for not carrying a separate coverage channel.
+    const float Depth = GBufferDepth.Load(pixel);
+    if (Depth >= 1.0)
+    {
+        discard;
+    }
+
+    const float4 BaseColor = GBufferBaseColor.Load(pixel);
+    const float3 Normal = normalize(GBufferNormal.Load(pixel).xyz);
+    const float4 MaterialSample = GBufferMaterial.Load(pixel);
+    const float Metallic = MaterialSample.r;
+    const float Roughness = MaterialSample.g;
+    const float AmbientOcclusion = MaterialSample.b;
+    const float3 Emissive = GBufferEmissive.Load(pixel).rgb;
+
+    // Pixel centre -> NDC -> world. The y flip is the usual one between a
+    // top-left pixel origin and a bottom-left NDC origin. mul(vector, matrix)
+    // matches the row-vector convention the rest of this file uses.
+    const float2 ScreenUV = (pin.NDCPosition.xy + 0.5) /
+                            float2(Light_TargetWidth, Light_TargetHeight);
+    const float4 ClipPosition = float4(ScreenUV.x * 2.0 - 1.0,
+                                       1.0 - ScreenUV.y * 2.0, Depth, 1.0);
+    const float4 WorldPosition4 = mul(ClipPosition, Light_InvViewProj);
+    const float3 WorldPosition = WorldPosition4.xyz / WorldPosition4.w;
+
+    float3 ViewDirection = normalize(Light_EyePosition - WorldPosition); // Object to camera direction
     float3 ViewReflectionDirection = reflect(-ViewDirection, Normal); // The reflection direction of Object to camera direction, reflect require incident direction (Therefore -ViewDirection)
 
     // BaseReflectivity represents reflectance at normal incidence, or a 0-degree angle straight-on in Fresnel-Schlick approximation, denoted as F_0 in its equation
     float3 DialectricBaseReflectivity = float3(0.04, 0.04, 0.04); // 4% base reflectivity for non-metal objects
 
     float3 Radiance = float3(0.0, 0.0, 0.0);
-    for (int i = 0; i < PBR_LightCount; ++i) {
-        float3 LightPos = PBR_Lights[i].Position;
-        float3 LightColor = PBR_Lights[i].Color;
+    for (int i = 0; i < Light_Count; ++i) {
+        float3 LightPos = Light_Lights[i].Position;
+        float3 LightColor = Light_Lights[i].Color;
 
-        float3 LightVector = LightPos - pin.WorldPosition;
+        float3 LightVector = LightPos - WorldPosition;
         float Distance = length(LightVector);
         float3 LightDirection = normalize(LightVector); // Object to light direction
         float Attenuation = 1.0 / (Distance * Distance);
