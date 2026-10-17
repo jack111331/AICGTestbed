@@ -190,6 +190,47 @@ static_assert(offsetof(ShaderLight, outerConeCos) == 52, "PunctualLight::OuterCo
 // silently misalign everything after the array in that constant buffer.
 constexpr std::size_t kMaxShaderLights = 4;
 
+// Which image a glTF texture actually points at: the MSFT_texture_dds source
+// when there is one, otherwise the ordinary source.
+//
+// Exposed because the loader needs the same answer the material resolution
+// does. An asset that ships both a .dds and an unreferenced .png per texture --
+// which is what MSFT_texture_dds assets do -- would otherwise have every .png
+// decoded to RGBA8 and never looked at.
+std::optional<std::size_t> TextureImageSource(const fastgltf::Texture& texture);
+
+// A view frustum as six world-space planes, each (a, b, c, d) with
+// a*x + b*y + c*z + d >= 0 on the inside.
+//
+// Written out rather than using DirectXMath's BoundingFrustum because the
+// planes come straight out of the clip-space inequalities and so do not depend
+// on a left- or right-handed convention being guessed correctly:
+// BoundingFrustum::CreateFromMatrix takes the projection alone plus an
+// rhcoords flag, and then has to be transformed by the inverse view, which is
+// two more places to get a convention wrong. //Engine:scenegraph-smoke pins
+// this version down against the same CreateLookAt and
+// CreatePerspectiveFieldOfView the application uses.
+struct ViewFrustum {
+    // left, right, bottom, top, near, far
+    DirectX::SimpleMath::Vector4 planes[6] = {};
+
+    // From the combined view-projection, in the row-vector convention this
+    // project uses throughout: clip = world * view * projection.
+    //
+    // For clip.x = p . column1 and so on, D3D's visible region is
+    // -w <= x <= w, -w <= y <= w, 0 <= z <= w, so each bound rearranges into a
+    // plane built from a sum or difference of the matrix's columns.
+    static ViewFrustum FromViewProjection(
+        const DirectX::SimpleMath::Matrix& viewProjection);
+
+    // Conservative: returns false only when the box is wholly outside. A box
+    // straddling a plane is kept, and a box outside two planes at once can
+    // still be reported as intersecting -- both are the right way to be wrong
+    // for culling.
+    bool Intersects(const DirectX::SimpleMath::Vector3& centre,
+                    const DirectX::SimpleMath::Vector3& extent) const;
+};
+
 // Packs one resolved light into its shader form.
 ShaderLight ToShaderLight(const SceneLight& light);
 
@@ -410,6 +451,31 @@ struct MaterialConstants {
     // the only place that knows both halves. Fills the last padding slot, so
     // the layout is unchanged again.
     int isSkinned = 0;
+
+    // --- KHR_materials_pbrSpecularGlossiness -----------------------------
+    // c7
+    // The extension's own factors, kept in their authored form so the
+    // conversion to metallic-roughness can happen per PIXEL in PSGBuffer.
+    //
+    // Converting per material on the CPU is not good enough. The solve reads
+    // metalness out of the specular colour, and a material that keeps its
+    // specular in a texture has a factor of (1,1,1) meaning "use the texture
+    // as-is" -- which solves to fully metallic. Measured on the Lumberyard
+    // Bistro that is what `Plaster` and `Beams` carry, so a factor-only
+    // conversion turns the street to chrome; their _spec texture is what makes
+    // them dielectric. 108 of its 234 spec-gloss materials are in that case.
+    DirectX::XMFLOAT3 specularFactor = {1.0f, 1.0f, 1.0f};
+    float glossinessFactor = 1.0f;
+    // c8 -- when set, baseColorFactor carries diffuseFactor and the
+    // metallic-roughness texture slot carries the specularGlossinessTexture.
+    int isSpecularGlossiness = 0;
+    float specularGlossinessPadding[3] = {0.0f, 0.0f, 0.0f};
+
+    // c9 -- where this primitive's chart sits in the lightmap atlas:
+    // lightmapUv * xy + zw. A zero scale means "no chart", which is the
+    // shader's signal that nothing was baked here and the shadow map is the
+    // only answer available. Per primitive, which is what this buffer is.
+    DirectX::XMFLOAT4 lightmapScaleOffset = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 static_assert(sizeof(MaterialConstants) % 16 == 0,
               "MaterialConstants must be a multiple of 16 bytes for a CBV");
@@ -440,7 +506,11 @@ static_assert(offsetof(MaterialConstants, occlusionTexCoord)  ==  96, "c6.x");
 static_assert(offsetof(MaterialConstants, emissiveTexCoord)   == 100, "c6.y");
 static_assert(offsetof(MaterialConstants, hasTangents)        == 104, "c6.z");
 static_assert(offsetof(MaterialConstants, isSkinned)         == 108, "c6.w");
-static_assert(sizeof(MaterialConstants) == 112,
+static_assert(offsetof(MaterialConstants, specularFactor)   == 112, "c7");
+static_assert(offsetof(MaterialConstants, glossinessFactor) == 124, "c7.w");
+static_assert(offsetof(MaterialConstants, isSpecularGlossiness) == 128, "c8.x");
+static_assert(offsetof(MaterialConstants, lightmapScaleOffset) == 144, "c9");
+static_assert(sizeof(MaterialConstants) == 160,
               "MaterialConstants packoffsets in no_texture.fx assume this layout");
 
 // Mirrors `cbuffer JointMatrices : register(b2)` in shaders/no_texture.fx.
@@ -469,8 +539,15 @@ enum class VertexStream : std::size_t {
     Tangent,
     Joints0,
     Weights0,
+    // glTF's second UV set, used here as LIGHTMAP UVs: a non-overlapping
+    // parameterisation of the surface, which is what a baked per-surface result
+    // has to be addressed by. TEXCOORD_0 cannot serve -- it is a texturing UV
+    // and on a converted scene it tiles, so it addresses the same texel from
+    // many places. Zero where an asset has no second set, which is what
+    // PrimitiveResource::hasLightmapUv records.
+    TexCoord1,
 };
-constexpr std::size_t kVertexStreamCount = 6;
+constexpr std::size_t kVertexStreamCount = 7;
 
 // Everything needed to issue one DrawIndexedInstanced, resolved at load time.
 struct PrimitiveResource {
@@ -485,8 +562,33 @@ struct PrimitiveResource {
     // where the material has no texture for that slot.
     std::optional<std::size_t> textureImageIndex[kMaterialTextureSlotCount];
 
+    // False when the mesh carries no second UV set, so nothing can be baked
+    // for it and the shader must fall back to the shadow map. The chart's
+    // placement itself lives in `material`, which is the buffer that is
+    // uploaded -- see MaterialConstants::lightmapScaleOffset. It is per
+    // INSTANCE, not per mesh: the same mesh placed in two places receives two
+    // different shadows, and this asset instances 2909 nodes from 551 meshes.
+    bool hasLightmapUv = false;
+
+    // Which five-descriptor block of the renderer's material descriptor heap
+    // holds the slots above. Filled in after the graph is built by whoever owns
+    // that heap -- the tuple above is what the block is deduplicated on, so two
+    // primitives naming the same five images share an index.
+    std::uint32_t materialTableIndex = 0;
+
     // Uploaded to b1 before this primitive is drawn.
     MaterialConstants material;
+
+    // Local-space axis-aligned bounds, straight from the POSITION accessor's
+    // min/max -- glTF requires those on POSITION specifically, so they are free
+    // and exact rather than something to compute from the vertex data.
+    //
+    // Only used to frame the camera so far. A scene whose contents sit 800
+    // units from the origin, as a converted street does, is otherwise invisible
+    // no matter how correctly it loads.
+    DirectX::XMFLOAT3 localMin = {0.0f, 0.0f, 0.0f};
+    DirectX::XMFLOAT3 localMax = {0.0f, 0.0f, 0.0f};
+    bool hasBounds = false;
 
     bool HasStream(VertexStream stream) const {
         return vertexBufferViews[static_cast<std::size_t>(stream)].SizeInBytes != 0;
@@ -516,6 +618,18 @@ struct PrimitiveResource {
 
 // One glTF node: where it sits in the hierarchy, its transform, and the
 // resources required to draw whatever mesh it references.
+// The world-space axis-aligned bounds of one primitive under a node transform.
+// False when the primitive has no authored bounds, in which case it must not be
+// culled.
+//
+// Transforming an AABB needs the absolute value of the matrix's linear part:
+// a rotation turns the box, and the smallest axis-aligned box still containing
+// it is given by projecting the extent onto each axis with signs discarded.
+bool PrimitiveWorldBounds(const PrimitiveResource& primitive,
+                          const DirectX::SimpleMath::Matrix& world,
+                          DirectX::SimpleMath::Vector3& centre,
+                          DirectX::SimpleMath::Vector3& extent);
+
 class SceneNode {
 public:
     std::string name;
@@ -571,7 +685,19 @@ public:
     // above: a joint may itself carry a skinned mesh.
     bool isJoint = false;
 
+    // True when this node's world transform can change between frames: an
+    // animation channel targets it or an ancestor, a skin drives it, or its
+    // mesh is skinned and so deforms where the authored bounds say it will
+    // not. Anything with this clear is geometry whose depth is the same in
+    // every frame, which is what makes a cached shadow map possible.
+    //
+    // Computed once at the end of Build, over EVERY animation rather than the
+    // selected one -- a node a different clip would move is not static, and
+    // changing clips must not quietly invalidate a cache.
+    bool movesAtRuntime = false;
+
     bool HasGeometry() const { return !primitives.empty(); }
+    bool IsStaticGeometry() const { return HasGeometry() && !movesAtRuntime; }
     bool IsSkinned() const { return skinIndex.has_value(); }
 };
 
@@ -594,6 +720,11 @@ public:
     bool Empty() const { return m_nodes.empty(); }
     std::size_t NodeCount() const { return m_nodes.size(); }
     const std::vector<SceneNode>& Nodes() const { return m_nodes; }
+    // Mutable access for the renderer's own per-primitive bookkeeping, which is
+    // only resolvable once the graph exists: see
+    // PrimitiveResource::materialTableIndex. Deliberately narrow in name --
+    // this is not a general-purpose handle on the graph's contents.
+    std::vector<SceneNode>& NodesForResourceBinding() { return m_nodes; }
     const std::vector<std::size_t>& RootNodes() const { return m_roots; }
     const std::string& SceneName() const { return m_sceneName; }
 
@@ -601,6 +732,14 @@ public:
     // subtrees hidden in the UI. The render loop iterates this instead of
     // recursing itself.
     const std::vector<std::size_t>& DrawOrder() const { return m_drawOrder; }
+    // DrawOrder() partitioned by SceneNode::movesAtRuntime, in the same order.
+    // The two together are exactly DrawOrder()'s contents.
+    const std::vector<std::size_t>& StaticDrawOrder() const {
+        return m_staticDrawOrder;
+    }
+    const std::vector<std::size_t>& MovingDrawOrder() const {
+        return m_movingDrawOrder;
+    }
 
     // Every punctual light the asset instances, in node order. Positions and
     // directions are only meaningful after UpdateTransforms has run, and the
@@ -612,12 +751,24 @@ public:
     // rather than blended, so the count is also how many the shader may read.
     std::size_t GatherShaderLights(ShaderLight* out, std::size_t maxLights) const;
 
+    // World-space bounds of everything in the draw order, from each primitive's
+    // local AABB transformed by its node. Returns false when nothing in the
+    // scene has bounds. UpdateTransforms must have run: this reads the world
+    // transforms it composes.
+    bool WorldBounds(DirectX::XMFLOAT3& outMin, DirectX::XMFLOAT3& outMax) const;
+
     // Lights the asset instances but PBR_Constants has no room for. Non-zero
     // means the render is missing light, so it is worth surfacing.
     std::size_t DroppedLightCount(std::size_t maxLights) const;
 
     // The asset's animations, parallel to Asset::animations.
     const std::vector<SceneAnimation>& Animations() const { return m_animations; }
+
+    // How many drawable nodes can and cannot move. Reported in the UI, and
+    // worth looking at before trusting a shadow cache: a scene where most
+    // nodes move has nothing to gain from one.
+    std::size_t StaticGeometryNodeCount() const { return m_staticGeometryNodes; }
+    std::size_t MovingGeometryNodeCount() const { return m_movingGeometryNodes; }
 
     // Poses every animated node by sampling `animationIndex` at `time` seconds.
     // Nodes the animation does not target keep their authored TRS. Must run
@@ -732,8 +883,13 @@ private:
     // Copies every animation's keyframes to the CPU. Runs after the nodes
     // exist, since channel targets are range-checked against them.
     void BuildAnimations(const fastgltf::Asset& asset);
+    // Flags every node whose world transform can change. Runs last: it needs
+    // the animations parsed, the skins resolved and the parent links set.
+    void MarkMovingNodes();
 
     std::vector<SceneNode> m_nodes;
+    std::size_t m_staticGeometryNodes = 0;
+    std::size_t m_movingGeometryNodes = 0;
     std::vector<SceneLight> m_lights;
     std::vector<SceneSkin> m_skins;
     std::vector<SceneAnimation> m_animations;
@@ -748,6 +904,8 @@ private:
     bool m_jointWeightFormatSeen = false;
     std::vector<std::size_t> m_roots;
     std::vector<std::size_t> m_drawOrder;
+    std::vector<std::size_t> m_staticDrawOrder;
+    std::vector<std::size_t> m_movingDrawOrder;
     std::string m_sceneName;
     std::optional<std::size_t> m_selected;
 };

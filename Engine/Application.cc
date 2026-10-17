@@ -7,6 +7,14 @@
 
 #include "pch.h"
 #include "Application.hpp"
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <vector>
 #include "Descriptors/DescriptorContext.hpp"
 
 #include "imgui.h"
@@ -42,6 +50,129 @@ Sample::~Sample()
         m_deviceResources->WaitForGpu();
     }
 }
+
+namespace {
+
+// Where to look for a scene, in order of preference. A directory rather than a
+// file, because an FBX-to-glTF export names the .gltf after the source file and
+// that name is whatever the exporter felt like -- so the first .gltf or .glb in
+// the directory is taken.
+//
+// Bistro first, then the small authored scenes, so dropping an export into
+// resources/bistro/ is all it takes to switch. See the README for how to get
+// and stage it; it is not in the repository and cannot be, at 2.8M triangles
+// and a CC-BY attribution requirement.
+constexpr const char *kSceneDirectories[] = {
+    // A sibling checkout, the same arrangement fastgltf uses. This is the
+    // niagara project's conversion of NVIDIA's rtxdi-assets Bistro: glTF with
+    // MSFT_texture_dds and specular-glossiness materials, MIT licensed.
+    "../niagara_bistro",
+    "resources/bistro/interior-wine",
+    "resources/bistro/interior",
+    "resources/bistro/exterior",
+};
+
+// The scene used when none of the above is staged.
+constexpr const char *kFallbackScene =
+    "resources/microphone_and_animated_char/scene_withlight_animated_char.gltf";
+
+// Longest edge any texture may keep. Every image is decoded to RGBA8 with a
+// full mip chain and no BC compression, so an uncapped large scene runs the
+// GPU out of memory part way through loading. 2048 costs 22 MB per texture and
+// leaves the authored scenes untouched.
+constexpr std::uint32_t kDefaultMaxTextureDimension = 2048;
+
+std::string FirstGltfIn(const std::filesystem::path &directory) {
+    std::error_code error;
+    if (!std::filesystem::is_directory(directory, error)) {
+        return {};
+    }
+    // Sorted, so a directory holding more than one export picks the same file
+    // every run rather than depending on the filesystem's order.
+    std::vector<std::string> candidates;
+    for (const auto &entry : std::filesystem::directory_iterator(directory, error)) {
+        if (!entry.is_regular_file(error)) {
+            continue;
+        }
+        const std::filesystem::path extension = entry.path().extension();
+        if (extension == ".gltf" || extension == ".glb") {
+            candidates.push_back(entry.path().generic_string());
+        }
+    }
+    if (candidates.empty()) {
+        return {};
+    }
+    std::sort(candidates.begin(), candidates.end());
+    return candidates.front();
+}
+
+// PTFLIO_SCENE overrides everything, so a scene staged anywhere can be loaded
+// without a rebuild.
+std::string ResolveScenePath() {
+    if (const char *fromEnvironment = std::getenv("PTFLIO_SCENE")) {
+        if (*fromEnvironment != '\0') {
+            return fromEnvironment;
+        }
+    }
+    for (const char *directory : kSceneDirectories) {
+        const std::string found = FirstGltfIn(directory);
+        if (!found.empty()) {
+            return found;
+        }
+    }
+    return kFallbackScene;
+}
+
+// Which environment map to use as the sky.
+//
+// PTFLIO_SKYBOX names one explicitly; otherwise the first .hdr beside the
+// scene is taken. Deliberately only .hdr and not "any image beside the scene":
+// the Bistro ships 390 .dds textures in the same tree and picking one of those
+// at random would be worse than no sky.
+std::string ResolveSkyboxPath(const std::string& scenePath) {
+    if (const char *fromEnvironment = std::getenv("PTFLIO_SKYBOX")) {
+        if (*fromEnvironment != '\0') {
+            return fromEnvironment;
+        }
+    }
+    std::error_code error;
+    const std::filesystem::path directory =
+        std::filesystem::path(scenePath).parent_path();
+    if (directory.empty() || !std::filesystem::is_directory(directory, error)) {
+        return {};
+    }
+    std::vector<std::string> candidates;
+    for (const auto &entry : std::filesystem::directory_iterator(directory, error)) {
+        if (!entry.is_regular_file(error)) {
+            continue;
+        }
+        if (entry.path().extension() == ".hdr") {
+            candidates.push_back(entry.path().generic_string());
+        }
+    }
+    if (candidates.empty()) {
+        return {};
+    }
+    std::sort(candidates.begin(), candidates.end());
+    return candidates.front();
+}
+
+// PTFLIO_MAX_TEXTURE caps the longest texture edge; 0 removes the cap.
+std::uint32_t ResolveMaxTextureDimension() {
+    if (const char *fromEnvironment = std::getenv("PTFLIO_MAX_TEXTURE")) {
+        try {
+            const int parsed = std::stoi(fromEnvironment);
+            if (parsed >= 0) {
+                return static_cast<std::uint32_t>(parsed);
+            }
+        } catch (const std::exception &) {
+            // Left at the default rather than failing to start over a typo.
+        }
+    }
+    return kDefaultMaxTextureDimension;
+}
+
+}  // namespace
 
 // Initialize the Direct3D resources required to run.
 void Sample::Initialize(HWND window, int width, int height)
@@ -86,15 +217,39 @@ void Sample::Initialize(HWND window, int width, int height)
     m_effect1->Play(true);
     m_effect2->Play();
 
-    // m_gltfAdapter.Initialize("resources/microphone_gxl_066_bafhcteks/scene_withlight.gltf");
-    m_gltfAdapter.Initialize("resources/microphone_and_animated_char/scene_withlight_animated_char.gltf");
-    // m_gltfAdapter.Initialize("resources/TestGLTF/WithTexture.gltf");
+    // Which scene, and how much texture memory it is allowed. Both are
+    // resolved rather than hardcoded so a large staged scene can be loaded
+    // without editing this file -- see ResolveScenePath above.
+    //
+    // Reported on stderr, not stdout: this is a WINDOWS-subsystem binary, so
+    // stdout goes nowhere when the app is launched normally.
+    const std::string scenePath = ResolveScenePath();
+    const std::uint32_t maxTextureDimension = ResolveMaxTextureDimension();
+    std::fprintf(stderr, "scene: %s\n", scenePath.c_str());
+
+    m_gltfAdapter.SetMaxTextureDimension(maxTextureDimension);
+    m_gltfAdapter.Initialize(scenePath);
     m_gltfAdapter.SetCommonStates(m_states);
     m_gltfAdapter.AssignCamera(m_camera);
     m_gltfAdapter.PrepareBuffer(m_deviceResources);
     m_gltfAdapter.PrepareImage(m_deviceResources);
     m_gltfAdapter.BuildSceneGraph();
     m_gltfAdapter.PreparePSO(m_deviceResources);
+    // After PreparePSO, because it needs the scene graph built and the
+    // transforms composable.
+    FrameSceneWithCamera();
+
+    // The sky. A scene without one renders against the clear colour, so a
+    // failure here is reported and then shrugged off rather than thrown.
+    const std::string skyboxPath = ResolveSkyboxPath(scenePath);
+    if (!skyboxPath.empty()) {
+        std::string skyboxError;
+        if (!m_deferred.LoadEnvironment(*m_deviceResources, skyboxPath, &skyboxError)) {
+            std::fprintf(stderr, "skybox: %s: %s\n", skyboxPath.c_str(),
+                         skyboxError.c_str());
+            std::fflush(stderr);
+        }
+    }
 
     m_nnModelManager.Initialize(m_deviceResources);
     {
@@ -236,15 +391,17 @@ void Sample::Update(DX::StepTimer const& timer)
     static Vector3 eye(0.0f, 0.7f, 1.5f);
     static Vector3 at(0.0f, -0.1f, 0.0f);
 
-    // m_view = Matrix::CreateLookAt(eye, at, Vector3::UnitY);
-    m_view = Matrix::CreateLookAt(m_camera->mEye, m_camera->mAt, m_camera->mUp);
-
     m_world = Matrix::CreateRotationY(float(timer.GetTotalSeconds() * XM_PIDIV4));
 
-    m_lineEffect->SetView(m_view);
     m_lineEffect->SetWorld(Matrix::Identity);
 
-    m_shapeEffect->SetView(m_view);
+    // The view matrix is NOT built here. It used to be, at the top of Update,
+    // which is before the mouse handling further down moves the camera -- so it
+    // described where the camera was on the PREVIOUS frame while
+    // BuildFrameGraph read m_camera->mEye fresh for the lighting and the sky.
+    // A frame then mixed a stale view-projection with a fresh eye position,
+    // which disagree by exactly the frame's camera motion. UpdateViewMatrix is
+    // called from Render instead, so every consumer reads one instant.
 
     // Before Render, which composes the posed nodes into world transforms and
     // the joint matrices the vertex shader skins with.
@@ -297,49 +454,107 @@ void Sample::Update(DX::StepTimer const& timer)
         m_gamePadButtons.Reset();
     }
 
+    // Everything below shares the mouse and keyboard with Dear ImGui, so it
+    // has to ask first.
+    //
+    // These two flags are computed inside ImGui::NewFrame, which runs in
+    // Render -- so what is read here is the PREVIOUS frame's answer. That is
+    // the one frame of lag every ImGui integration lives with, and it is
+    // harmless: the pointer moves a few pixels in 16 ms, and an item that was
+    // active last frame is still active now.
+    const ImGuiIO& io = ImGui::GetIO();
+
     auto kb = m_keyboard->GetState();
     m_keyboardButtons.Update(kb);
 
-    if (kb.Escape)
+    // Not while a text field has the keyboard. The FloodDiffusion prompt is an
+    // InputText, and Escape there means "cancel this edit" to ImGui -- it must
+    // not also mean "quit the application".
+    if (kb.Escape && !io.WantCaptureKeyboard)
     {
         ExitSample();
     }
 
     auto mouse = m_mouse->GetState();
     m_mouseTracker.Update( mouse );
-    if (mouse.positionMode == Mouse::MODE_RELATIVE)
+
+    // Latched on the press. See m_mouseDragging in Application.hpp for why
+    // this is not simply `if (!io.WantCaptureMouse)` on each frame.
+    const bool anyButtonDown =
+        mouse.leftButton || mouse.rightButton || mouse.middleButton;
+    if (anyButtonDown && !m_mouseDragging)
     {
+        m_mouseDragging = true;
+        m_uiOwnsMouseDrag = io.WantCaptureMouse;
+    }
+    else if (!anyButtonDown)
+    {
+        m_mouseDragging = false;
+        m_uiOwnsMouseDrag = false;
+    }
+    const bool cameraOwnsDrag = m_mouseDragging && !m_uiOwnsMouseDrag;
+
+    if (cameraOwnsDrag && mouse.positionMode == Mouse::MODE_RELATIVE)
+    {
+        // Scaled by the speed multipliers, which FrameSceneWithCamera sizes to
+        // the scene: MoveForward takes WORLD UNITS, so an unscaled drag that
+        // crosses a two-metre scene in a moment barely stirs a street.
+        const float elapsed = static_cast<float>(timer.GetElapsedSeconds());
+        const float move = elapsed * m_cameraMoveSpeed;
+        const float rotate = elapsed * m_cameraRotateSpeed;
         if (m_mouseTracker.leftButton == Mouse::ButtonStateTracker::HELD) {
-            m_camera->RotateAroundYAxis(-mouse.x * (float)timer.GetElapsedSeconds());
-            m_camera->RotatePitch(-mouse.y * (float)timer.GetElapsedSeconds());
+            m_camera->RotateAroundYAxis(-mouse.x * rotate);
+            m_camera->RotatePitch(-mouse.y * rotate);
         }
         if (m_mouseTracker.rightButton == Mouse::ButtonStateTracker::HELD) {
-            m_camera->MoveForward(-mouse.y * (float)timer.GetElapsedSeconds());
+            m_camera->MoveForward(-mouse.y * move);
         }
         if (m_mouseTracker.middleButton == Mouse::ButtonStateTracker::HELD) {
-            m_camera->MoveUpward(-mouse.y * (float)timer.GetElapsedSeconds());
-            m_camera->MoveRightward(-mouse.x * (float)timer.GetElapsedSeconds());
+            m_camera->MoveUpward(-mouse.y * move);
+            m_camera->MoveRightward(-mouse.x * move);
         }
     }
-    if ( m_mouseTracker.leftButton == Mouse::ButtonStateTracker::PRESSED ||
+    // Capturing the pointer is the camera's doing, so it only happens for a
+    // drag the camera owns. Grabbing it for a drag that belongs to a widget is
+    // worse than the spurious camera motion it caused: MODE_RELATIVE hides the
+    // cursor and stops delivering positions, so the widget being dragged would
+    // stop tracking too.
+    if (cameraOwnsDrag &&
+        (m_mouseTracker.leftButton == Mouse::ButtonStateTracker::PRESSED ||
          m_mouseTracker.rightButton == Mouse::ButtonStateTracker::PRESSED ||
-         m_mouseTracker.middleButton == Mouse::ButtonStateTracker::PRESSED  ) {
+         m_mouseTracker.middleButton == Mouse::ButtonStateTracker::PRESSED)) {
         m_mouse->SetMode(Mouse::MODE_RELATIVE);
     }
     else if (m_mouseTracker.leftButton == Mouse::ButtonStateTracker::ButtonState::RELEASED ||
              m_mouseTracker.rightButton == Mouse::ButtonStateTracker::ButtonState::RELEASED ||
              m_mouseTracker.middleButton == Mouse::ButtonStateTracker::ButtonState::RELEASED)
     {
+        // Unconditional on purpose: a release has to restore the cursor
+        // whoever owned the drag, and setting ABSOLUTE when it was never left
+        // costs nothing.
         m_mouse->SetMode(Mouse::MODE_ABSOLUTE);
     }
-    mouse;
+
 
     PIXEndEvent();
 }
+
+
 #pragma endregion
 
 #pragma region Frame Render
 // Draws the scene.
+
+
+
+
+
+
+
+
+
+
+
 
 void Sample::Render()
 {
@@ -357,11 +572,16 @@ void Sample::Render()
     m_deviceResources->Prepare();
     auto commandList = m_deviceResources->GetCommandList();
 
+
     // Before the graph: the ImGui pass only submits draw data, so the draw data
     // has to already exist. Panels that inspect this frame's graph therefore
     // show the PREVIOUS frame's plan, which is why the plan description is kept
     // from frame to frame rather than cleared.
     BuildUserInterface();
+
+    // After Update has applied this frame's input, so the matrices and the eye
+    // position every pass reads describe the same camera.
+    UpdateViewMatrix();
 
     // Composes world transforms and places the lights. The lighting pass needs
     // both and runs inside the graph, so this cannot wait until recording.
@@ -450,27 +670,77 @@ void Sample::BuildFrameGraph()
         m_frameLights, NeuralModelIntegrateTestbed::kMaxDeferredLights);
     inputs.lights = m_frameLights;
 
-    m_deferred.AddPasses(m_frameGraph, targets, inputs,
-                         [this](ID3D12GraphicsCommandList* commandList) {
-                             m_gltfAdapter.RecordGeometry(commandList, m_view, m_projection);
-                         });
+    // The cascade fit needs to know how far the scene extends, so a caster
+    // behind a slice is still inside the light's depth range. Cached rather
+    // than recomputed: the bounds only change when the scene is reposed, and
+    // SceneBounds walks every primitive.
+    inputs.sceneMin = m_sceneBoundsMin;
+    inputs.sceneMax = m_sceneBoundsMax;
+    inputs.hasSceneBounds = m_hasSceneBounds;
+    // Nothing moving means no compositing: the cached shadow atlas is the
+    // frame's shadow map as it stands.
+    inputs.hasMovingGeometry = m_gltfAdapter.HasMovingGeometry();
+
+    m_deferred.AddPasses(
+        m_frameGraph, targets, inputs,
+        [this](ID3D12GraphicsCommandList* commandList,
+               D3D12_CPU_DESCRIPTOR_HANDLE lightmapAtlas) {
+            m_gltfAdapter.SetLightmapAtlasSrv(lightmapAtlas);
+            m_gltfAdapter.RecordGeometry(commandList, m_view, m_projection);
+        },
+        [this](ID3D12GraphicsCommandList* commandList,
+               const DirectX::SimpleMath::Matrix& lightViewProjection,
+               NeuralModelIntegrateTestbed::DeferredRenderer::ShadowGeometry which) {
+            m_gltfAdapter.RecordShadowGeometry(
+                commandList, lightViewProjection,
+                which == NeuralModelIntegrateTestbed::DeferredRenderer::
+                             ShadowGeometry::Moving);
+        },
+        [this](ID3D12GraphicsCommandList* commandList,
+               const DirectX::SimpleMath::Matrix& sunViewProjection,
+               float sunTexelWorldSize, D3D12_CPU_DESCRIPTOR_HANDLE sunDepth) {
+            m_gltfAdapter.RecordLightmapBake(commandList, sunViewProjection,
+                                             sunTexelWorldSize, sunDepth);
+        });
 
     {
         NeuralModelIntegrateTestbed::Render::RenderPassDesc overlay;
-        overlay.name = "ForwardOverlay";
+        overlay.name = "WorldOverlay";
         overlay.writes = {
-            {targets.color, NeuralModelIntegrateTestbed::Render::Access::RenderTarget},
+            // The HDR target, not the back buffer: these are world-space draws
+            // and belong on the same side of the display transform as the
+            // scene they sit in.
+            {m_deferred.SceneColor(),
+             NeuralModelIntegrateTestbed::Render::Access::RenderTarget},
             // Depth-tested, so the graph has to transition depth back out of
             // the readable state the lighting pass left it in.
             {targets.depth, NeuralModelIntegrateTestbed::Render::Access::DepthWrite},
         };
         overlay.execute = [this](ID3D12GraphicsCommandList* commandList,
                                  const NeuralModelIntegrateTestbed::Render::PassResources&) {
-            RecordForwardOverlays(commandList);
+            RecordWorldOverlays(commandList);
         };
         m_frameGraph.AddPass(std::move(overlay));
     }
 
+
+    // Everything above wrote linear radiance; this is where it becomes an
+    // image. Anything added after it is in display space.
+    m_deferred.AddTonemapPass(m_frameGraph, targets.color);
+
+
+
+    {
+        NeuralModelIntegrateTestbed::Render::RenderPassDesc screen;
+        screen.name = "ScreenOverlay";
+        screen.writes = {
+            {targets.color, NeuralModelIntegrateTestbed::Render::Access::RenderTarget}};
+        screen.execute = [this](ID3D12GraphicsCommandList* commandList,
+                                const NeuralModelIntegrateTestbed::Render::PassResources&) {
+            RecordScreenOverlays(commandList);
+        };
+        m_frameGraph.AddPass(std::move(screen));
+    }
 
     {
         NeuralModelIntegrateTestbed::Render::RenderPassDesc ui;
@@ -492,15 +762,29 @@ void Sample::BuildFrameGraph()
     }
 }
 
-void Sample::RecordForwardOverlays(ID3D12GraphicsCommandList* commandList)
+void Sample::RecordWorldOverlays(ID3D12GraphicsCommandList* commandList)
 {
     // Draw procedurally generated dynamic grid
     const XMVECTORF32 xaxis = { 20.f, 0.f, 0.f };
     const XMVECTORF32 yaxis = { 0.f, 0.f, 20.f };
-    DrawGrid(xaxis, yaxis, g_XMZero, 20, 20, Colors::Gray);
+    // DrawGrid(xaxis, yaxis, g_XMZero, 20, 20, Colors::Gray);
     DrawMotionSkeleton();
 
-    // Set the descriptor heaps
+    // The sampler heap, for the teapot's texture.
+    ID3D12DescriptorHeap* heaps[] = { m_resourceDescriptors->Heap(), m_states->Heap() };
+    commandList->SetDescriptorHeaps(_countof(heaps), heaps);
+
+    // Draw 3D object
+    // PIXBeginEvent(commandList, PIX_COLOR_DEFAULT, L"Draw teapot");
+    // XMMATRIX local = m_world * Matrix::CreateTranslation(-2.f, -2.f, -4.f);
+    // m_shapeEffect->SetWorld(local);
+    // m_shapeEffect->Apply(commandList);
+    // m_shape->Draw(commandList);
+    // PIXEndEvent(commandList);
+}
+
+void Sample::RecordScreenOverlays(ID3D12GraphicsCommandList* commandList)
+{
     ID3D12DescriptorHeap* heaps[] = { m_resourceDescriptors->Heap(), m_states->Heap() };
     commandList->SetDescriptorHeaps(_countof(heaps), heaps);
 
@@ -513,14 +797,197 @@ void Sample::RecordForwardOverlays(ID3D12GraphicsCommandList* commandList)
     m_font->DrawString(m_sprites.get(), L"DirectXTK Simple Sample", XMFLOAT2(100, 10), Colors::Yellow);
     m_sprites->End();
     PIXEndEvent(commandList);
+}
 
-    // Draw 3D object
-    PIXBeginEvent(commandList, PIX_COLOR_DEFAULT, L"Draw teapot");
-    XMMATRIX local = m_world * Matrix::CreateTranslation(-2.f, -2.f, -4.f);
-    m_shapeEffect->SetWorld(local);
-    m_shapeEffect->Apply(commandList);
-    m_shape->Draw(commandList);
-    PIXEndEvent(commandList);
+void Sample::FrameSceneWithCamera()
+{
+    DirectX::XMFLOAT3 minimum = {};
+    DirectX::XMFLOAT3 maximum = {};
+    if (!m_gltfAdapter.SceneBounds(minimum, maximum))
+    {
+        return;
+    }
+
+    const Vector3 low(minimum.x, minimum.y, minimum.z);
+    const Vector3 high(maximum.x, maximum.y, maximum.z);
+    const Vector3 centre = (low + high) * 0.5f;
+    const float radius = std::max(0.001f, (high - low).Length() * 0.5f);
+
+    m_sceneCentre = centre;
+    m_sceneRadius = radius;
+    m_sceneBoundsMin = low;
+    m_sceneBoundsMax = high;
+    m_hasSceneBounds = true;
+    // The shadow distance follows the scene, so the cascades are worth having
+    // in a two-metre fixture and a hundred-and-sixty-metre street alike.
+    m_deferred.SetSceneScale(radius);
+
+    // Far enough back that the bounding sphere fits the vertical field of view,
+    // with a little margin. 70 degrees is what CreateWindowSizeDependentResources
+    // uses; a narrower window makes it wider still, so this is the tight case.
+    const float fovY = m_fovDegrees * XM_PI / 180.0f;
+    const float distance = radius / std::sin(fovY * 0.5f) * 1.1f;
+
+    // A raised three-quarter view. Any fixed direction is a guess, but one that
+    // is not axis-aligned at least shows depth rather than a flat elevation.
+    Vector3 direction(-0.55f, 0.35f, 1.0f);
+    direction.Normalize();
+
+    m_camera->Set(centre + direction * distance, centre, Vector3::UnitY);
+
+    // Depth precision is governed by far/near, not by either alone, so the near
+    // plane scales with the scene. 1/1000 of the radius keeps the ratio near
+    // 10^4, which D32_FLOAT handles comfortably; leaving it at 0.01 against a
+    // far plane of 400 would be 40000 and z-fight in the distance.
+    m_near = std::max(0.01f, radius * 0.001f);
+    m_far = distance + radius * 2.0f;
+
+    // Roughly "cross the scene in a second of dragging". Rotation is in radians
+    // and has nothing to do with scene size, so it is left alone.
+    m_cameraMoveSpeed = radius * 0.05f;
+
+    UpdateProjection();
+
+    std::fprintf(stderr,
+                 "[camera] scene centre (%.2f, %.2f, %.2f) radius %.2f -> "
+                 "eye distance %.2f, near %.4f, far %.1f\n",
+                 centre.x, centre.y, centre.z, radius, distance, m_near, m_far);
+    std::fflush(stderr);
+}
+
+void Sample::ShowCameraUI()
+{
+    if (!ImGui::CollapsingHeader("Camera"))
+    {
+        return;
+    }
+
+    // Drag steps are scaled to the scene, so one pixel of drag is a sensible
+    // nudge whether the scene is two units across or a hundred and sixty.
+    const float step = std::max(0.001f, m_sceneRadius * 0.002f);
+
+    Vector3 eye = m_camera->mEye;
+    Vector3 at = m_camera->mAt;
+    Vector3 up = m_camera->mUp;
+    bool changed = false;
+
+    changed |= ImGui::DragFloat3("Position", &eye.x, step);
+    changed |= ImGui::DragFloat3("Target", &at.x, step);
+    changed |= ImGui::DragFloat3("Up", &up.x, 0.01f);
+
+    if (changed)
+    {
+        // CreateLookAt produces NaNs when the eye and the target coincide, and
+        // one NaN in the view matrix takes the whole frame with it -- including
+        // the UI that would let you undo it. Dragging the target onto the eye
+        // is an easy accident, so it is caught here.
+        Vector3 forward = at - eye;
+        if (forward.Length() < 1e-4f)
+        {
+            at = eye + Vector3(0.0f, 0.0f, -std::max(step, 1e-3f));
+        }
+        if (up.Length() < 1e-4f)
+        {
+            up = Vector3::UnitY;
+        }
+        m_camera->Set(eye, at, up);
+    }
+
+    ImGui::Separator();
+
+    // Derived, so there is something to read back after flying around with the
+    // mouse rather than only something to type into.
+    Vector3 forward = Vector3(m_camera->mAt) - Vector3(m_camera->mEye);
+    const float distance = forward.Length();
+    if (distance > 1e-6f)
+    {
+        forward /= distance;
+    }
+    ImGui::Text("Distance to target: %.3f", distance);
+    ImGui::Text("Forward: (%.3f, %.3f, %.3f)", forward.x, forward.y, forward.z);
+    // Pitch is unambiguous. Yaw needs a zero, and -Z is the one this
+    // right-handed projection looks down.
+    ImGui::Text("Pitch %.1f deg, yaw %.1f deg (0 == -Z)",
+                XMConvertToDegrees(std::asin(std::max(-1.0f, std::min(1.0f, forward.y)))),
+                XMConvertToDegrees(std::atan2(forward.x, -forward.z)));
+
+    ImGui::Separator();
+
+    // The projection. Each of these rebuilds it, which also re-pushes it into
+    // the DirectXTK effects the forward overlay pass draws with -- otherwise
+    // the grid and the teapot would keep the old one and stop lining up.
+    bool projectionChanged = false;
+    projectionChanged |= ImGui::SliderFloat("Field of view", &m_fovDegrees, 20.0f, 120.0f,
+                                            "%.1f deg");
+    // Depth precision is governed by far/near rather than by either alone, so
+    // the ratio is shown: pushing the near plane in is far more expensive than
+    // pushing the far plane out.
+    projectionChanged |= ImGui::DragFloat("Near plane", &m_near, step * 0.1f, 0.001f,
+                                         m_far * 0.5f, "%.4f");
+    projectionChanged |= ImGui::DragFloat("Far plane", &m_far, step * 10.0f,
+                                         m_near * 2.0f, 100000.0f, "%.1f");
+    ImGui::Text("far/near = %.0f", m_near > 0.0f ? m_far / m_near : 0.0f);
+    if (projectionChanged)
+    {
+        UpdateProjection();
+    }
+
+    ImGui::Separator();
+
+    ImGui::DragFloat("Move speed", &m_cameraMoveSpeed, step, 0.0001f, 10000.0f, "%.4f");
+    ImGui::DragFloat("Rotate speed", &m_cameraRotateSpeed, 0.01f, 0.0001f, 100.0f, "%.4f");
+    ImGui::TextUnformatted("drag: left orbit, right dolly, middle pan");
+
+    ImGui::Separator();
+
+    if (ImGui::Button("Frame scene"))
+    {
+        FrameSceneWithCamera();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Look at centre") && m_sceneRadius > 0.0f)
+    {
+        // Keeps the eye where it is and re-aims it, which is what you want after
+        // dollying past the scene and losing it off the edge of the screen.
+        m_camera->Set(m_camera->mEye, m_sceneCentre, Vector3::UnitY);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset"))
+    {
+        m_camera->Reset();
+    }
+    if (m_sceneRadius > 0.0f)
+    {
+        ImGui::Text("Scene: centre (%.2f, %.2f, %.2f), radius %.2f", m_sceneCentre.x,
+                    m_sceneCentre.y, m_sceneCentre.z, m_sceneRadius);
+    }
+}
+
+
+
+void Sample::ShowFrameTimingUI()
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::Text("%.2f ms this frame, %.2f ms average (%.1f FPS)",
+                io.DeltaTime * 1000.0f, 1000.0f / io.Framerate, io.Framerate);
+
+    // The floor is fixed at two 60 Hz frames rather than fitted to the data, so
+    // the plot does not rescale itself the moment the frame gets slower --
+    // which is exactly when its shape is being read. It grows past that only
+    // when something in the window genuinely exceeded it.
+    float worst = 0.0f;
+    for (const float sample : m_frameTimes)
+    {
+        worst = std::max(worst, sample);
+    }
+    const float ceiling = worst > 33.3f ? worst : 33.3f;
+    char overlay[48];
+    std::snprintf(overlay, sizeof(overlay), "worst %.1f ms", worst);
+    // The cursor is where the NEXT sample goes, so plotting from there reads
+    // oldest-to-newest and the newest sample is at the right edge.
+    ImGui::PlotLines("##frametimes", m_frameTimes, kFrameTimeHistory,
+                     m_frameTimeCursor, overlay, 0.0f, ceiling, ImVec2(0.0f, 60.0f));
+    ImGui::Separator();
 }
 
 void Sample::BuildUserInterface()
@@ -530,35 +997,55 @@ void Sample::BuildUserInterface()
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
-    bool show_demo_window = true;
-    float clear_color[3] = {0.0, .0, .0};
-    // ImGui::ShowDemoWindow(&show_demo_window);
+    // Sampled here rather than inside the Performance tab: ImGui skips the body
+    // of a tab that is not selected, so recording it there would leave the
+    // history full of whichever frames happened to be on that tab -- a plot
+    // that only has data for the moments you were already looking at it.
+    m_frameTimes[m_frameTimeCursor] = ImGui::GetIO().DeltaTime * 1000.0f;
+    m_frameTimeCursor = (m_frameTimeCursor + 1) % kFrameTimeHistory;
 
-    // 2. Show a simple window that we create ourselves. We use a Begin/End pair to create a named window.
+    // One window, four tabs. Everything was in a single scrolling column of
+    // collapsing headers before, which meant the frame time was at the bottom
+    // past the scene hierarchy and no two costs were ever on screen together.
+    //
+    // The split is by what you are doing, not by which class owns the widget:
+    // Performance collects every cost in the process from four different files,
+    // and three of those files also draw controls into one of the other tabs.
+    ImGui::Begin("ptflio");
+    if (ImGui::BeginTabBar("sections"))
     {
-        static float f = 0.0f;
-        static int counter = 0;
+        using NeuralModelIntegrateTestbed::UiSection;
 
-        ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
-
-        ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
-        m_deferred.ShowImgui();
-        m_gltfAdapter.ShowImgui();
-        m_nnModelManager.ShowImgui();
-        m_motionStream.ShowImgui();
-
-        ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
-        ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
-
-        if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
-            counter++;
-        ImGui::SameLine();
-        ImGui::Text("counter = %d", counter);
-        ImGuiIO& io = ImGui::GetIO(); (void)io;
-        ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
-        ImGui::End();
+        if (ImGui::BeginTabItem("Render"))
+        {
+            m_deferred.ShowImgui(UiSection::Render);
+            m_gltfAdapter.ShowImgui(UiSection::Render);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Scene"))
+        {
+            ShowCameraUI();
+            m_gltfAdapter.ShowImgui(UiSection::Scene);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Neural"))
+        {
+            m_nnModelManager.ShowImgui(UiSection::Neural);
+            m_motionStream.ShowImgui(UiSection::Neural);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Performance"))
+        {
+            ShowFrameTimingUI();
+            m_deferred.ShowImgui(UiSection::Performance);
+            m_gltfAdapter.ShowImgui(UiSection::Performance);
+            m_nnModelManager.ShowImgui(UiSection::Performance);
+            m_motionStream.ShowImgui(UiSection::Performance);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
+    ImGui::End();
 
     // Rendering
     ImGui::Render();
@@ -736,7 +1223,13 @@ void Sample::CreateDeviceDependentResources()
 
         CreateShaderResourceView(device, m_texture2.Get(), m_resourceDescriptors->GetCpuHandle(Descriptors::WindowsLogo));
 
+        // Two render target states now, because the overlays were split either
+        // side of the tonemap. A PSO bakes its RTV format in, so a world-space
+        // effect drawing into the HDR scene colour target cannot share one with
+        // a screen-space effect drawing onto the back buffer.
         RenderTargetState rtState(m_deviceResources->GetBackBufferFormat(), m_deviceResources->GetDepthBufferFormat());
+        RenderTargetState sceneState(NeuralModelIntegrateTestbed::kSceneColorFormat,
+                                     m_deviceResources->GetDepthBufferFormat());
 
         {
             SpriteBatchPipelineStateDescription pd(rtState);
@@ -758,7 +1251,7 @@ void Sample::CreateDeviceDependentResources()
                 CommonStates::Opaque,
                 CommonStates::DepthRead,
                 CommonStates::CullNone,
-                rtState,
+                sceneState,
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE);
 
             m_lineEffect = std::make_unique<BasicEffect>(device, EffectFlags::VertexColor, pd);
@@ -770,7 +1263,7 @@ void Sample::CreateDeviceDependentResources()
                 CommonStates::Opaque,
                 CommonStates::DepthDefault,
                 CommonStates::CullNone,
-                rtState);
+                sceneState);
 
             m_shapeEffect = std::make_unique<BasicEffect>(device, EffectFlags::PerPixelLighting | EffectFlags::Texture, pd);
             m_shapeEffect->EnableDefaultLighting();
@@ -823,11 +1316,31 @@ void Sample::CreateWindowSizeDependentResources()
                         static_cast<std::uint32_t>(size.bottom));
     m_deferred.CreateWindowSizeDependentResources(*m_deviceResources);
 
+    UpdateProjection();
+
+    auto viewport = m_deviceResources->GetScreenViewport();
+    m_sprites->SetViewport(viewport);
+}
+
+void Sample::UpdateViewMatrix()
+{
+    m_view = Matrix::CreateLookAt(m_camera->mEye, m_camera->mAt, m_camera->mUp);
+    // The overlay effects hold their own copy, and they draw into the same
+    // scene colour target as the deferred geometry, so they have to agree with
+    // it about where the camera is.
+    m_lineEffect->SetView(m_view);
+    m_shapeEffect->SetView(m_view);
+}
+
+void Sample::UpdateProjection()
+{
+    auto size = m_deviceResources->GetOutputSize();
     float aspectRatio = float(size.right) / float(size.bottom);
-    float fovAngleY = 70.0f * XM_PI / 180.0f;
+    float fovAngleY = m_fovDegrees * XM_PI / 180.0f;
 
     // This is a simple example of change that can be made when the app is in
-    // portrait or snapped view.
+    // portrait or snapped view. Applied to a local, so the field of view the
+    // panel shows stays the one that was asked for.
     if (aspectRatio < 1.0f)
     {
         fovAngleY *= 2.0f;
@@ -837,15 +1350,14 @@ void Sample::CreateWindowSizeDependentResources()
     m_projection = Matrix::CreatePerspectiveFieldOfView(
         fovAngleY,
         aspectRatio,
-        0.01f,
-        100.0f
+        m_near,
+        m_far
     );
 
+    // The overlay effects hold their own copy, so without this the grid and the
+    // teapot keep the previous projection and stop lining up with the scene.
     m_lineEffect->SetProjection(m_projection);
     m_shapeEffect->SetProjection(m_projection);
-
-    auto viewport = m_deviceResources->GetScreenViewport();
-    m_sprites->SetViewport(viewport);
 }
 
 void Sample::OnDeviceLost()

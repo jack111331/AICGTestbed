@@ -409,8 +409,46 @@ void MotionStreamView::Draw(
     }
 }
 
-void MotionStreamView::ShowImgui() {
-    if (!ImGui::CollapsingHeader("FloodDiffusion motion")) {
+void MotionStreamView::ShowImgui(UiSection section) {
+    switch (section) {
+        case UiSection::Neural:      ShowNeuralUi(); break;
+        case UiSection::Performance: ShowPerformanceUi(); break;
+        case UiSection::Render:
+        case UiSection::Scene:
+            break;
+    }
+}
+
+// Where the sampler runs and what a take cost to produce. Separate from the
+// controls because these are the numbers the device and pin-shapes choices
+// exist to move, and comparing two configurations means reading them against
+// the rest of the frame's cost rather than against the prompt box.
+void MotionStreamView::ShowPerformanceUi() {
+    if (!ImGui::CollapsingHeader("FloodDiffusion", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    if (!IsLoaded()) {
+        ImGui::TextUnformatted("not loaded");
+        return;
+    }
+    const FloodDiffusionConfig& config = m_pipeline.Config();
+    ImGui::Text("%d joints, chunk %d, %d steps, cfg %.1f", config.joints,
+                config.chunkSize, config.noiseSteps, config.cfgScale);
+    ImGui::Text("sampler on %s, prompt encoder on %s%s",
+                ToString(m_pipeline.Device()),
+                ToString(m_pipeline.TextEncoderDevice()),
+                m_pipeline.StaticShapes() ? ", shapes pinned" : "");
+    ImGui::Text("denoise %.2f ms, decode %.2f ms, total %.0f ms",
+                m_pipeline.LastDenoiseMs(), m_pipeline.LastDecodeMs(),
+                m_pipeline.GenerationMs());
+    ImGui::Text("%d motion frames (%.2f s)", m_pipeline.FrameCount(),
+                static_cast<float>(m_pipeline.FrameCount()) /
+                    FloodDiffusionPipeline::kFrameRate);
+}
+
+void MotionStreamView::ShowNeuralUi() {
+    if (!ImGui::CollapsingHeader("FloodDiffusion motion",
+                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
 
@@ -422,13 +460,10 @@ void MotionStreamView::ShowImgui() {
         return;
     }
 
+    // The joint count and chunk size are reported in the Performance tab; this
+    // is the one place the controls need them, to say how long the take the
+    // "latent frames" slider is asking for will actually be.
     const FloodDiffusionConfig& config = m_pipeline.Config();
-    ImGui::Text("%d joints, chunk %d, %d steps, cfg %.1f", config.joints,
-                config.chunkSize, config.noiseSteps, config.cfgScale);
-    ImGui::Text("sampler on %s, prompt encoder on %s%s",
-                ToString(m_pipeline.Device()),
-                ToString(m_pipeline.TextEncoderDevice()),
-                m_pipeline.StaticShapes() ? ", shapes pinned" : "");
 
     // Changing a provider rebuilds the sessions, so it is deliberately a
     // separate action from Generate.
@@ -555,9 +590,6 @@ void MotionStreamView::ShowImgui() {
     ImGui::Text("%d motion frames (%.2f s), showing %d", frameCount,
                 static_cast<float>(frameCount) / FloodDiffusionPipeline::kFrameRate,
                 m_currentFrame);
-    ImGui::Text("denoise %.2f ms, decode %.2f ms, total %.0f ms",
-                m_pipeline.LastDenoiseMs(), m_pipeline.LastDecodeMs(),
-                m_pipeline.GenerationMs());
     if (m_pipeline.PromptTokenCount() > 0) {
         ImGui::Text("%d tokens:%s", m_pipeline.PromptTokenCount(),
                     m_pipeline.TokenisedPrompt().c_str());

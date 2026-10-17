@@ -27,6 +27,11 @@ hlsl_shader(
     entries = {
         "GBuffer": "g_gbuffer",
         "Lighting": "g_deferred_lighting",
+        "Skybox": "g_skybox",
+        "Tonemap": "g_tonemap",
+        "Shadow": "g_shadow",
+        "LightmapBake": "g_lightmap_bake",
+        "DebugView": "g_debug_view",
     },
     profile = "6_0", # Shader Model 6.0 for DX12
     out = "no_texture.h"
@@ -132,6 +137,9 @@ cc_library(
         ":DeviceResources",
         ":Descriptors",
         ":GBuffer",
+        ":Lightmap",
+        ":ShadowCascades",
+        ":Ui",
         ":pch",
         "@fastgltf//:fastgltf",
         "//third:stb",
@@ -140,8 +148,39 @@ cc_library(
     ],
 )
 
+# Cascaded shadow map fitting: frustum splits, per-cascade light projections
+# and the atlas layout. Pure arithmetic with no D3D12, so the smoke test can
+# assert on it -- which matters because every way of getting this wrong still
+# produces shadows, just ones in the wrong place or that crawl.
+cc_library(
+    name = "ShadowCascades",
+    srcs = ["ShadowCascades.cc"],
+    hdrs = ["ShadowCascades.hpp"],
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+    deps = [":pch"],
+)
+
 # The G-buffer layout. Its own target because three places have to agree on it:
 # the shader that writes it, GLTFAdapter's PSO, and DeferredRenderer's targets.
+cc_library(
+    name = "Lightmap",
+    srcs = ["Lightmap.cc"],
+    hdrs = ["Lightmap.hpp"],
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+    deps = [":pch"],
+)
+
+# Which tab of the main window a ShowImgui call is building. A header on its
+# own so every subsystem can take one without depending on the application.
+cc_library(
+    name = "Ui",
+    hdrs = ["Ui.hpp"],
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+)
+
 cc_library(
     name = "GBuffer",
     hdrs = ["GBuffer.hpp"],
@@ -159,6 +198,16 @@ cc_library(
     hdrs = ["RenderGraph.hpp"],
     defines = SAMPLE_DEFINES,
     includes = ["."],
+    deps = [
+        ":Descriptors",
+        ":pch",
+    ],
+)
+
+cc_binary(
+    name = "dynamicdescriptorheap-smoke",
+    srcs = ["dynamicdescriptorheap-smoke.cc"],
+    defines = SAMPLE_DEFINES,
     deps = [
         ":Descriptors",
         ":pch",
@@ -189,10 +238,15 @@ cc_library(
         ":Descriptors",
         ":DeviceResources",
         ":GBuffer",
+        ":Lightmap",
         ":GLTFAdapter",
         ":RenderGraph",
+        ":ShadowCascades",
+        ":Ui",
         ":pch",
         ":shader_bytecode",
+        # Radiance .hdr environment maps go through stb_image's float loader.
+        "//third:stb",
         "@vcpkg_directxtk12//:directxtk12",
         "@vcpkg_directxtk12//:imgui",
     ],
@@ -301,6 +355,7 @@ cc_library(
         ":DeviceResources",
         ":Descriptors",
         ":OrtEnv",
+        ":Ui",
         ":pch",
         # The ONNX protobuf schema, for OnnxModel.cc. Only the schema -- the
         # graph is translated to DirectML here rather than run by ONNX Runtime.
@@ -336,6 +391,7 @@ cc_library(
         ":GLTFAdapter",
         ":ModelManager",
         ":RenderGraph",
+        ":Ui",
         ":pch",
         "@vcpkg_directxtk12//:directxtk12",
         "@vcpkg_directxtk12//:imgui"
@@ -401,6 +457,8 @@ cc_binary(
     defines = SAMPLE_DEFINES,
     deps = [
         ":GLTFAdapter",
+        ":Lightmap",
+        ":ShadowCascades",
         ":pch",
     ],
 )

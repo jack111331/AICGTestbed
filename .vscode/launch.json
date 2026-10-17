@@ -16,7 +16,7 @@
             "console": "internalConsole"
         },
         {
-            "name": "(Windows) Launch",
+            "name": "Dbg build",
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceFolder}/bazel-out/x64_windows-dbg/bin/Engine/hello-world.exe",
@@ -25,6 +25,19 @@
             "cwd": "${workspaceFolder}",
             "environment": [],
             "console": "internalConsole"
+        },
+        {
+            "name": "Opt build",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/bazel-out/x64_windows-opt/bin/Engine/hello-world.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "console": "internalConsole"
         }
+
     ]
 }

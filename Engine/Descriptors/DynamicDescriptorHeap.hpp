@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <memory>
 #include <queue>
+#include <utility>
 
 namespace NeuralModelIntegrateTestbed::Descriptors {
 
@@ -65,7 +66,11 @@ class DynamicDescriptorHeap
 public:
     DynamicDescriptorHeap(
         D3D12_DESCRIPTOR_HEAP_TYPE heapType,
-        uint32_t numDescriptorsPerHeap = 1024);
+        uint32_t numDescriptorsPerHeap = 1024,
+        // Frames a heap must sit out after use. The default matches
+        // Application.cc's kInFlightMargin; raise it alongside the back buffer
+        // count.
+        uint64_t framesInFlight = 3);
 
     virtual ~DynamicDescriptorHeap();
 
@@ -120,6 +125,16 @@ public:
      * that are being referenced by a command list has finished executing on the 
      * command queue.
      */
+    // Call once per frame, in step with the command list this heap records
+    // into. Retires the heaps this frame used rather than making them
+    // immediately available again: a submitted command list keeps referencing
+    // its descriptor heap until the GPU has finished with it, and overwriting
+    // one in flight shows up as a single frame drawn with another frame's
+    // descriptors -- the wrong textures on the wrong geometry.
+    //
+    // Reclaims heaps retired at least m_FramesInFlight frames ago, using
+    // Descriptors::Context()'s frame counter, so this must be advanced once per
+    // frame (Application.cc does it after Present).
     void Reset();
 
 protected:
@@ -192,11 +207,46 @@ private:
     // in the root signature that has changed since the last time the 
     // descriptors were copied.
     uint32_t m_StaleDescriptorTableBitMask;
+    // Each bit set represents a descriptor table that has had descriptors
+    // staged into it at least once since the root signature was parsed, and so
+    // has source handles worth copying. Only consulted when a heap switch
+    // forces every table to be recopied.
+    uint32_t m_StagedDescriptorTableBitMask;
+
+    // Flattened source ranges for CommitStagedDescriptors' one CopyDescriptors
+    // call, sized by ParseRootSignature to the total across all tables.
+    std::unique_ptr<D3D12_CPU_DESCRIPTOR_HANDLE[]> m_SrcRangeStarts;
+    std::unique_ptr<UINT[]> m_SrcRangeSizes;
+    uint32_t m_ScratchRangeCapacity = 0;
 
     using DescriptorHeapPool = std::queue< Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> >;
 
+    // Every heap this object has ever created; owns them.
     DescriptorHeapPool m_DescriptorHeapPool;
+    // Heaps the GPU is known to be finished with.
     DescriptorHeapPool m_AvailableDescriptorHeaps;
+
+    // Heaps handed out since the last Reset, and heaps retired by earlier
+    // frames with the frame number that retired them.
+    //
+    // Upstream's Reset() did `m_AvailableDescriptorHeaps = m_DescriptorHeapPool`,
+    // handing every heap straight back with no synchronisation at all. With two
+    // back buffers the swap chain only waits for the frame that last used the
+    // NEXT back buffer index, so frame N+1 can still be executing while frame
+    // N+2 records -- and frame N+2 would then copy new descriptors into the
+    // very heap frame N+1's submitted command list is still sampling from.
+    //
+    // That is invisible as long as consecutive frames stage identical
+    // descriptors, which is why it survived until frustum culling started
+    // changing the drawn set as the camera moves. See the note on Reset().
+    DescriptorHeapPool m_UsedThisFrame;
+    std::queue< std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> > >
+        m_RetiredDescriptorHeaps;
+
+    // How many frames a retired heap has to sit out before it is handed out
+    // again. Back buffer count + 1, matching kInFlightMargin in Application.cc,
+    // which gates the CPU descriptor allocator the same way.
+    uint64_t m_FramesInFlight;
 
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_CurrentDescriptorHeap;
     CD3DX12_GPU_DESCRIPTOR_HANDLE m_CurrentGPUDescriptorHandle;

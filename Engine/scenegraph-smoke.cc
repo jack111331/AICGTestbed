@@ -10,6 +10,8 @@
 
 #include "MotionRetarget.hpp"
 #include "SceneGraph.hpp"
+#include "Lightmap.hpp"
+#include "ShadowCascades.hpp"
 
 #include <filesystem>
 
@@ -18,7 +20,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -339,6 +343,13 @@ void ExpectSpace(const char* what, NeuralModelIntegrateTestbed::ImageColorSpace 
     if (!ok) ++g_failures;
 }
 
+void ExpectEqualU(const char* what, std::uint32_t got, std::uint32_t expected) {
+    const bool ok = got == expected;
+    std::printf("  %-52s %6u  expected %6u  %s\n", what, got, expected,
+                ok ? "ok" : "MISMATCH");
+    if (!ok) ++g_failures;
+}
+
 void Expect(const char* what, bool condition) {
     std::printf("  %-34s %s\n", what, condition ? "ok" : "MISMATCH");
     if (!condition) ++g_failures;
@@ -452,6 +463,422 @@ void BuildSyntheticFeature(std::vector<float>& feature, int joints,
         c[3] = m._21; c[4] = m._22; c[5] = m._23;
     }
     (void)rootAngle;
+}
+
+// Cascaded shadow map fitting.
+//
+// The assertions worth having here are not "does it produce a matrix" but the
+// properties that distinguish a working cascade set from one that produces
+// shadows in the wrong place:
+//
+//   * every point inside a slice must land inside that cascade's clip box,
+//     or the shadow for it simply does not exist;
+//   * a caster BEHIND the slice must still be inside the depth range, or
+//     objects stop casting onto things in front of them;
+//   * rotating the camera in place must not change the fitted radius, which is
+//     what the bounding-sphere fit buys and what stops the edges crawling;
+//   * the fitted centre must move in whole texels, which is what stops them
+//     shimmering.
+void TestShadowCascades() {
+    using DirectX::SimpleMath::Matrix;
+    using DirectX::SimpleMath::Vector3;
+    using DirectX::SimpleMath::Vector4;
+    using NeuralModelIntegrateTestbed::ComputeShadowCascades;
+    using NeuralModelIntegrateTestbed::ShadowCascades;
+    using NeuralModelIntegrateTestbed::ShadowCascadeSetup;
+
+    std::cout << "cascaded shadow maps" << std::endl;
+
+    const Matrix view = Matrix::CreateLookAt(Vector3(0.0f, 2.0f, 20.0f),
+                                             Vector3(0.0f, 2.0f, 0.0f), Vector3::UnitY);
+    const Matrix projection = Matrix::CreatePerspectiveFieldOfView(
+        DirectX::XMConvertToRadians(70.0f), 16.0f / 9.0f, 0.1f, 200.0f);
+    // Afternoon sun: travelling down and sideways.
+    Vector3 lightDirection(-0.4f, -0.8f, -0.45f);
+    lightDirection.Normalize();
+    const Vector3 sceneMin(-60.0f, -2.0f, -60.0f);
+    const Vector3 sceneMax(60.0f, 30.0f, 60.0f);
+
+    ShadowCascadeSetup setup;
+    setup.cascadeCount = 4;
+    setup.shadowDistance = 100.0f;
+    setup.resolution = 1024;
+
+    const ShadowCascades cascades =
+        ComputeShadowCascades(view, projection, lightDirection, sceneMin, sceneMax, setup);
+    Expect("four cascades are produced", cascades.count == 4);
+    Expect("the atlas is two cascades on a side",
+           cascades.atlasResolution == 2048);
+
+    // Splits must be increasing and end at the shadow distance.
+    bool increasing = true;
+    for (int i = 1; i < cascades.count; ++i) {
+        increasing = increasing && cascades.cascades[i].splitDistance >
+                                       cascades.cascades[i - 1].splitDistance;
+    }
+    Expect("split distances increase", increasing);
+    ExpectFloat("the last split reaches the shadow distance",
+                cascades.cascades[cascades.count - 1].splitDistance, 100.1f);
+
+    // The near cascade must be tighter than the far one, or the split scheme
+    // is doing nothing useful.
+    Expect("the near cascade has smaller texels than the far one",
+           cascades.cascades[0].texelWorldSize <
+               cascades.cascades[cascades.count - 1].texelWorldSize);
+
+    // --- containment ---------------------------------------------------
+    // Points along the view axis, each inside a known slice, must land in that
+    // cascade's clip box.
+    const auto insideClip = [](const Matrix& viewProjection, const Vector3& world,
+                               float slack) {
+        const Vector4 clip = Vector4::Transform(Vector4(world.x, world.y, world.z, 1.0f),
+                                                viewProjection);
+        if (std::fabs(clip.w) < 1e-9f) return false;
+        const Vector3 ndc(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+        return ndc.x >= -1.0f - slack && ndc.x <= 1.0f + slack &&
+               ndc.y >= -1.0f - slack && ndc.y <= 1.0f + slack &&
+               ndc.z >= -slack && ndc.z <= 1.0f + slack;
+    };
+
+    bool allContained = true;
+    for (int i = 0; i < cascades.count; ++i) {
+        const float nearEdge =
+            (i == 0) ? 0.1f : cascades.cascades[i - 1].splitDistance;
+        const float midway = 0.5f * (nearEdge + cascades.cascades[i].splitDistance);
+        // The camera looks down -Z from z = 20.
+        const Vector3 point(0.0f, 2.0f, 20.0f - midway);
+        const bool contained = insideClip(cascades.cascades[i].viewProjection, point, 0.0f);
+        if (!contained) {
+            std::printf("    cascade %d does not contain its own midpoint z=%.2f\n", i,
+                        point.z);
+        }
+        allContained = allContained && contained;
+    }
+    Expect("each cascade contains the midpoint of its own slice", allContained);
+
+    // A caster well above the slice, inside the scene bounds, must be within
+    // the depth range: this is what lets a roof shadow the street.
+    Expect("a caster above the slice is still inside the light's depth range",
+           insideClip(cascades.cascades[1].viewProjection,
+                      Vector3(0.0f, 28.0f, 20.0f - cascades.cascades[0].splitDistance -
+                                               1.0f),
+                      0.0f));
+
+    // --- rotation stability --------------------------------------------
+    // Yawing the camera in place must not change the fitted radius. A bounding
+    // box fitted to the slice corners would change it by up to 40%, and the
+    // shadow texels would change size as you turned.
+    const Matrix rotated = Matrix::CreateLookAt(
+        Vector3(0.0f, 2.0f, 20.0f),
+        Vector3(0.0f, 2.0f, 20.0f) + Vector3(0.7071f, 0.0f, -0.7071f), Vector3::UnitY);
+    const ShadowCascades turned = ComputeShadowCascades(
+        rotated, projection, lightDirection, sceneMin, sceneMax, setup);
+    bool stable = true;
+    for (int i = 0; i < cascades.count; ++i) {
+        const float before = cascades.cascades[i].texelWorldSize;
+        const float after = turned.cascades[i].texelWorldSize;
+        stable = stable && std::fabs(before - after) < before * 1e-3f;
+    }
+    Expect("yawing the camera does not change the texel size", stable);
+
+    // --- texel snapping ------------------------------------------------
+    // Nudge the camera by a fraction of a texel and the fitted projection must
+    // either not move at all or move by a whole texel. Measured through where
+    // a fixed world point lands in shadow-map texels: without snapping this
+    // drifts smoothly and every edge shimmers.
+    const float texel = cascades.cascades[0].texelWorldSize;
+    const Vector3 probe(1.0f, 2.0f, 15.0f);
+    const auto texelCoordinate = [&](const Matrix& viewProjection) {
+        const Vector4 clip = Vector4::Transform(Vector4(probe.x, probe.y, probe.z, 1.0f),
+                                                viewProjection);
+        return (clip.x / clip.w * 0.5f + 0.5f) * static_cast<float>(setup.resolution);
+    };
+    const float base = texelCoordinate(cascades.cascades[0].viewProjection);
+    float worstFraction = 0.0f;
+    for (int step = 1; step <= 8; ++step) {
+        // Sub-texel camera motion along the light's right-ish axis.
+        const float nudge = texel * 0.1f * static_cast<float>(step);
+        const Matrix moved = Matrix::CreateLookAt(Vector3(nudge, 2.0f, 20.0f),
+                                                  Vector3(nudge, 2.0f, 0.0f),
+                                                  Vector3::UnitY);
+        const ShadowCascades shifted = ComputeShadowCascades(
+            moved, projection, lightDirection, sceneMin, sceneMax, setup);
+        const float moved_coordinate = texelCoordinate(shifted.cascades[0].viewProjection);
+        const float delta = moved_coordinate - base;
+        const float fraction = std::fabs(delta - std::round(delta));
+        worstFraction = std::max(worstFraction, fraction);
+    }
+    std::printf("  %-52s %.4f\n", "worst sub-texel drift under camera nudges",
+                worstFraction);
+    Expect("the projection moves in whole texels", worstFraction < 0.02f);
+
+    // --- holding a fit across camera motion ----------------------------
+    // Snapping stabilises the texel grid, NOT the matrix: the centre's
+    // component along the light, the fitted radius and the light's eye all
+    // slide continuously with the camera. Measured on a Bistro-sized setup,
+    // every cascade's matrix changed after 1 mm of motion and 0.01 degrees of
+    // yaw, with texels of 1.6 to 24 cm. So nothing can be cached against the
+    // matrix alone, and ComputeShadowCascades holds a padded fit instead.
+    {
+        ShadowCascadeSetup held = setup;
+        held.fitMargin = 0.12f;
+        const ShadowCascades first = ComputeShadowCascades(
+            view, projection, lightDirection, sceneMin, sceneMax, held);
+        Expect("every cascade is refitted on the first fit", first.AnyRefitted());
+        bool allRefitted = true;
+        for (int i = 0; i < first.count; ++i) {
+            allRefitted = allRefitted && first.cascades[i].refitted;
+        }
+        Expect("...and that means all of them", allRefitted);
+
+        // The same camera again must reuse everything.
+        const ShadowCascades again = ComputeShadowCascades(
+            view, projection, lightDirection, sceneMin, sceneMax, held, &first);
+        Expect("a stationary camera refits nothing", !again.AnyRefitted());
+        bool identical = true;
+        for (int i = 0; i < again.count; ++i) {
+            identical = identical && std::memcmp(&again.cascades[i].viewProjection,
+                                                 &first.cascades[i].viewProjection,
+                                                 sizeof(Matrix)) == 0;
+        }
+        Expect("a held cascade's matrix is bit-identical", identical);
+
+        // A nudge far smaller than the margin must still reuse cascade 0 --
+        // this is the whole point, and what the old code could not do.
+        const Matrix nudged = Matrix::CreateLookAt(
+            Vector3(0.001f, 2.0f, 20.0f),
+            Vector3(0.001f, 2.0f, 0.0f), Vector3::UnitY);
+        const ShadowCascades afterNudge = ComputeShadowCascades(
+            nudged, projection, lightDirection, sceneMin, sceneMax, held, &first);
+        Expect("a 1 mm nudge refits nothing", !afterNudge.AnyRefitted());
+
+        // Yaw in place: a bounding sphere is rotation-invariant in SIZE, but
+        // its centre swings along the new view axis, which is what used to
+        // force a refit after a hundredth of a degree.
+        const Matrix turned = Matrix::CreateLookAt(
+            Vector3(0.0f, 2.0f, 20.0f),
+            Vector3(0.0f, 2.0f, 20.0f) + Vector3(0.0872f, 0.0f, -0.9962f),
+            Vector3::UnitY);
+        const ShadowCascades afterYaw = ComputeShadowCascades(
+            turned, projection, lightDirection, sceneMin, sceneMax, held, &first);
+        Expect("five degrees of yaw still reuses the far cascade",
+               !afterYaw.cascades[afterYaw.count - 1].refitted);
+
+        // Far enough and it must refit, or the slice would be sampling a map
+        // that does not cover it.
+        const Matrix moved = Matrix::CreateLookAt(Vector3(500.0f, 2.0f, 20.0f),
+                                                  Vector3(500.0f, 2.0f, 0.0f),
+                                                  Vector3::UnitY);
+        const ShadowCascades afterMove = ComputeShadowCascades(
+            moved, projection, lightDirection, sceneMin, sceneMax, held, &first);
+        bool everyCascadeRefitted = true;
+        for (int i = 0; i < afterMove.count; ++i) {
+            everyCascadeRefitted =
+                everyCascadeRefitted && afterMove.cascades[i].refitted;
+        }
+        Expect("moving 500 m refits every cascade", everyCascadeRefitted);
+
+        // A held cascade must actually CONTAIN its slice, which is the
+        // correctness condition the whole scheme rests on. Walk the camera out
+        // in small steps and check containment on every frame, held or not.
+        bool containedThroughout = true;
+        bool sawAHold = false;
+        bool sawARefit = false;
+        int holds = 0;
+        int refits = 0;
+        ShadowCascades rolling = ComputeShadowCascades(
+            view, projection, lightDirection, sceneMin, sceneMax, held);
+        for (int step = 1; step <= 400; ++step) {
+            const float x = 0.05f * static_cast<float>(step);
+            const Matrix walk = Matrix::CreateLookAt(Vector3(x, 2.0f, 20.0f),
+                                                     Vector3(x, 2.0f, 0.0f),
+                                                     Vector3::UnitY);
+            const ShadowCascades next = ComputeShadowCascades(
+                walk, projection, lightDirection, sceneMin, sceneMax, held, &rolling);
+            for (int i = 0; i < next.count; ++i) {
+                if (next.cascades[i].refitted) {
+                    sawARefit = true;
+                    ++refits;
+                } else {
+                    sawAHold = true;
+                    ++holds;
+                }
+            }
+            // The near cascade's own slice midpoint must land inside the
+            // cascade it is held for.
+            const float nearEdge = 0.1f;
+            const float midway = 0.5f * (nearEdge + next.cascades[0].splitDistance);
+            const Vector3 point(x, 2.0f, 20.0f - midway);
+            containedThroughout = containedThroughout &&
+                                  insideClip(next.cascades[0].viewProjection, point, 0.0f);
+            rolling = next;
+        }
+        std::printf("  %-52s %d of %d (%.0f%%)\n",
+                    "cascade fits held while walking 20 m", holds, holds + refits,
+                    100.0 * holds / static_cast<double>(holds + refits));
+        Expect("a held cascade still contains its slice while walking",
+               containedThroughout);
+        Expect("walking 20 m both holds and refits", sawAHold && sawARefit);
+
+        // Margin 0 must behave exactly as the old code did: refit every frame.
+        ShadowCascadeSetup unheld = setup;
+        unheld.fitMargin = 0.0f;
+        const ShadowCascades a = ComputeShadowCascades(
+            view, projection, lightDirection, sceneMin, sceneMax, unheld);
+        const ShadowCascades b = ComputeShadowCascades(
+            nudged, projection, lightDirection, sceneMin, sceneMax, unheld, &a);
+        Expect("a zero margin refits on the smallest motion", b.AnyRefitted());
+
+        // Changing the light must invalidate every held fit: the held spheres
+        // and the fitted depth range were both chosen against the old one.
+        const ShadowCascades relit = ComputeShadowCascades(
+            view, projection, Vector3(-0.4f, -0.8f, 0.2f), sceneMin, sceneMax,
+            held, &first);
+        bool allRelit = true;
+        for (int i = 0; i < relit.count; ++i) {
+            allRelit = allRelit && relit.cascades[i].refitted;
+        }
+        Expect("moving the light refits every cascade", allRelit);
+    }
+
+    // --- refusals ------------------------------------------------------
+    ShadowCascadeSetup degenerate = setup;
+    degenerate.shadowDistance = 0.0f;
+    Expect("a zero shadow distance produces no cascades",
+           ComputeShadowCascades(view, projection, lightDirection, sceneMin, sceneMax,
+                                 degenerate)
+                   .count == 0);
+    Expect("a zero light direction produces no cascades",
+           ComputeShadowCascades(view, projection, Vector3::Zero, sceneMin, sceneMax,
+                                 setup)
+                   .count == 0);
+
+    // A sun straight overhead is the case that breaks an up vector of +Y.
+    const ShadowCascades overhead = ComputeShadowCascades(
+        view, projection, Vector3(0.0f, -1.0f, 0.0f), sceneMin, sceneMax, setup);
+    Expect("a light straight overhead still fits", overhead.count == 4);
+    bool overheadFinite = true;
+    for (int i = 0; i < overhead.count; ++i) {
+        const float* m = &overhead.cascades[i].viewProjection._11;
+        for (int k = 0; k < 16; ++k) {
+            overheadFinite = overheadFinite && std::isfinite(m[k]);
+        }
+    }
+    Expect("and its matrices are finite", overheadFinite);
+}
+
+// Frustum culling, against the same CreateLookAt and
+// CreatePerspectiveFieldOfView the application builds its matrices with.
+//
+// The plane extraction is derived from the clip-space inequalities rather than
+// taken from a library, so the convention is exactly what these assertions say
+// it is: a box in front of the camera is kept, one behind it is not. Getting a
+// sign wrong here culls the entire scene or nothing at all, and both look like
+// a different bug.
+void TestViewFrustum() {
+    using DirectX::SimpleMath::Matrix;
+    using DirectX::SimpleMath::Vector3;
+
+    std::cout << "view frustum culling" << std::endl;
+
+    // Looking down -Z from the origin, the way a right-handed view matrix does.
+    const Matrix view = Matrix::CreateLookAt(Vector3(0.0f, 0.0f, 10.0f),
+                                             Vector3::Zero, Vector3::UnitY);
+    const Matrix projection = Matrix::CreatePerspectiveFieldOfView(
+        DirectX::XMConvertToRadians(70.0f), 16.0f / 9.0f, 0.1f, 100.0f);
+    const NeuralModelIntegrateTestbed::ViewFrustum frustum =
+        NeuralModelIntegrateTestbed::ViewFrustum::FromViewProjection(view * projection);
+
+    const Vector3 unit(0.5f, 0.5f, 0.5f);
+
+    Expect("a box at the look-at point is visible",
+           frustum.Intersects(Vector3::Zero, unit));
+    Expect("a box just inside the near plane is visible",
+           frustum.Intersects(Vector3(0.0f, 0.0f, 9.0f), Vector3(0.1f, 0.1f, 0.1f)));
+
+    // Behind the camera. This is the one that matters: the near plane and the
+    // far plane are the pair most easily swapped, and swapping them keeps
+    // everything in front visible while also keeping everything behind.
+    Expect("a box behind the camera is culled",
+           !frustum.Intersects(Vector3(0.0f, 0.0f, 20.0f), unit));
+    Expect("a box beyond the far plane is culled",
+           !frustum.Intersects(Vector3(0.0f, 0.0f, -95.0f), unit));
+
+    // Sideways. At 10 units of depth the horizontal half-extent is
+    // 10 * tan(35) * 16/9 == 12.45, so 40 is well outside and 2 is well inside.
+    Expect("a box far to the left is culled",
+           !frustum.Intersects(Vector3(-40.0f, 0.0f, 0.0f), unit));
+    Expect("a box far to the right is culled",
+           !frustum.Intersects(Vector3(40.0f, 0.0f, 0.0f), unit));
+    Expect("a box slightly off-axis is visible",
+           frustum.Intersects(Vector3(2.0f, 0.0f, 0.0f), unit));
+    Expect("a box far above is culled",
+           !frustum.Intersects(Vector3(0.0f, 40.0f, 0.0f), unit));
+    Expect("a box far below is culled",
+           !frustum.Intersects(Vector3(0.0f, -40.0f, 0.0f), unit));
+
+    // Conservative, in the direction that keeps things: a box whose centre is
+    // outside but which reaches in must not be culled.
+    Expect("a box straddling the left plane is kept",
+           frustum.Intersects(Vector3(-13.0f, 0.0f, 0.0f), Vector3(2.0f, 2.0f, 2.0f)));
+
+    // A box enclosing the whole frustum is trivially visible, and is the case a
+    // naive "are all corners inside" test gets wrong.
+    Expect("a box containing the camera is visible",
+           frustum.Intersects(Vector3::Zero, Vector3(1000.0f, 1000.0f, 1000.0f)));
+
+    // --- the AABB transform --------------------------------------------
+    NeuralModelIntegrateTestbed::PrimitiveResource primitive;
+    primitive.hasBounds = true;
+    primitive.localMin = {-1.0f, -1.0f, -1.0f};
+    primitive.localMax = {1.0f, 1.0f, 1.0f};
+
+    Vector3 centre;
+    Vector3 extent;
+    Expect("bounds resolve under an identity transform",
+           NeuralModelIntegrateTestbed::PrimitiveWorldBounds(primitive, Matrix::Identity,
+                                                             centre, extent));
+    ExpectFloat("identity keeps the centre at the origin", centre.Length(), 0.0f);
+    ExpectFloat("identity keeps the extent at 1", extent.x, 1.0f);
+
+    const Matrix translated = Matrix::CreateTranslation(5.0f, 0.0f, 0.0f);
+    NeuralModelIntegrateTestbed::PrimitiveWorldBounds(primitive, translated, centre,
+                                                      extent);
+    ExpectFloat("translation moves the centre", centre.x, 5.0f);
+    ExpectFloat("translation leaves the extent", extent.x, 1.0f);
+
+    const Matrix scaled = Matrix::CreateScale(2.0f, 3.0f, 4.0f);
+    NeuralModelIntegrateTestbed::PrimitiveWorldBounds(primitive, scaled, centre, extent);
+    ExpectFloat("scale scales the extent in x", extent.x, 2.0f);
+    ExpectFloat("scale scales the extent in y", extent.y, 3.0f);
+    ExpectFloat("scale scales the extent in z", extent.z, 4.0f);
+
+    // 45 degrees about Z grows a unit cube's x and y extents to sqrt(2): the
+    // case a transform that forgets to take absolute values gets wrong, because
+    // the contributions cancel instead of adding.
+    const Matrix rotated = Matrix::CreateRotationZ(DirectX::XM_PIDIV4);
+    NeuralModelIntegrateTestbed::PrimitiveWorldBounds(primitive, rotated, centre, extent);
+    ExpectFloat("a 45 degree rotation grows the x extent to sqrt(2)", extent.x,
+               std::sqrt(2.0f));
+    ExpectFloat("and the y extent to sqrt(2)", extent.y, std::sqrt(2.0f));
+    ExpectFloat("and leaves z alone", extent.z, 1.0f);
+
+    // A primitive with no authored bounds must report failure, so the caller
+    // knows not to cull it.
+    NeuralModelIntegrateTestbed::PrimitiveResource unbounded;
+    Expect("a primitive without bounds reports failure",
+           !NeuralModelIntegrateTestbed::PrimitiveWorldBounds(unbounded, Matrix::Identity,
+                                                              centre, extent));
+
+    // --- end to end ----------------------------------------------------
+    // A primitive placed outside the frustum by its node transform alone.
+    NeuralModelIntegrateTestbed::PrimitiveWorldBounds(
+        primitive, Matrix::CreateTranslation(0.0f, 0.0f, 30.0f), centre, extent);
+    Expect("a node transform can move a primitive out of view",
+           !frustum.Intersects(centre, extent));
+    NeuralModelIntegrateTestbed::PrimitiveWorldBounds(
+        primitive, Matrix::CreateTranslation(0.0f, 0.0f, 2.0f), centre, extent);
+    Expect("and back into it", frustum.Intersects(centre, extent));
 }
 
 // Which order does SimpleMath's Quaternion::Concatenate compose in?
@@ -922,6 +1349,343 @@ void TestRetargetBinding() {
     }
     std::printf("  %-52s %d\n", "driven bones that left the bind pose", moved);
     Expect("the pose actually changed the rig", moved >= 12);
+}
+
+
+
+// The sun's direction as two Euler angles. Worth asserting rather than eyeing
+// on screen: every sign slip here still produces a lit scene, just one lit from
+// somewhere else, and the yaw zero has to agree with the camera panel's or an
+// angle read off one means something different in the other.
+void TestSunEuler() {
+    using NeuralModelIntegrateTestbed::SunDirectionFromEuler;
+    using NeuralModelIntegrateTestbed::SunEulerFromDirection;
+    using DirectX::SimpleMath::Vector3;
+
+    std::printf("Sun direction from Euler angles\n");
+
+    // glTF's default: an untransformed punctual light shines down -Z, so that
+    // is what (0, 0) has to mean.
+    ExpectVec("(0, 0) is glTF's -Z", SunDirectionFromEuler(0.0f, 0.0f), 0.0f, 0.0f,
+              -1.0f);
+    // Negative pitch is downwards, which is where a sun is.
+    ExpectVec("pitch -90 shines straight down", SunDirectionFromEuler(-90.0f, 0.0f),
+              0.0f, -1.0f, 0.0f);
+    ExpectVec("pitch +90 shines straight up", SunDirectionFromEuler(90.0f, 0.0f),
+              0.0f, 1.0f, 0.0f);
+    // Yaw turns towards +X first, matching atan2(x, -z).
+    ExpectVec("yaw 90 shines towards +X", SunDirectionFromEuler(0.0f, 90.0f), 1.0f,
+              0.0f, 0.0f);
+    ExpectVec("yaw 180 shines towards +Z", SunDirectionFromEuler(0.0f, 180.0f), 0.0f,
+              0.0f, 1.0f);
+    ExpectVec("yaw -90 shines towards -X", SunDirectionFromEuler(0.0f, -90.0f), -1.0f,
+              0.0f, 0.0f);
+
+    // Unit by construction, so nothing downstream has to normalise. Checked at
+    // an angle where neither component is 0 or 1.
+    const Vector3 oblique = SunDirectionFromEuler(-33.0f, 57.0f);
+    ExpectFloat("an oblique direction is unit", oblique.Length(), 1.0f);
+
+    // The round trip is what the UI depends on: enabling the override reads the
+    // angles back out of whatever direction the asset authored, and a sun that
+    // jumps on a checkbox is the failure this prevents.
+    float worstPitch = 0.0f;
+    float worstYaw = 0.0f;
+    for (int pitchStep = -8; pitchStep <= 8; ++pitchStep) {
+        for (int yawStep = -12; yawStep < 12; ++yawStep) {
+            // Deliberately off the poles: at pitch +/-90 the direction is
+            // vertical and its yaw is genuinely undefined, so a round trip
+            // cannot recover it and nothing should claim otherwise.
+            const float pitch = pitchStep * 10.0f;
+            const float yaw = yawStep * 15.0f;
+            float gotPitch = 0.0f;
+            float gotYaw = 0.0f;
+            SunEulerFromDirection(SunDirectionFromEuler(pitch, yaw), gotPitch, gotYaw);
+            worstPitch = std::max(worstPitch, std::fabs(gotPitch - pitch));
+            // 180 and -180 are the same yaw, so the error is the circular one.
+            float yawError = std::fabs(gotYaw - yaw);
+            if (yawError > 180.0f) yawError = 360.0f - yawError;
+            worstYaw = std::max(worstYaw, yawError);
+        }
+    }
+    std::printf("  round trip over 17 x 24 angles: worst pitch %.4f deg, "
+                "worst yaw %.4f deg\n", worstPitch, worstYaw);
+    ExpectFloat("round trip recovers the pitch", worstPitch, 0.0f);
+    ExpectFloat("round trip recovers the yaw", worstYaw, 0.0f);
+
+    // A vertical direction has no yaw. The pitch still has to come back, and
+    // nothing may come back NaN.
+    float polePitch = 0.0f;
+    float poleYaw = 0.0f;
+    SunEulerFromDirection(Vector3(0.0f, -1.0f, 0.0f), polePitch, poleYaw);
+    ExpectFloat("straight down reads as pitch -90", polePitch, -90.0f);
+    ExpectFloat("straight down has a finite yaw", poleYaw - poleYaw, 0.0f);
+
+    // A degenerate direction is what an absent sun leaves behind; it must not
+    // produce NaN angles that then poison a cascade matrix.
+    float zeroPitch = 0.0f;
+    float zeroYaw = 0.0f;
+    SunEulerFromDirection(Vector3::Zero, zeroPitch, zeroYaw);
+    ExpectFloat("a zero direction falls back to straight down", zeroPitch, -90.0f);
+
+    // Not normalised on the way in. The UI reads back from ShaderLight, which
+    // is whatever the asset's node produced, and nothing promises unit length.
+    float longPitch = 0.0f;
+    float longYaw = 0.0f;
+    SunEulerFromDirection(Vector3(0.0f, -7.0f, 0.0f), longPitch, longYaw);
+    ExpectFloat("a long direction is normalised first", longPitch, -90.0f);
+
+    // And the cascades have to accept what this produces: a light direction is
+    // the one input ComputeShadowCascades cannot work without.
+    const NeuralModelIntegrateTestbed::ShadowCascadeSetup setup;
+    const DirectX::SimpleMath::Matrix view = DirectX::SimpleMath::Matrix::CreateLookAt(
+        Vector3(0.0f, 2.0f, 10.0f), Vector3::Zero, Vector3::UnitY);
+    const DirectX::SimpleMath::Matrix projection =
+        DirectX::SimpleMath::Matrix::CreatePerspectiveFieldOfView(1.2f, 1.777f, 0.1f,
+                                                                 100.0f);
+    const NeuralModelIntegrateTestbed::ShadowCascades fromEuler =
+        NeuralModelIntegrateTestbed::ComputeShadowCascades(
+            view, projection, SunDirectionFromEuler(-45.0f, 30.0f),
+            Vector3(-10.0f, -1.0f, -10.0f), Vector3(10.0f, 5.0f, 10.0f), setup);
+    ExpectFloat("a Euler sun still fits cascades",
+                static_cast<float>(fromEuler.count),
+                static_cast<float>(setup.cascadeCount));
+    // Two different suns must give two different fits, or the angles are not
+    // reaching the matrix at all.
+    const NeuralModelIntegrateTestbed::ShadowCascades other =
+        NeuralModelIntegrateTestbed::ComputeShadowCascades(
+            view, projection, SunDirectionFromEuler(-45.0f, 120.0f),
+            Vector3(-10.0f, -1.0f, -10.0f), Vector3(10.0f, 5.0f, 10.0f), setup);
+    const float matrixDelta =
+        (fromEuler.cascades[0].viewProjection.Translation() -
+         other.cascades[0].viewProjection.Translation())
+            .Length();
+    std::printf("  a 90 deg yaw change moves cascade 0 by %.4f\n", matrixDelta);
+    Expect("turning the sun moves the cascade matrix", matrixDelta > 1e-3f);
+}
+
+void TestSceneSunView() {
+    using DirectX::SimpleMath::Matrix;
+    using DirectX::SimpleMath::Vector3;
+    using DirectX::SimpleMath::Vector4;
+    using NeuralModelIntegrateTestbed::SceneSunViewProjection;
+
+    std::cout << "whole-scene sun view (for baking)" << std::endl;
+
+    const Vector3 sceneMin(-52.4f, -4.7f, -46.9f);
+    const Vector3 sceneMax(58.7f, 27.2f, 72.4f);
+    Matrix viewProjection;
+    float texel = 0.0f;
+    Expect("a scene-wide sun view is produced",
+           SceneSunViewProjection(Vector3(0.3f, -0.9f, 0.3f), sceneMin, sceneMax,
+                                  4096, viewProjection, texel));
+
+    // The Bistro is 166 units across, so a 4096-texel map over its bounding
+    // sphere resolves about 4 cm -- finer than the lightmap's own 12.5 cm
+    // texels at 8 per metre, which is what keeps the bake from being limited
+    // by the depth map rather than by the atlas.
+    std::printf("  %-52s %.4f m\n", "sun depth texel at 4096", texel);
+    Expect("the sun depth map outresolves an 8-per-metre lightmap",
+           texel < 1.0f / 8.0f);
+
+    // EVERY corner of the scene must be inside the fit. A cascade may
+    // legitimately exclude geometry outside its slice; this one may not
+    // exclude anything, because a lightmap texel anywhere can need it.
+    bool allInside = true;
+    for (int corner = 0; corner < 8; ++corner) {
+        const Vector3 point((corner & 1) ? sceneMax.x : sceneMin.x,
+                            (corner & 2) ? sceneMax.y : sceneMin.y,
+                            (corner & 4) ? sceneMax.z : sceneMin.z);
+        const Vector4 clip =
+            Vector4::Transform(Vector4(point.x, point.y, point.z, 1.0f), viewProjection);
+        const Vector3 ndc(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+        allInside = allInside && ndc.x >= -1.0f && ndc.x <= 1.0f && ndc.y >= -1.0f &&
+                    ndc.y <= 1.0f && ndc.z >= 0.0f && ndc.z <= 1.0f;
+    }
+    Expect("every corner of the scene is inside the fit", allInside);
+
+    // Rotating the light must not change the resolution: the fit is a sphere.
+    Matrix other;
+    float otherTexel = 0.0f;
+    SceneSunViewProjection(Vector3(-0.7f, -0.2f, 0.6f), sceneMin, sceneMax, 4096,
+                           other, otherTexel);
+    ExpectFloat("the texel size does not depend on the light direction",
+                otherTexel, texel);
+
+    Expect("a degenerate light is refused",
+           !SceneSunViewProjection(Vector3::Zero, sceneMin, sceneMax, 4096,
+                                   viewProjection, texel));
+    Expect("empty bounds are refused",
+           !SceneSunViewProjection(Vector3::UnitY, sceneMin, sceneMin, 4096,
+                                   viewProjection, texel));
+    Expect("a zero resolution is refused",
+           !SceneSunViewProjection(Vector3::UnitY, sceneMin, sceneMax, 0,
+                                   viewProjection, texel));
+}
+
+void TestLightmapPacking() {
+    using NeuralModelIntegrateTestbed::LightmapAllocation;
+    using NeuralModelIntegrateTestbed::LightmapChartEdge;
+    using NeuralModelIntegrateTestbed::LightmapSetup;
+    using NeuralModelIntegrateTestbed::PackLightmap;
+
+    std::cout << "lightmap packing" << std::endl;
+
+    LightmapSetup setup;
+    setup.texelsPerMetre = 8.0f;
+    setup.atlasResolution = 1024;
+    setup.minChartEdge = 4;
+    setup.maxChartEdge = 256;
+    setup.padding = 2;
+
+    // --- sizing ---------------------------------------------------------
+    // A 1 m^2 surface earns 8 texels of content, which with a 2-texel border
+    // on each side is 12, rounded up to 16.
+    ExpectEqualU("one square metre earns a 16-texel chart",
+                 LightmapChartEdge(1.0f, setup), 16);
+    // 16 m^2 is a 4 m edge, so 32 texels of content, 36 with the border -> 64.
+    ExpectEqualU("sixteen square metres earn 64", LightmapChartEdge(16.0f, setup), 64);
+    ExpectEqualU("no area earns no chart", LightmapChartEdge(0.0f, setup), 0);
+    ExpectEqualU("a negative area earns no chart",
+                 LightmapChartEdge(-5.0f, setup), 0);
+    // Bigger never means smaller, which is the property a resolution dial has
+    // to have for the result to be predictable.
+    bool monotonic = true;
+    std::uint32_t previous = 0;
+    for (int i = 1; i <= 400; ++i) {
+        const std::uint32_t edge =
+            LightmapChartEdge(static_cast<float>(i) * 0.5f, setup);
+        monotonic = monotonic && edge >= previous;
+        previous = edge;
+    }
+    Expect("chart size never shrinks as area grows", monotonic);
+    // And it is capped, or one enormous floor would eat the atlas.
+    ExpectEqualU("a huge surface is capped", LightmapChartEdge(1.0e6f, setup),
+                 setup.maxChartEdge);
+
+    // --- packing --------------------------------------------------------
+    // A spread of sizes, deliberately not sorted, so the packer's own
+    // ordering is what decides the layout.
+    std::vector<float> areas;
+    for (int i = 0; i < 300; ++i) {
+        areas.push_back(0.05f + static_cast<float>((i * 37) % 97) * 0.9f);
+    }
+    // 1024 is genuinely too small for this mix -- a third of these areas earn a
+    // 128-texel chart, which is 1.6 M texels on its own -- so the atlas that
+    // has to hold them is bigger. That the 1024 case fills to exactly 100%
+    // before overflowing is the packer being tight, not the test being lucky.
+    LightmapSetup roomy = setup;
+    roomy.atlasResolution = 2048;
+    const LightmapAllocation packed = PackLightmap(areas, roomy);
+    Expect("every chart was placed", packed.complete);
+    ExpectEqualU("charts match instances",
+                 static_cast<std::uint32_t>(packed.charts.size()),
+                 static_cast<std::uint32_t>(areas.size()));
+
+    // Nothing may leave the atlas.
+    bool inside = true;
+    for (const auto& chart : packed.charts) {
+        if (!chart.placed) continue;
+        inside = inside && chart.x + chart.size <= roomy.atlasResolution &&
+                 chart.y + chart.size <= roomy.atlasResolution;
+    }
+    Expect("every chart is inside the atlas", inside);
+
+    // And no two may share a texel. This is the assertion the whole file
+    // exists for: a one-texel overlap makes one object wear another object's
+    // shadow, which reads as a baking bug and is an allocation bug.
+    bool disjoint = true;
+    std::size_t firstA = 0, firstB = 0;
+    for (std::size_t a = 0; a < packed.charts.size() && disjoint; ++a) {
+        if (!packed.charts[a].placed) continue;
+        for (std::size_t b = a + 1; b < packed.charts.size(); ++b) {
+            if (!packed.charts[b].placed) continue;
+            const auto& p = packed.charts[a];
+            const auto& q = packed.charts[b];
+            const bool apart = p.x + p.size <= q.x || q.x + q.size <= p.x ||
+                               p.y + p.size <= q.y || q.y + q.size <= p.y;
+            if (!apart) {
+                disjoint = false;
+                firstA = a;
+                firstB = b;
+                break;
+            }
+        }
+    }
+    if (!disjoint) {
+        std::printf("    charts %zu and %zu overlap\n", firstA, firstB);
+    }
+    Expect("no two charts overlap", disjoint);
+
+    // The UV transform must land inside the chart's own content, border
+    // excluded -- that border is what stops a bilinear tap at the edge of one
+    // chart from reading the next one.
+    bool uvInside = true;
+    for (const auto& chart : packed.charts) {
+        if (!chart.placed) continue;
+        const float lowU = chart.scaleOffset.z;
+        const float lowV = chart.scaleOffset.w;
+        const float highU = chart.scaleOffset.x + chart.scaleOffset.z;
+        const float highV = chart.scaleOffset.y + chart.scaleOffset.w;
+        const float atlas = static_cast<float>(roomy.atlasResolution);
+        uvInside = uvInside &&
+                   lowU * atlas >= static_cast<float>(chart.x + setup.padding) - 1e-3f &&
+                   lowV * atlas >= static_cast<float>(chart.y + setup.padding) - 1e-3f &&
+                   highU * atlas <= static_cast<float>(chart.x + chart.size -
+                                                       setup.padding) + 1e-3f &&
+                   highV * atlas <= static_cast<float>(chart.y + chart.size -
+                                                       setup.padding) + 1e-3f;
+    }
+    Expect("each UV transform stays inside its chart's content", uvInside);
+
+    // How much of the atlas the pack actually used. Printed rather than
+    // asserted on: it is a property of the size mix, not a correctness claim.
+    const double occupancy = 100.0 * static_cast<double>(packed.texelsPlaced) /
+                             (static_cast<double>(roomy.atlasResolution) *
+                              roomy.atlasResolution);
+    std::printf("  %-52s %.1f%% of %ux%u\n", "atlas occupancy", occupancy,
+                roomy.atlasResolution, roomy.atlasResolution);
+    // Not a tight bound, just a guard: a packer that started leaving most of
+    // the atlas empty would still pass every correctness check above.
+    Expect("the pack uses a reasonable share of the atlas", occupancy > 40.0);
+
+    // --- overflow is reported, not papered over -------------------------
+    LightmapSetup tiny = setup;
+    tiny.atlasResolution = 64;
+    const LightmapAllocation overflowed = PackLightmap(areas, tiny);
+    Expect("an atlas that is too small reports it", !overflowed.complete);
+    bool stillDisjoint = true;
+    for (std::size_t a = 0; a < overflowed.charts.size() && stillDisjoint; ++a) {
+        if (!overflowed.charts[a].placed) continue;
+        for (std::size_t b = a + 1; b < overflowed.charts.size(); ++b) {
+            if (!overflowed.charts[b].placed) continue;
+            const auto& p = overflowed.charts[a];
+            const auto& q = overflowed.charts[b];
+            stillDisjoint = stillDisjoint &&
+                            (p.x + p.size <= q.x || q.x + q.size <= p.x ||
+                             p.y + p.size <= q.y || q.y + q.size <= p.y);
+        }
+    }
+    // The important half of an overflow: what DID fit is still valid, so the
+    // caller can fall back per instance rather than losing the whole bake.
+    Expect("an overflowed pack is still internally consistent", stillDisjoint);
+
+    // --- reproducibility ------------------------------------------------
+    const LightmapAllocation again = PackLightmap(areas, roomy);
+    bool same = again.charts.size() == packed.charts.size();
+    for (std::size_t i = 0; same && i < again.charts.size(); ++i) {
+        same = again.charts[i].x == packed.charts[i].x &&
+               again.charts[i].y == packed.charts[i].y &&
+               again.charts[i].size == packed.charts[i].size;
+    }
+    Expect("packing the same scene twice gives the same atlas", same);
+
+    // A degenerate primitive asks for nothing and must not break the pack.
+    std::vector<float> withZeroes = {0.0f, 4.0f, 0.0f, 9.0f};
+    const LightmapAllocation mixed = PackLightmap(withZeroes, setup);
+    Expect("zero-area instances are skipped, not failed", mixed.complete);
+    Expect("...and get no chart", !mixed.charts[0].placed && !mixed.charts[2].placed);
+    Expect("...while the others do", mixed.charts[1].placed && mixed.charts[3].placed);
 }
 
 int main() {
@@ -1967,9 +2731,15 @@ int main() {
         Expect("an unanimated asset yields no animations", still.Animations().empty());
     }
 
+    TestViewFrustum();
+    TestShadowCascades();
     TestConcatenateOrder();
     TestRetargetRotations();
     TestRetargetBinding();
+
+    TestSunEuler();
+    TestSceneSunView();
+    TestLightmapPacking();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed" << std::endl;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DeviceResources.hpp"
+#include "Ui.hpp"
 #include <DirectMLX.h>
 
 #include <cstdint>
@@ -185,7 +186,7 @@ public:
     ID3D12Resource* InputResource(const std::string& name);
     ID3D12Resource* OutputResource(const std::string& name);
 
-    void ShowImgui();
+    void ShowImgui(UiSection section);
 
     // The DirectML device this manager created on the renderer's D3D12 device,
     // or null if Initialize has not run or DirectML was unavailable. Exposed so

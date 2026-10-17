@@ -1,6 +1,7 @@
 #pragma once
 
 #include "FloodDiffusion.hpp"
+#include "Ui.hpp"
 #include "MotionRetarget.hpp"
 
 #include <DirectXMath.h>
@@ -69,7 +70,9 @@ public:
     // Draws the current pose. Must be called between Begin and End on `batch`.
     void Draw(DirectX::PrimitiveBatch<DirectX::VertexPositionColor>& batch) const;
 
-    void ShowImgui();
+    void ShowImgui(UiSection section);
+    void ShowNeuralUi();
+    void ShowPerformanceUi();
 
 private:
     // The joint positions being displayed, after the world placement below.

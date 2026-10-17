@@ -2,6 +2,8 @@
 
 #include "SceneGraph.hpp"
 
+#include <cfloat>
+
 #include <fastgltf/math.hpp>
 #include <fastgltf/tools.hpp>
 
@@ -268,6 +270,85 @@ const char* ToString(SkinIssue issue) {
     return "unknown skin issue";
 }
 
+ViewFrustum ViewFrustum::FromViewProjection(
+    const DirectX::SimpleMath::Matrix& m) {
+    // Columns of the view-projection. With row vectors, clip.x is the dot of
+    // the position with column 1, and so on.
+    const DirectX::SimpleMath::Vector4 column1(m._11, m._21, m._31, m._41);
+    const DirectX::SimpleMath::Vector4 column2(m._12, m._22, m._32, m._42);
+    const DirectX::SimpleMath::Vector4 column3(m._13, m._23, m._33, m._43);
+    const DirectX::SimpleMath::Vector4 column4(m._14, m._24, m._34, m._44);
+
+    ViewFrustum frustum;
+    frustum.planes[0] = column4 + column1;  // -w <= x
+    frustum.planes[1] = column4 - column1;  //  x <= w
+    frustum.planes[2] = column4 + column2;  // -w <= y
+    frustum.planes[3] = column4 - column2;  //  y <= w
+    frustum.planes[4] = column3;            //  0 <= z
+    frustum.planes[5] = column4 - column3;  //  z <= w
+
+    // Normalised so d is a signed distance in world units. Not required by the
+    // box test below, which only looks at the sign, but it makes the planes
+    // usable for anything that wants a distance and keeps the magnitudes from
+    // varying wildly with the projection.
+    for (DirectX::SimpleMath::Vector4& plane : frustum.planes) {
+        const float length = std::sqrt(plane.x * plane.x + plane.y * plane.y +
+                                       plane.z * plane.z);
+        if (length > 1e-20f) {
+            plane /= length;
+        }
+    }
+    return frustum;
+}
+
+bool ViewFrustum::Intersects(const DirectX::SimpleMath::Vector3& centre,
+                             const DirectX::SimpleMath::Vector3& extent) const {
+    for (const DirectX::SimpleMath::Vector4& plane : planes) {
+        // Signed distance from the centre, and how far the box reaches towards
+        // the plane along its normal. The box is outside only when even its
+        // nearest corner is on the far side.
+        const float distance =
+            plane.x * centre.x + plane.y * centre.y + plane.z * centre.z + plane.w;
+        const float reach = std::fabs(plane.x) * extent.x +
+                            std::fabs(plane.y) * extent.y +
+                            std::fabs(plane.z) * extent.z;
+        if (distance + reach < 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PrimitiveWorldBounds(const PrimitiveResource& primitive,
+                          const DirectX::SimpleMath::Matrix& world,
+                          DirectX::SimpleMath::Vector3& centre,
+                          DirectX::SimpleMath::Vector3& extent) {
+    if (!primitive.hasBounds) {
+        return false;
+    }
+    const DirectX::SimpleMath::Vector3 localMin(primitive.localMin.x, primitive.localMin.y,
+                                                primitive.localMin.z);
+    const DirectX::SimpleMath::Vector3 localMax(primitive.localMax.x, primitive.localMax.y,
+                                                primitive.localMax.z);
+    const DirectX::SimpleMath::Vector3 localCentre = (localMin + localMax) * 0.5f;
+    const DirectX::SimpleMath::Vector3 localExtent = (localMax - localMin) * 0.5f;
+
+    centre = DirectX::SimpleMath::Vector3::Transform(localCentre, world);
+    // Row-vector convention: the x of the result is built from column 1, so
+    // the x extent reads down that column. Signs are dropped because a
+    // rotation can map either end of an axis onto the positive side.
+    extent.x = std::fabs(world._11) * localExtent.x +
+               std::fabs(world._21) * localExtent.y +
+               std::fabs(world._31) * localExtent.z;
+    extent.y = std::fabs(world._12) * localExtent.x +
+               std::fabs(world._22) * localExtent.y +
+               std::fabs(world._32) * localExtent.z;
+    extent.z = std::fabs(world._13) * localExtent.x +
+               std::fabs(world._23) * localExtent.y +
+               std::fabs(world._33) * localExtent.z;
+    return true;
+}
+
 ShaderLight ToShaderLight(const SceneLight& light) {
     ShaderLight out;
     out.position = DirectX::XMFLOAT3(light.position.x, light.position.y, light.position.z);
@@ -276,7 +357,21 @@ ShaderLight ToShaderLight(const SceneLight& light) {
     // without needing a second flag.
     out.range = light.range.value_or(0.0f);
     out.direction = DirectX::XMFLOAT3(light.direction.x, light.direction.y, light.direction.z);
-    out.intensity = light.intensity;
+    // Photometric to radiometric. KHR_lights_punctual's intensity is in
+    // CANDELA (lm/sr) for point and spot lights and LUX (lm/m^2) for
+    // directional ones; the shader needs a radiance multiplier. 683 lm/W is
+    // the luminous efficacy at 555 nm -- the same constant the SI candela is
+    // defined against, and the one glTF-Blender-IO divides by in its
+    // spec-compliant import mode (`PBR_WATTS_TO_LUMENS` in com/conversion.py).
+    //
+    // This asset settles any doubt about intent: its sun is authored at 6830
+    // lux, which is exactly 10.0 W/m^2 after the division. Passing the raw
+    // number through instead made every lit surface clip to white -- measured,
+    // 57% of the frame at 250/255 or above, with albedo no longer visible.
+    //
+    // Converted here, on load, rather than in the shader, so everything
+    // downstream is consistently radiometric.
+    out.intensity = light.intensity / 683.0f;
     out.color = DirectX::XMFLOAT3(light.color.x, light.color.y, light.color.z);
     out.type = static_cast<int>(light.type);
     out.innerConeCos = std::cos(light.innerConeAngle);
@@ -305,6 +400,20 @@ void PackWorldMatrices(const DirectX::SimpleMath::Matrix& world,
     }
 }
 
+// Which image a texture actually points at.
+//
+// MSFT_texture_dds lets a texture carry a second, DDS, source alongside its
+// ordinary one, and assets converted from engine content often ship ONLY the
+// DDS: the Lumberyard Bistro names a .png in `source` that was never shipped
+// and the real BC7 file in the extension. Preferring the DDS is therefore not
+// an optimisation, it is the difference between having textures and not.
+std::optional<std::size_t> TextureImageSource(const fastgltf::Texture& texture) {
+    if (texture.ddsImageIndex.has_value()) {
+        return texture.ddsImageIndex;
+    }
+    return texture.imageIndex;
+}
+
 ImageColorSpaceClassification ClassifyImageColorSpaces(const fastgltf::Asset& asset) {
     ImageColorSpaceClassification result;
     result.perImage.assign(asset.images.size(), ImageColorSpace::Linear);
@@ -318,10 +427,11 @@ ImageColorSpaceClassification ClassifyImageColorSpaces(const fastgltf::Asset& as
             return;
         }
         const fastgltf::Texture& texture = asset.textures[textureIndex];
-        if (!texture.imageIndex.has_value()) {
+        const std::optional<std::size_t> source = TextureImageSource(texture);
+        if (!source.has_value()) {
             return;
         }
-        const std::size_t imageIdx = texture.imageIndex.value();
+        const std::size_t imageIdx = source.value();
         if (imageIdx >= result.perImage.size()) {
             return;
         }
@@ -356,6 +466,25 @@ ImageColorSpaceClassification ClassifyImageColorSpaces(const fastgltf::Asset& as
         if (material.pbrData.metallicRoughnessTexture.has_value()) {
             claim(material.pbrData.metallicRoughnessTexture.value().textureIndex,
                   MaterialTextureSlot::MetallicRoughness);
+        }
+        // A spec-gloss diffuse map becomes the base colour, so it is sRGB. Left
+        // out, it would be read as linear and the whole scene would come out
+        // washed out -- the quietest of the failures this asset can produce.
+        if (material.specularGlossiness != nullptr &&
+            material.specularGlossiness->diffuseTexture.has_value()) {
+            claim(material.specularGlossiness->diffuseTexture.value().textureIndex,
+                  MaterialTextureSlot::BaseColor);
+        }
+        // The specularGlossiness map is sRGB too, and claimed as a base colour
+        // slot to say so even though it rides in the metallic-roughness one.
+        // The extension puts specular COLOUR in RGB and glossiness in A, and an
+        // _SRGB DXGI format decodes RGB through the sRGB curve while passing
+        // alpha through linearly -- which is exactly the split this needs.
+        if (material.specularGlossiness != nullptr &&
+            material.specularGlossiness->specularGlossinessTexture.has_value()) {
+            claim(material.specularGlossiness->specularGlossinessTexture.value()
+                      .textureIndex,
+                  MaterialTextureSlot::BaseColor);
         }
         if (material.normalTexture.has_value()) {
             claim(material.normalTexture.value().textureIndex,
@@ -502,6 +631,72 @@ void SceneGraph::Build(const fastgltf::Asset& asset,
             }
         }
     }
+
+    // Last, because it needs the animations, the skins and the parent links.
+    MarkMovingNodes();
+}
+
+void SceneGraph::MarkMovingNodes() {
+    m_staticGeometryNodes = 0;
+    m_movingGeometryNodes = 0;
+    for (SceneNode& node : m_nodes) {
+        node.movesAtRuntime = false;
+    }
+
+    // Directly animated, by ANY clip. Using only the selected one would make
+    // the answer change when the user picks a different animation, and a cache
+    // built against it would be silently wrong.
+    for (const SceneAnimation& animation : m_animations) {
+        for (const AnimationChannel& channel : animation.channels) {
+            if (channel.nodeIndex < m_nodes.size()) {
+                m_nodes[channel.nodeIndex].movesAtRuntime = true;
+            }
+        }
+    }
+
+    // A skinned mesh deforms where its authored POSITION bounds say it will
+    // not, and a joint's transform is driven rather than authored. Neither can
+    // be baked. This is the same exemption frustum culling makes, for the same
+    // reason.
+    for (SceneNode& node : m_nodes) {
+        if (node.IsSkinned() || node.isJoint) {
+            node.movesAtRuntime = true;
+        }
+    }
+
+    // Propagate down: a child of something that moves moves with it. Walked
+    // from the roots so a parent is always decided before its children, which
+    // an index-order loop would not guarantee.
+    std::vector<std::size_t> stack(m_roots.begin(), m_roots.end());
+    std::vector<bool> seen(m_nodes.size(), false);
+    while (!stack.empty()) {
+        const std::size_t index = stack.back();
+        stack.pop_back();
+        if (index >= m_nodes.size() || seen[index]) {
+            continue;
+        }
+        seen[index] = true;
+        SceneNode& node = m_nodes[index];
+        if (node.parent.has_value() && *node.parent < m_nodes.size() &&
+            m_nodes[*node.parent].movesAtRuntime) {
+            node.movesAtRuntime = true;
+        }
+        // Counted here rather than in a pass of its own: `inScene` is only
+        // set by UpdateTransforms, which has not run yet, so reachability from
+        // the roots is what this walk already knows and a later loop would
+        // see every node as out of scene.
+        if (node.HasGeometry()) {
+            if (node.movesAtRuntime) {
+                ++m_movingGeometryNodes;
+            } else {
+                ++m_staticGeometryNodes;
+            }
+        }
+
+        for (const std::size_t child : node.children) {
+            stack.push_back(child);
+        }
+    }
 }
 
 
@@ -517,11 +712,50 @@ std::optional<std::size_t> ResolveTextureImage(const fastgltf::Asset& asset,
         return std::nullopt;
     }
     const fastgltf::Texture& texture = asset.textures[textureIndex];
-    if (!texture.imageIndex.has_value() ||
-        texture.imageIndex.value() >= imageDescriptorCount) {
+    const std::optional<std::size_t> source = TextureImageSource(texture);
+    if (!source.has_value() || source.value() >= imageDescriptorCount) {
         return std::nullopt;
     }
-    return texture.imageIndex.value();
+    return source;
+}
+
+// Reads a primitive's local AABB out of its POSITION accessor. glTF makes
+// min/max mandatory on POSITION, so this is exact and costs nothing -- unlike
+// every other accessor, where they are optional.
+void ReadPositionBounds(const fastgltf::Asset& asset,
+                        const fastgltf::Primitive& primitive,
+                        PrimitiveResource& res) {
+    const auto* attribute = primitive.findAttribute("POSITION");
+    if (attribute == primitive.attributes.end()) {
+        return;
+    }
+    if (attribute->accessorIndex >= asset.accessors.size()) {
+        return;
+    }
+    const fastgltf::Accessor& accessor = asset.accessors[attribute->accessorIndex];
+    if (!accessor.min.has_value() || !accessor.max.has_value()) {
+        return;
+    }
+    if (accessor.min->size() < 3 || accessor.max->size() < 3) {
+        return;
+    }
+    // The bounds array is typed: an integer POSITION accessor stores them as
+    // int64, a float one as double.
+    const auto component = [](const fastgltf::AccessorBoundsArray& bounds,
+                              std::size_t index) -> float {
+        if (bounds.isType<double>()) {
+            return static_cast<float>(bounds.get<double>(index));
+        }
+        if (bounds.isType<std::int64_t>()) {
+            return static_cast<float>(bounds.get<std::int64_t>(index));
+        }
+        return 0.0f;
+    };
+    res.localMin = {component(*accessor.min, 0), component(*accessor.min, 1),
+                    component(*accessor.min, 2)};
+    res.localMax = {component(*accessor.max, 0), component(*accessor.max, 1),
+                    component(*accessor.max, 2)};
+    res.hasBounds = true;
 }
 
 // Fills one vertex buffer view from a named glTF attribute. Returns false, and
@@ -635,6 +869,54 @@ void SceneGraph::ResolveMaterial(const fastgltf::Asset& asset,
     c.metallicFactor = static_cast<float>(material.pbrData.metallicFactor);
     c.roughnessFactor = static_cast<float>(material.pbrData.roughnessFactor);
 
+    // KHR_materials_pbrSpecularGlossiness, mapped onto the metallic-roughness
+    // fields the shader reads. The extension is archived, but FBX2glTF emits it
+    // for anything converted out of an engine that worked that way -- 234 of the
+    // Lumberyard Bistro's 254 materials are specular-glossiness, and without
+    // this they have no base colour at all and the scene renders white.
+    //
+    //   diffuseFactor      -> baseColorFactor      (direct)
+    //   glossinessFactor   -> roughnessFactor      (1 - gloss, by definition)
+    //   specularFactor     -> NOT metallicFactor   (see below)
+    //
+    // metallic is forced to 0 rather than derived from specularFactor, which
+    // looks like it should work and does not. Measured across this asset,
+    // max(specularFactor) is 1.0 for `Plaster` and for wooden `Beams` and 0.03
+    // for `Fabric`: it is a specular *intensity* multiplier inherited from the
+    // source engine, not a metalness. Treating it as one turns the whole street
+    // to chrome. The asset's two genuine metals (`metal_grain_01`,
+    // `black_metal`) are authored as ordinary metallic-roughness materials and
+    // come through this function untouched.
+    //
+    // The specularGlossinessTexture is deliberately NOT bound. Its channels are
+    // RGB = specular colour, A = glossiness, while the shader reads the
+    // metallic-roughness slot as B = metallic, G = roughness -- so binding it
+    // would feed specular blue in as metalness. Using it needs a shading
+    // decision in the pixel shader, which is not this function's to make, so
+    // per-pixel gloss variation is lost and the factor stands in for it.
+    if (material.specularGlossiness != nullptr) {
+        const fastgltf::MaterialSpecularGlossiness& sg = *material.specularGlossiness;
+        c.isSpecularGlossiness = 1;
+        c.baseColorFactor = {
+            static_cast<float>(sg.diffuseFactor[0]),
+            static_cast<float>(sg.diffuseFactor[1]),
+            static_cast<float>(sg.diffuseFactor[2]),
+            static_cast<float>(sg.diffuseFactor[3]),
+        };
+        c.specularFactor = {
+            static_cast<float>(sg.specularFactor[0]),
+            static_cast<float>(sg.specularFactor[1]),
+            static_cast<float>(sg.specularFactor[2]),
+        };
+        c.glossinessFactor = static_cast<float>(sg.glossinessFactor);
+        // metallicFactor and roughnessFactor are not used on this path:
+        // PSGBuffer derives both from the factors above and the textures, per
+        // pixel. Left at values that read as "rough dielectric" so a material
+        // the shader somehow fails to convert is dull rather than chrome.
+        c.metallicFactor = 0.0f;
+        c.roughnessFactor = 1.0f - c.glossinessFactor;
+    }
+
     c.emissiveFactor = {
         static_cast<float>(material.emissiveFactor[0]),
         static_cast<float>(material.emissiveFactor[1]),
@@ -667,6 +949,31 @@ void SceneGraph::ResolveMaterial(const fastgltf::Asset& asset,
         const auto& info = material.pbrData.metallicRoughnessTexture.value();
         assign(MaterialTextureSlot::MetallicRoughness, info.textureIndex, info.texCoordIndex,
                c.hasMetallicRoughnessTexture, c.metallicRoughnessTexCoord);
+    }
+    // The spec-gloss diffuse map is the base colour. Only when the material did
+    // not also supply a metallic-roughness base colour, which would be the
+    // authored intent; in practice a spec-gloss material has neither.
+    if (material.specularGlossiness != nullptr &&
+        material.specularGlossiness->diffuseTexture.has_value() &&
+        !material.pbrData.baseColorTexture.has_value()) {
+        const auto& info = material.specularGlossiness->diffuseTexture.value();
+        assign(MaterialTextureSlot::BaseColor, info.textureIndex, info.texCoordIndex,
+               c.hasBaseColorTexture, c.baseColorTexCoord);
+    }
+    // The specularGlossinessTexture rides in the metallic-roughness slot. That
+    // slot is free on a spec-gloss material -- the two workflows are mutually
+    // exclusive -- so this needs no extra SRV, no wider descriptor table and no
+    // root signature change. PSGBuffer reads the slot as RGB = specular colour,
+    // A = glossiness when Mat_IsSpecularGlossiness is set, and as
+    // B = metallic, G = roughness otherwise.
+    if (material.specularGlossiness != nullptr &&
+        material.specularGlossiness->specularGlossinessTexture.has_value() &&
+        !material.pbrData.metallicRoughnessTexture.has_value()) {
+        const auto& info =
+            material.specularGlossiness->specularGlossinessTexture.value();
+        assign(MaterialTextureSlot::MetallicRoughness, info.textureIndex,
+               info.texCoordIndex, c.hasMetallicRoughnessTexture,
+               c.metallicRoughnessTexCoord);
     }
     if (material.normalTexture.has_value()) {
         const auto& info = material.normalTexture.value();
@@ -733,9 +1040,16 @@ void SceneGraph::BuildPrimitives(
                                      VertexStream::Position)])) {
             continue;
         }
+        ReadPositionBounds(asset, primitive, res);
         ResolveVertexStream(asset, primitive, "TEXCOORD_0", 2, buffers,
                             res.vertexBufferViews[static_cast<std::size_t>(
                                 VertexStream::TexCoord0)]);
+        // The lightmap UV set. Optional: an asset that has never been baked
+        // has no second UV set, and the renderer falls back to the shadow map
+        // for those surfaces rather than refusing to draw them.
+        res.hasLightmapUv = ResolveVertexStream(
+            asset, primitive, "TEXCOORD_1", 2, buffers,
+            res.vertexBufferViews[static_cast<std::size_t>(VertexStream::TexCoord1)]);
         ResolveVertexStream(asset, primitive, "NORMAL", 3, buffers,
                             res.vertexBufferViews[static_cast<std::size_t>(
                                 VertexStream::Normal)]);
@@ -1132,6 +1446,8 @@ bool SceneGraph::ComputeJointMatrices(
 
 void SceneGraph::UpdateTransforms(const DirectX::SimpleMath::Matrix& rootTransform) {
     m_drawOrder.clear();
+    m_staticDrawOrder.clear();
+    m_movingDrawOrder.clear();
     for (SceneNode& node : m_nodes) {
         node.inScene = false;
     }
@@ -1168,6 +1484,15 @@ void SceneGraph::VisitForTransform(std::size_t nodeIndex,
     const bool visible = parentVisible && node.visible;
     if (visible && node.HasGeometry()) {
         m_drawOrder.push_back(nodeIndex);
+        // Split here rather than filtered at each use: the shadow passes walk
+        // the moving half once per cascade, and scanning the whole scene four
+        // times to find a handful of nodes makes the per-frame cost scale with
+        // the scene instead of with what actually moves.
+        if (node.movesAtRuntime) {
+            m_movingDrawOrder.push_back(nodeIndex);
+        } else {
+            m_staticDrawOrder.push_back(nodeIndex);
+        }
     }
 
     // A light node usually carries no mesh, so it never reaches the draw order;
@@ -1231,6 +1556,46 @@ std::size_t SceneGraph::GatherShaderLights(ShaderLight* out, std::size_t maxLigh
         out[i] = ShaderLight{};
     }
     return written;
+}
+
+bool SceneGraph::WorldBounds(DirectX::XMFLOAT3& outMin,
+                             DirectX::XMFLOAT3& outMax) const {
+    float minimum[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
+    float maximum[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    bool any = false;
+
+    for (const std::size_t nodeIndex : m_drawOrder) {
+        const SceneNode& node = m_nodes[nodeIndex];
+        for (const PrimitiveResource& primitive : node.primitives) {
+            if (!primitive.hasBounds) {
+                continue;
+            }
+            // All eight corners, because the node transform can rotate: taking
+            // just min and max through a rotation gives a box that is too small
+            // and frames the scene badly.
+            for (int corner = 0; corner < 8; ++corner) {
+                const DirectX::SimpleMath::Vector3 local(
+                    (corner & 1) ? primitive.localMax.x : primitive.localMin.x,
+                    (corner & 2) ? primitive.localMax.y : primitive.localMin.y,
+                    (corner & 4) ? primitive.localMax.z : primitive.localMin.z);
+                const DirectX::SimpleMath::Vector3 world =
+                    DirectX::SimpleMath::Vector3::Transform(local, node.worldTransform);
+                const float components[3] = {world.x, world.y, world.z};
+                for (int axis = 0; axis < 3; ++axis) {
+                    minimum[axis] = std::min(minimum[axis], components[axis]);
+                    maximum[axis] = std::max(maximum[axis], components[axis]);
+                }
+                any = true;
+            }
+        }
+    }
+
+    if (!any) {
+        return false;
+    }
+    outMin = {minimum[0], minimum[1], minimum[2]};
+    outMax = {maximum[0], maximum[1], maximum[2]};
+    return true;
 }
 
 std::size_t SceneGraph::DroppedLightCount(std::size_t maxLights) const {

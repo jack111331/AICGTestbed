@@ -737,8 +737,17 @@ ID3D12Resource* ModelManager::OutputResource(const std::string& name) {
     return it == m_models.end() ? nullptr : it->second->OutputResource();
 }
 
-void ModelManager::ShowImgui() {
-    if (!ImGui::CollapsingHeader("Neural models")) {
+void ModelManager::ShowImgui(UiSection section) {
+    // Two tabs: what a model is and how to run it in Neural, what it costs in
+    // Performance. The split is per LINE rather than per model, which is why
+    // the loop below is walked twice rather than once with a branch inside.
+    if (section != UiSection::Neural && section != UiSection::Performance) {
+        return;
+    }
+    const bool costs = section == UiSection::Performance;
+    if (!ImGui::CollapsingHeader(costs ? "Neural model footprints"
+                                       : "Neural models",
+                                 costs ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
         return;
     }
     if (m_models.empty()) {
@@ -761,31 +770,38 @@ void ModelManager::ShowImgui() {
             continue;
         }
         ImGui::Text("Backend: %s", ToString(info.backend));
-        // Submits on the shared queue. Safe to press at any time: the work is
-        // ordered after whatever the renderer has already submitted.
-        if (ImGui::Button("Enqueue now")) {
-            std::string enqueueError;
-            if (!entry.second->Enqueue(&enqueueError)) {
-                std::printf("enqueueing '%s' failed: %s\n", info.name.c_str(),
-                            enqueueError.c_str());
+        if (costs) {
+            ImGui::Text("Input:  %s  (%llu bytes)", shape(info.inputSizes).c_str(),
+                        static_cast<unsigned long long>(info.inputBytes));
+            ImGui::Text("Output: %s  (%llu bytes)", shape(info.outputSizes).c_str(),
+                        static_cast<unsigned long long>(info.outputBytes));
+            if (info.backend == ModelBackend::DirectMLGraph) {
+                ImGui::Text("Weights: %zu tensors, %llu bytes", info.weightCount,
+                            static_cast<unsigned long long>(info.weightBytes));
+                ImGui::Text("Scratch: %llu temporary, %llu persistent",
+                            static_cast<unsigned long long>(info.temporaryBytes),
+                            static_cast<unsigned long long>(info.persistentBytes));
+            } else {
+                // ORT does not report the session's weight footprint, and
+                // guessing would be worse than saying nothing.
+                ImGui::TextUnformatted("Weights are held inside the ORT session");
             }
-        }
-        ImGui::Text("Input:  %s  (%llu bytes)", shape(info.inputSizes).c_str(),
-                    static_cast<unsigned long long>(info.inputBytes));
-        ImGui::Text("Output: %s  (%llu bytes)", shape(info.outputSizes).c_str(),
-                    static_cast<unsigned long long>(info.outputBytes));
-        if (info.backend == ModelBackend::DirectMLGraph) {
-            ImGui::Text("Weights: %zu tensors, %llu bytes", info.weightCount,
-                        static_cast<unsigned long long>(info.weightBytes));
-            ImGui::Text("Scratch: %llu temporary, %llu persistent",
-                        static_cast<unsigned long long>(info.temporaryBytes),
-                        static_cast<unsigned long long>(info.persistentBytes));
-            ImGui::TextUnformatted("Recordable into the render command list");
         } else {
-            // ORT does not report the session's weight footprint, and guessing
-            // would be worse than saying nothing.
-            ImGui::TextUnformatted("Weights are held inside the ORT session");
-            ImGui::TextUnformatted("Submits its own command lists on the shared queue");
+            // Submits on the shared queue. Safe to press at any time: the work
+            // is ordered after whatever the renderer has already submitted.
+            if (ImGui::Button("Enqueue now")) {
+                std::string enqueueError;
+                if (!entry.second->Enqueue(&enqueueError)) {
+                    std::printf("enqueueing '%s' failed: %s\n", info.name.c_str(),
+                                enqueueError.c_str());
+                }
+            }
+            if (info.backend == ModelBackend::DirectMLGraph) {
+                ImGui::TextUnformatted("Recordable into the render command list");
+            } else {
+                ImGui::TextUnformatted("Submits its own command lists on the "
+                                       "shared queue");
+            }
         }
         ImGui::TreePop();
     }
