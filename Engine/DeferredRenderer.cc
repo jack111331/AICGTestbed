@@ -48,6 +48,16 @@ constexpr DebugViewInfo kDebugViews[static_cast<std::size_t>(DebugView::Count)] 
     {"Lightmap sun depth", DebugChannels::Red},
 };
 
+// What a sun the UI invented is worth, when there is no authored light to take
+// a colour and an intensity from. White, and 6830 lux -- the value the
+// project's own shadow-test asset authors its sun at, which ToShaderLight's
+// 683 lm/W division turns into exactly 10 W/m^2. Taking the asset's number
+// means a character lit by this and a character lit by a real sun are exposed
+// the same, so the override is a way to see the scene rather than a second set
+// of lighting to tune.
+constexpr float kSynthesizedSunLux = 6830.0f;
+constexpr float kLumensPerWatt = 683.0f;
+
 }  // namespace
 
 const char* DebugViewName(DebugView view) {
@@ -121,6 +131,15 @@ void DeferredRenderer::CreateDeviceDependentResources(ID3D12Device* device,
 
         desc.name = "ShadowStaticAtlas";
         m_shadowStaticAtlas = graph.DeclareTexture(desc);
+
+        // The atlas the lighting pass samples, chosen per frame below. Pointed
+        // at a real resource from the start because that pass binds it in every
+        // frame, INCLUDING a frame that casts no shadows at all -- a scene with
+        // no directional light, or shadows switched off. A descriptor table may
+        // not contain an uninitialised entry, and an invalid handle here became
+        // a null source in CopyDescriptors, which faults inside the driver
+        // rather than failing anywhere this code could see.
+        m_shadowSampledAtlas = m_shadowStaticAtlas;
     }
 
     // The lightmap, and the sun depth map the bake tests against. Both are
@@ -325,28 +344,44 @@ void DeferredRenderer::SetSceneScale(float sceneRadius) {
 void DeferredRenderer::ResolveSun(const FrameInputs& inputs) {
     m_sunLightIndex = kNoSunLight;
     m_hasDirectionalLight = false;
-    if (inputs.lights == nullptr) {
-        return;
-    }
+    m_sunIsSynthesized = false;
 
     // The first directional light wins. Cascades are for a light with no
     // position, and nothing in these scenes has two suns.
-    for (std::size_t i = 0; i < inputs.lightCount; ++i) {
-        if (inputs.lights[i].type == static_cast<int>(LightType::Directional)) {
-            m_sunLightIndex = i;
-            break;
+    if (inputs.lights != nullptr) {
+        for (std::size_t i = 0; i < inputs.lightCount; ++i) {
+            if (inputs.lights[i].type == static_cast<int>(LightType::Directional)) {
+                m_sunLightIndex = i;
+                break;
+            }
         }
     }
-    if (m_sunLightIndex == kNoSunLight) {
+
+    if (m_sunLightIndex != kNoSunLight) {
+        const DirectX::XMFLOAT3& authored = inputs.lights[m_sunLightIndex].direction;
+        m_sunDirection =
+            m_sunOverride.enabled
+                ? SunDirectionFromEuler(m_sunOverride.pitchDegrees,
+                                        m_sunOverride.yawDegrees)
+                : DirectX::SimpleMath::Vector3(authored.x, authored.y, authored.z);
+    } else if (m_sunOverride.enabled) {
+        // No sun in the asset, so the override supplies one rather than
+        // overriding anything. A character exported on its own carries no
+        // KHR_lights_punctual block at all, and without this the only way to
+        // light it is to edit the glTF. Direction from the sliders; colour and
+        // intensity from kSynthesizedSunLux, because there is no authored
+        // light to take them from. The lighting pass appends it to the light
+        // array -- see the constants it builds.
+        m_sunIsSynthesized = true;
+        m_sunDirection =
+            SunDirectionFromEuler(m_sunOverride.pitchDegrees, m_sunOverride.yawDegrees);
+    } else {
+        // Nothing to light the scene with, and nothing downstream to update:
+        // leaving m_sunDirection alone keeps the bake's staleness comparison
+        // from firing on a sun that does not exist.
         return;
     }
     m_hasDirectionalLight = true;
-
-    const DirectX::XMFLOAT3& authored = inputs.lights[m_sunLightIndex].direction;
-    m_sunDirection =
-        m_sunOverride.enabled
-            ? SunDirectionFromEuler(m_sunOverride.pitchDegrees, m_sunOverride.yawDegrees)
-            : DirectX::SimpleMath::Vector3(authored.x, authored.y, authored.z);
 
     // A bake fixes the light into the data, so a sun that moves invalidates it
     // -- which is now a thing the UI can do, not only a thing an animation can.
@@ -528,8 +563,8 @@ void DeferredRenderer::AddDebugViewPass(Render::RenderGraph& graph,
         case DebugView::ShadowAtlas: {
             // Whichever half the lighting pass sampled, so this shows the map
             // the frame was actually lit by rather than one of its inputs.
-            source = m_shadowSampledAtlas.IsValid() ? m_shadowSampledAtlas
-                                                    : m_shadowStaticAtlas;
+            // Always a real handle -- see where it is declared.
+            source = m_shadowSampledAtlas;
             std::uint32_t x = 0, y = 0, size = 0, atlas = 0;
             ShadowCascadeAtlasRect(0, m_shadowSetup.cascadeCount,
                                    m_shadowSetup.resolution, x, y, size, atlas);
@@ -932,6 +967,11 @@ void DeferredRenderer::AddPasses(Render::RenderGraph& graph, const FrameTargets&
     // the cascade fit, the bake and what the lighting pass is told, so it is
     // settled once here.
     ResolveSun(inputs);
+    // A synthesised sun occupies a slot in the lighting constants, so it
+    // counts against the cap the Performance tab reports.
+    if (m_sunIsSynthesized) {
+        ++m_lastLightCount;
+    }
 
     // Before the G-buffer: the cascades are fitted to this frame's camera, and
     // the lighting pass reads the result out of the same constants it reads the
@@ -1129,6 +1169,15 @@ void DeferredRenderer::AddPasses(Render::RenderGraph& graph, const FrameTargets&
         // there is no per-frame shadow work at all.
         m_shadowSampledAtlas = moving ? m_shadowAtlas : m_shadowStaticAtlas;
         m_lastFrameHadMovingGeometry = moving;
+    } else {
+        // No shadow pass this frame, so the live atlas holds whatever an
+        // earlier frame left in it. The lighting pass is told
+        // shadowCascadeCount == 0 and so never samples what it binds, but it
+        // does bind it, so this names the half that is never written by a
+        // dynamic pass rather than leaving the previous frame's choice in
+        // place.
+        m_shadowSampledAtlas = m_shadowStaticAtlas;
+        m_lastFrameHadMovingGeometry = false;
     }
 
     {
@@ -1209,10 +1258,14 @@ void DeferredRenderer::AddPasses(Render::RenderGraph& graph, const FrameTargets&
         // Reading the same depth buffer the geometry pass just wrote is the
         // transition the graph exists to get right.
         pass.reads.push_back({targets.depth, Render::Access::PixelShaderResource});
-        if (castShadows) {
-            pass.reads.push_back(
-                {m_shadowSampledAtlas, Render::Access::PixelShaderResource});
-        }
+        // Declared whether or not a shadow pass ran, because the SRV table this
+        // pass binds holds the atlas either way: the graph has to put the
+        // resource in PIXEL_SHADER_RESOURCE for that binding to be legal, and
+        // only a declared read does that. Reading an atlas no pass wrote is
+        // what persistentContent on the declaration allows, and the shader does
+        // not sample it with a cascade count of zero.
+        pass.reads.push_back(
+            {m_shadowSampledAtlas, Render::Access::PixelShaderResource});
         pass.writes.push_back({m_sceneColor, Render::Access::RenderTarget});
         // Cleared here only when no skybox pass ran: whichever of the two is
         // first has to clear, and what shows through where this shader discards
@@ -1252,6 +1305,22 @@ void DeferredRenderer::AddPasses(Render::RenderGraph& graph, const FrameTargets&
                 m_sunLightIndex < std::min(inputs.lightCount, kMaxDeferredLights)) {
                 constants.lights[m_sunLightIndex].direction = DirectX::XMFLOAT3(
                     m_sunDirection.x, m_sunDirection.y, m_sunDirection.z);
+            } else if (m_sunIsSynthesized &&
+                       static_cast<std::size_t>(constants.lightCount) <
+                           kMaxDeferredLights) {
+                // A sun with no light of its own in the scene needs a slot
+                // here, or the cascades would be fitted to a light the shading
+                // never sees. Appended past the asset's lights and counted, so
+                // the array stays exactly what the scene authored plus this
+                // one; radiometric like everything ToShaderLight produces,
+                // since the shader does no photometric conversion.
+                ShaderLight& sun = constants.lights[constants.lightCount++];
+                sun = ShaderLight{};
+                sun.direction = DirectX::XMFLOAT3(m_sunDirection.x, m_sunDirection.y,
+                                                  m_sunDirection.z);
+                sun.intensity = kSynthesizedSunLux / kLumensPerWatt;
+                sun.color = DirectX::XMFLOAT3(1.0f, 1.0f, 1.0f);
+                sun.type = static_cast<int>(LightType::Directional);
             }
 
             // The cascades, or zeroed when there are none: a cascade count of
@@ -1380,20 +1449,30 @@ void DeferredRenderer::ShowRenderUi() {
     }
 
     ImGui::SeparatorText("Sun");
-    if (!m_hasDirectionalLight) {
-        // Worth saying: a scene lit only by point lights has no sun to steer,
-        // and an absent sun looks exactly like broken shadows.
-        ImGui::TextUnformatted("no directional light in this scene");
-    } else {
+    {
+        // Whether the asset brought a sun of its own decides what this panel
+        // is: a redirect, or the only sun there is. Worth saying either way --
+        // a scene lit only by point lights looks exactly like broken shadows,
+        // and the answer to that is now on this panel rather than in the glTF.
+        const bool authored = m_sunLightIndex != kNoSunLight;
+        if (!authored) {
+            ImGui::TextUnformatted("no directional light in this scene");
+        }
+
         // Two angles rather than a vector, because a vector typed in by hand is
         // three numbers of which only two matter and which have to be
         // renormalised afterwards. The components are shown below, derived.
         bool enabled = m_sunOverride.enabled;
-        if (ImGui::Checkbox("Override the asset's sun direction", &enabled)) {
-            if (enabled && !m_sunOverride.enabled) {
+        if (ImGui::Checkbox(authored ? "Override the asset's sun direction"
+                                     : "Light this scene with a sun from here",
+                            &enabled)) {
+            if (enabled && !m_sunOverride.enabled && authored) {
                 // Seeded from wherever the sun is now, so switching this on
                 // moves nothing. Without it the light jumps to the struct's
-                // default and the scene appears to break on a checkbox.
+                // default and the scene appears to break on a checkbox. Only
+                // with an authored sun: with none, the sliders' own values are
+                // the sun, and seeding them from m_sunDirection would copy
+                // whatever the last scene left there.
                 SunEulerFromDirection(m_sunDirection, m_sunOverride.pitchDegrees,
                                       m_sunOverride.yawDegrees);
             }
@@ -1409,7 +1488,7 @@ void DeferredRenderer::ShowRenderUi() {
         }
         float pitch = m_sunOverride.pitchDegrees;
         float yaw = m_sunOverride.yawDegrees;
-        if (!m_sunOverride.enabled) {
+        if (!m_sunOverride.enabled && authored) {
             // Showing the asset's own angles while disabled, so the sliders are
             // where the sun is rather than where the override last was.
             SunEulerFromDirection(m_sunDirection, pitch, yaw);
@@ -1429,14 +1508,30 @@ void DeferredRenderer::ShowRenderUi() {
             ImGui::EndDisabled();
         }
 
-        ImGui::Text("direction (%.3f, %.3f, %.3f)%s", m_sunDirection.x,
-                    m_sunDirection.y, m_sunDirection.z,
-                    m_sunOverride.enabled ? "" : "  (from the asset)");
+        if (!m_hasDirectionalLight) {
+            // The one state with no direction to print: no authored sun and
+            // the checkbox off, which is also the state the scene is black in.
+            ImGui::TextUnformatted("nothing is lighting this scene");
+        } else {
+            ImGui::Text("direction (%.3f, %.3f, %.3f)%s", m_sunDirection.x,
+                        m_sunDirection.y, m_sunDirection.z,
+                        m_sunOverride.enabled ? "" : "  (from the asset)");
+        }
+        if (m_sunIsSynthesized) {
+            // Said because it is the part the sliders do not control, and
+            // because "why is this scene brighter than the other one" is
+            // otherwise unanswerable from the UI.
+            ImGui::Text("white at %.0f lux -- there is no authored sun to take "
+                        "a colour from",
+                        kSynthesizedSunLux);
+        }
         if (m_sunOverride.enabled) {
-            // Not a scene edit: the Scene tab's hierarchy reads the light's own
-            // node and still shows what the asset authored.
-            ImGui::TextUnformatted("the Scene tab still shows the authored "
-                                   "direction");
+            if (authored) {
+                // Not a scene edit: the Scene tab's hierarchy reads the light's
+                // own node and still shows what the asset authored.
+                ImGui::TextUnformatted("the Scene tab still shows the authored "
+                                       "direction");
+            }
             // A bake fixes the sun into the lightmap, so every change here
             // throws it away and asks for another. Worth saying, because on a
             // large scene the rebake is a visible hitch on the next frame.
@@ -1522,7 +1617,11 @@ void DeferredRenderer::ShowPerformanceUi() {
     if (!m_shadowsEnabled) {
         ImGui::TextUnformatted("Shadows: off");
     } else if (!m_hasDirectionalLight) {
-        ImGui::TextUnformatted("Shadows: no directional light in this scene");
+        // Points at the fix rather than only at the symptom: the Sun panel can
+        // supply the light this scene is missing.
+        ImGui::TextUnformatted(
+            "Shadows: no directional light in this scene (the Render tab's Sun "
+            "panel can supply one)");
     } else {
         ImGui::Text("%d cascades in a %ux%u atlas", m_shadowCascades.count,
                     m_shadowCascades.atlasResolution, m_shadowCascades.atlasResolution);

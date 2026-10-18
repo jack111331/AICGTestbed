@@ -461,6 +461,12 @@ private:
     std::size_t m_sunLightIndex = kNoSunLight;
     DirectX::SimpleMath::Vector3 m_sunDirection = {0.0f, -1.0f, 0.0f};
     SunDirectionOverride m_sunOverride;
+    // True when the override is standing in for a sun the scene does not have,
+    // rather than redirecting one it does. The distinction is the lighting
+    // pass's: a synthesised sun has no slot in the scene's light array and has
+    // to be appended to the constants, where an overridden one is already
+    // there and only its direction is rewritten.
+    bool m_sunIsSynthesized = false;
 
     // Set false to refit and re-render every cascade every frame, which is
     // what this did before the cache existed. Kept because "turn it off and
