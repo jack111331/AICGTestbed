@@ -47,6 +47,33 @@ void Expect(const char* what, bool condition) {
     if (!condition) ++g_failures;
 }
 
+// Reads the debug layer rather than relying on break-on-error, which this
+// test never arms: a reported failure beats a crash with no explanation.
+void ExpectNoDebugErrors(const char* what, ID3D12InfoQueue* infoQueue) {
+    if (infoQueue == nullptr) {
+        std::printf("  %-54s (no debug layer)\n", what);
+        return;
+    }
+    std::vector<std::string> errors;
+    const UINT64 count = infoQueue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; ++i) {
+        SIZE_T length = 0;
+        if (FAILED(infoQueue->GetMessage(i, nullptr, &length))) continue;
+        std::vector<char> storage(length);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(infoQueue->GetMessage(i, message, &length))) continue;
+        if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR ||
+            message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+            errors.emplace_back(message->pDescription, message->DescriptionByteLength);
+        }
+    }
+    infoQueue->ClearStoredMessages();
+    Expect(what, errors.empty());
+    for (const std::string& error : errors) {
+        std::printf("    %s\n", error.c_str());
+    }
+}
+
 void ExpectInt(const char* what, long long got, long long expected) {
     const bool ok = got == expected;
     std::printf("  %-54s %8lld expected %8lld  %s\n", what, got, expected,
@@ -63,11 +90,21 @@ struct Devices {
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<IDMLDevice> dml;
 
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
+
     bool Create() {
+        // The debug layer, so releasing an ONNX Runtime session while its
+        // submissions are still running is reported rather than silent. Not
+        // fatal if unavailable -- that only costs the checks below.
+        Microsoft::WRL::ComPtr<ID3D12Debug> debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            debug->EnableDebugLayer();
+        }
         if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                      IID_PPV_ARGS(&device)))) {
             return false;
         }
+        device->QueryInterface(IID_PPV_ARGS(&infoQueue));
         D3D12_COMMAND_QUEUE_DESC desc = {};
         desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         if (FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)))) {
@@ -232,7 +269,7 @@ void TestPipeline(const FloodDiffusionConfig& config, FloodDiffusionDevice devic
 
     std::string error;
     if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
-                       devices.queue.Get(), devices.dml.Get())) {
+                       devices.dml.Get())) {
         std::printf("  %s\n", error.c_str());
         ++g_failures;
         return;
@@ -515,6 +552,114 @@ void ComparePinned(const Run& prefix, const Run& pinned) {
     Expect("pinning shapes made it faster", pinned.milliseconds < prefix.milliseconds);
 }
 
+// The queue the DirectML provider submits to, and the fence that is now the
+// only thing ordering it against anything else.
+//
+// What is NOT tested here, because it does not exist: a fence that makes the
+// motion visible. Every tensor this pipeline binds is host memory, so Step()
+// returns with its floats already on the CPU -- ONNX Runtime does that copy
+// and that wait itself. The fence is for lifetime and for cross-queue
+// ordering, which is what these checks are about.
+void TestComputeQueue(const Devices& devices) {
+    std::printf("\nthe pipeline's own compute queue\n");
+
+    FloodDiffusionPipeline pipeline;
+    FloodDiffusionOptions options;
+    options.device = FloodDiffusionDevice::DirectML;
+    options.textEncoderDevice = FloodDiffusionDevice::Cpu;
+    options.latentFrames = 4;
+    options.seed = 7;
+    options.staticShapes = true;
+
+    std::string error;
+    if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
+                       devices.dml.Get())) {
+        std::printf("  %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+
+    ID3D12CommandQueue* queue = pipeline.ComputeQueue();
+    Expect("the pipeline made a queue of its own", queue != nullptr);
+    if (queue != nullptr) {
+        Expect("it is a COMPUTE queue, not a DIRECT one",
+               queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+        // devices.queue is the DIRECT queue this test creates and no longer
+        // hands over: it stands in for the renderer's, and the pipeline must
+        // not be on it.
+        Expect("and it is not the caller's DIRECT queue",
+               queue != devices.queue.Get());
+    }
+
+    // Draining with nothing outstanding has to be cheap and succeed, or every
+    // caller learns to skip it.
+    error.clear();
+    Expect("draining an idle queue succeeds", pipeline.WaitForWork(&error));
+    if (!error.empty()) std::printf("    error: %s\n", error.c_str());
+
+    // Real work, then the two synchronisation calls against it.
+    if (!pipeline.Begin("a person walks forward", options, &error)) {
+        std::printf("  Begin failed: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    int steps = 0;
+    while (!pipeline.Done() && steps < 400) {
+        if (!pipeline.Step(&error)) {
+            std::printf("  Step failed: %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+        ++steps;
+    }
+    Expect("a generation completed on the compute queue", pipeline.Done());
+    Expect("  and produced motion", pipeline.FrameCount() > 0);
+
+    error.clear();
+    Expect("the caller's queue can be ordered after it",
+           pipeline.OrderAfterWork(devices.queue.Get(), &error));
+    if (!error.empty()) std::printf("    error: %s\n", error.c_str());
+    Expect("ordering a null queue is refused",
+           !pipeline.OrderAfterWork(nullptr, &error));
+    Expect("draining after the work succeeds", pipeline.WaitForWork(&error));
+    ExpectNoDebugErrors("no debug-layer errors from the generation",
+                        devices.infoQueue.Get());
+
+    // The case the drain exists for: Load destroys every session, and on a
+    // private queue nothing else waits for their submissions first. Called
+    // twice so the second one has a live GPU-backed pipeline to tear down.
+    for (int i = 0; i < 2; ++i) {
+        error.clear();
+        if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
+                           devices.dml.Get())) {
+            std::printf("  reload %d failed: %s\n", i, error.c_str());
+            ++g_failures;
+            return;
+        }
+    }
+    Expect("reloading over live sessions keeps the pipeline usable",
+           pipeline.IsLoaded());
+    Expect("the queue survives a provider change",
+           pipeline.ComputeQueue() == queue);
+    ExpectNoDebugErrors("no debug-layer errors from reloading over live work",
+                        devices.infoQueue.Get());
+
+    // The CPU path submits nothing, so both calls have to be harmless no-ops
+    // rather than failures a caller has to special-case.
+    FloodDiffusionPipeline cpuOnly;
+    FloodDiffusionOptions cpuOptions;
+    cpuOptions.device = FloodDiffusionDevice::Cpu;
+    cpuOptions.textEncoderDevice = FloodDiffusionDevice::Cpu;
+    error.clear();
+    if (cpuOnly.Load(kDirectory, cpuOptions, &error)) {
+        Expect("the CPU path has no compute queue",
+               cpuOnly.ComputeQueue() == nullptr);
+        Expect("  draining it is a harmless no-op", cpuOnly.WaitForWork(&error));
+        Expect("  so is ordering against it",
+               cpuOnly.OrderAfterWork(devices.queue.Get(), &error));
+    }
+}
+
 void TestFailures() {
     std::printf("\nrefusals\n");
     FloodDiffusionPipeline pipeline;
@@ -580,6 +725,8 @@ int main() {
                 TestPipeline(config, FloodDiffusionDevice::DirectML, devices, &pinned,
                              true);
                 ComparePinned(gpu, pinned);
+
+                TestComputeQueue(devices);
             } else {
                 std::printf("\nno DirectML device; skipping the GPU sections\n");
             }

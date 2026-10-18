@@ -73,9 +73,11 @@ enum class FloodDiffusionDevice {
     // for these model sizes -- see the note above.
     Cpu,
 
-    // ONNX Runtime's DirectML EP, given this project's own ID3D12Device,
-    // command queue and IDMLDevice, so its work lands on the same queue as
-    // rendering and is ordered against it without a fence.
+    // ONNX Runtime's DirectML EP, given this project's own ID3D12Device and
+    // IDMLDevice. It submits to a COMPUTE queue the pipeline creates and owns,
+    // not the renderer's graphics queue, so a generation is scheduled beside
+    // the frame instead of between frames -- see OrderAfterWork for what that
+    // costs in ordering.
     DirectML,
 };
 
@@ -235,19 +237,62 @@ public:
     // `options.device` is the only option read at load time; the rest are
     // per-generation and taken by Begin.
     //
-    // The three device pointers are used only by FloodDiffusionDevice::
-    // DirectML, where ONNX Runtime is handed this project's own device and
-    // queue so its work is ordered against rendering without a fence. Pass
-    // nullptr for the CPU path.
+    // The two device pointers are used only by FloodDiffusionDevice::DirectML.
+    // Pass nullptr for the CPU path.
+    //
+    // No command queue: the pipeline creates its OWN compute queue on the
+    // device it is given and hands that to the execution provider. A caller
+    // cannot put this work on the graphics queue, which is the point -- a
+    // generation is tens of milliseconds of denoising, and on the renderer's
+    // queue those milliseconds are frames.
+    //
+    // Calling Load again changes provider. It drains the compute queue first,
+    // because it destroys the ONNX Runtime sessions and their submissions may
+    // still be running on it.
     bool Load(const std::filesystem::path& directory,
               const FloodDiffusionOptions& options,
               std::string* error,
               ID3D12Device* device = nullptr,
-              ID3D12CommandQueue* queue = nullptr,
               IDMLDevice* dmlDevice = nullptr);
 
     bool IsLoaded() const;
     const FloodDiffusionConfig& Config() const;
+
+    // --- the compute queue --------------------------------------------------
+    //
+    // What the fence is, and is not, for.
+    //
+    // Every tensor this pipeline binds is in HOST memory, so Step() already
+    // comes back with its results on the CPU: ONNX Runtime's Run does the
+    // copy and the wait itself, and no fence of ours could make the floats
+    // appear any sooner. Frame(), FeatureFrame() and the retargeting all read
+    // ordinary std::vectors and need no synchronisation at all.
+    //
+    // The fence exists for the two things queue order used to cover for free
+    // and no longer does:
+    //
+    //   * LIFETIME. Destroying an ONNX Runtime session, which Load does on
+    //     every provider change, releases resources its submissions may still
+    //     be reading. On the renderer's queue the frame's own drains hid this.
+    //     Nothing drains a private queue, so Load and the destructor do.
+    //   * CROSS-QUEUE ORDERING, for whatever samples this on the GPU next. The
+    //     motion is CPU-side today; the moment a pass reads one of these
+    //     tensors as a buffer, OrderAfterWork is what makes the read safe.
+
+    // Makes `queue` wait until everything the pipeline has submitted so far
+    // has finished. GPU-side: returns immediately, and costs the waiting queue
+    // nothing unless it arrives early. False only on a real failure; with no
+    // compute queue (the CPU path) there is nothing to order and it succeeds.
+    bool OrderAfterWork(ID3D12CommandQueue* queue, std::string* error = nullptr);
+
+    // Blocks the CPU until the same point. For teardown, provider changes and
+    // tests.
+    bool WaitForWork(std::string* error = nullptr);
+
+    // The queue the DirectML provider submits to, or null on the CPU path.
+    // Exposed so a test can assert what type it is and that it is not the
+    // renderer's.
+    ID3D12CommandQueue* ComputeQueue() const;
 
     // What Load actually settled on. These can differ from what was asked for
     // only by failing, never by silently falling back.

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------
-// DirectXTKSimpleSample12.cpp
+// Application.cc
 //
 // Advanced Technology Group (ATG)
 // Copyright (C) Microsoft Corporation. All rights reserved.
@@ -29,7 +29,7 @@ extern void ExitSample() noexcept;
 
 using namespace DirectX;
 
-// The model ModelManager registers at startup and RecordModelDispatch runs each
+// The model ModelManager registers at startup and EnqueueModel submits each
 // frame. One constant so the two cannot disagree -- a typo would simply stop
 // dispatching, silently.
 static constexpr const char* kNeuralModelName = "FloodDiffusion";
@@ -293,10 +293,13 @@ void Sample::Initialize(HWND window, int width, int height)
     // resources/FloodDiffusion is not an error -- the weights are 1.2 GB and
     // gitignored.
     //
-    // It is handed this renderer's device and queue plus the IDMLDevice the
-    // ModelManager already made, so the DirectML provider runs on the same
-    // adapter and queue as rendering and there is one IDMLDevice, not two.
-    // Hence this must follow m_nnModelManager.Initialize above.
+    // It is handed this renderer's device plus the IDMLDevice the ModelManager
+    // already made, so the DirectML provider runs on the same adapter and
+    // there is one IDMLDevice, not two. Hence this must follow
+    // m_nnModelManager.Initialize above.
+    //
+    // NOT the renderer's command queue: the pipeline makes its own compute
+    // queue, so a generation does not land in the middle of a frame.
     {
         // The retarget target lives in the glTF scene, so this has to follow
         // BuildSceneGraph above.
@@ -306,7 +309,6 @@ void Sample::Initialize(HWND window, int width, int height)
         std::string motionError;
         if (m_motionStream.Load("resources/FloodDiffusion",
                                 m_deviceResources->GetD3DDevice(),
-                                m_deviceResources->GetCommandQueue(),
                                 m_nnModelManager.DmlDevice(),
                                 &motionError)) {
             std::printf("FloodDiffusion motion pipeline ready\n");
@@ -608,14 +610,20 @@ void Sample::Render()
         m_deferred.SetPlanDescription("compile failed: " + graphError);
     }
 
-    // Outside the graph: a compute dispatch on the same queue that touches
-    // none of the frame's render targets. It would belong in the graph the
-    // moment it produced something a pass reads.
+    // Outside the graph, and off the graphics queue entirely: EnqueueModel
+    // submits to ModelManager's own compute queue, so this dispatch is
+    // scheduled beside the frame rather than between two of them.
     //
-    // Dispatched by name. An unregistered name records nothing and returns
+    // That is only correct because nothing in the frame reads the result. The
+    // moment a pass samples a model's output, this becomes a graph pass and
+    // the frame needs ModelManager::OrderAfterModelWork ahead of it --
+    // sharing the graphics queue used to make that ordering free, and it is
+    // not free any more.
+    //
+    // Dispatched by name. An unregistered name submits nothing and returns
     // false rather than asserting, so a model that failed to load does not
     // take the frame down with it.
-    m_nnModelManager.RecordModelDispatch(commandList, kNeuralModelName);
+    m_nnModelManager.EnqueueModel(kNeuralModelName);
 
     // Show the new frame. Present closes and submits the command list.
     PIXBeginEvent(m_deviceResources->GetCommandQueue(), PIX_COLOR_DEFAULT, L"Present");
@@ -729,7 +737,7 @@ void Sample::BuildFrameGraph()
     m_deferred.AddTonemapPass(m_frameGraph, targets.color);
 
 
-
+/*
     {
         NeuralModelIntegrateTestbed::Render::RenderPassDesc screen;
         screen.name = "ScreenOverlay";
@@ -741,7 +749,7 @@ void Sample::BuildFrameGraph()
         };
         m_frameGraph.AddPass(std::move(screen));
     }
-
+*/
     {
         NeuralModelIntegrateTestbed::Render::RenderPassDesc ui;
         ui.name = "ImGui";

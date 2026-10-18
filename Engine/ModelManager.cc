@@ -94,9 +94,8 @@ public:
     }
 
     bool Enqueue(std::string* error) override {
-        // Recording onto this runner's own list and submitting it, so the work
-        // is ordered against the renderer's submissions on the shared queue
-        // exactly as the ORT backend's is.
+        // Recording onto this runner's own list and submitting it to the
+        // manager's compute queue, which is what lets it overlap the frame.
         if (!BeginList(error)) {
             return false;
         }
@@ -110,6 +109,19 @@ public:
         }
         ID3D12CommandList* lists[] = {m_commandList.Get()};
         m_queue->ExecuteCommandLists(1, lists);
+        // Signalled even though nothing waits here, because BeginList does:
+        // an allocator may only be reset once every submission recorded from
+        // it has COMPLETED, and the fence is the only thing that knows. This
+        // used to be missing, so a second Enqueue reset an allocator still in
+        // flight -- Reset returns S_OK and corrupts it, and only the debug
+        // layer notices (EXECUTION ERROR #552, COMMAND_ALLOCATOR_SYNC).
+        // Harmless while Enqueue was called once in a session; not harmless
+        // once a frame calls it.
+        ++m_pendingFence;
+        if (FAILED(m_queue->Signal(m_fence.Get(), m_pendingFence))) {
+            SetError(error, "fence signal failed");
+            return false;
+        }
         return true;
     }
 
@@ -431,9 +443,15 @@ bool DmlGraphRunner::Build(std::unique_ptr<NNModel> source, std::string* error) 
     m_info.backend = ModelBackend::DirectMLGraph;
     m_inputDesc = source->InputDesc();
 
-    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+    // COMPUTE, to match the queue it submits to -- a list's type has to equal
+    // its queue's. Everything this list records is legal on a compute queue:
+    // DirectML dispatches, CopyBufferRegion, and barriers between COMMON,
+    // COPY_DEST, COPY_SOURCE and UNORDERED_ACCESS. A render-target or
+    // pixel-shader-resource state would NOT be, which is the constraint to
+    // remember if this list ever has to touch a texture the frame uses.
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
                                                 IID_PPV_ARGS(&m_allocator))) ||
-        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
                                            m_allocator.Get(), nullptr,
                                            IID_PPV_ARGS(&m_commandList))) ||
         FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
@@ -441,6 +459,12 @@ bool DmlGraphRunner::Build(std::unique_ptr<NNModel> source, std::string* error) 
         return false;
     }
     m_commandList->Close();
+    // Named so the debug layer's allocator-sync message says which model's it
+    // is; it identifies the object, and an unnamed one reads "Unnamed
+    // ID3D12CommandAllocator Object".
+    const std::wstring wideName(m_info.name.begin(), m_info.name.end());
+    m_allocator->SetName((L"DmlGraphRunner " + wideName).c_str());
+    m_commandList->SetName((L"DmlGraphRunner " + wideName).c_str());
 
     dml::Graph graph(m_dmlDevice);
     auto input = dml::InputTensor(graph, 0, m_inputDesc);
@@ -611,6 +635,83 @@ void ModelManager::Initialize(std::shared_ptr<DX::DeviceResources> deviceResourc
     // command list commands, which is what lets DirectMLGraph models be
     // recorded into the same list as rendering.
     DX::ThrowIfFailed(m_dmlDevice->CreateCommandRecorder(IID_PPV_ARGS(&m_dmlCommandRecorder)));
+
+    // The manager's own queue. COMPUTE rather than DIRECT because that is the
+    // whole point: a compute queue is a separate hardware engine on every
+    // adapter this runs on, so model work and frame work are scheduled
+    // independently instead of taking turns.
+    //
+    // DirectML is happy on either -- its dispatches are compute work -- and the
+    // ONNX Runtime DirectML EP documents DIRECT or COMPUTE, so both backends
+    // move together.
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    DX::ThrowIfFailed(device->CreateCommandQueue(&queueDesc,
+                                                 IID_PPV_ARGS(&m_computeQueue)));
+    m_computeQueue->SetName(L"ModelManager compute");
+    DX::ThrowIfFailed(
+        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_computeFence)));
+    m_computeFence->SetName(L"ModelManager compute fence");
+}
+
+ModelManager::~ModelManager() {
+    // Models hold buffers that submitted command lists still reference, and
+    // nothing else drains this queue. Failing to wait does not fault here; it
+    // surfaces later as a device removal with no obvious cause.
+    WaitForModelWork(nullptr);
+}
+
+bool ModelManager::OrderAfterModelWork(ID3D12CommandQueue* queue, std::string* error) {
+    if (!m_computeQueue || !m_computeFence) {
+        SetError(error, "ModelManager::Initialize has not run");
+        return false;
+    }
+    if (queue == nullptr) {
+        SetError(error, "null queue");
+        return false;
+    }
+    // Signal on the compute queue, wait on theirs. Both are GPU-side, so this
+    // returns straight away and the waiting queue only stalls if it actually
+    // reaches the wait before the model work has finished.
+    ++m_computeFenceValue;
+    if (FAILED(m_computeQueue->Signal(m_computeFence.Get(), m_computeFenceValue))) {
+        SetError(error, "fence signal failed");
+        return false;
+    }
+    if (FAILED(queue->Wait(m_computeFence.Get(), m_computeFenceValue))) {
+        SetError(error, "cross-queue wait failed");
+        return false;
+    }
+    return true;
+}
+
+bool ModelManager::WaitForModelWork(std::string* error) {
+    if (!m_computeQueue || !m_computeFence) {
+        // Not an error worth reporting: nothing was ever submitted.
+        return true;
+    }
+    ++m_computeFenceValue;
+    if (FAILED(m_computeQueue->Signal(m_computeFence.Get(), m_computeFenceValue))) {
+        SetError(error, "fence signal failed");
+        return false;
+    }
+    if (m_computeFence->GetCompletedValue() >= m_computeFenceValue) {
+        return true;
+    }
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (event == nullptr) {
+        SetError(error, "could not create a wait event");
+        return false;
+    }
+    m_computeFence->SetEventOnCompletion(m_computeFenceValue, event);
+    const DWORD waited = WaitForSingleObject(event, 60000);
+    CloseHandle(event);
+    if (waited != WAIT_OBJECT_0) {
+        SetError(error, "timed out waiting for the compute queue");
+        return false;
+    }
+    return true;
 }
 
 bool ModelManager::AddModel(std::unique_ptr<NNModel> source, std::string* error) {
@@ -635,7 +736,7 @@ bool ModelManager::AddModel(std::unique_ptr<NNModel> source, std::string* error)
     // Built into a local and only moved into the registry on success, so a
     // failure part way through cannot leave a half-built model findable.
     auto runner = std::make_unique<DmlGraphRunner>(m_deviceResources->GetD3DDevice(),
-                                                   m_deviceResources->GetCommandQueue(),
+                                                   m_computeQueue.Get(),
                                                    m_dmlDevice.Get(),
                                                    m_dmlCommandRecorder.Get());
     if (!runner->Build(std::move(source), error)) {
@@ -667,8 +768,8 @@ bool ModelManager::AddOnnxModel(const std::string& name,
     }
 
     auto runner = OrtModelRunner::Create(name, path, m_deviceResources->GetD3DDevice(),
-                                         m_deviceResources->GetCommandQueue(),
-                                         m_dmlDevice.Get(), error);
+                                         m_computeQueue.Get(), m_dmlDevice.Get(),
+                                         error);
     if (runner == nullptr) {
         return false;
     }
@@ -684,6 +785,13 @@ bool ModelManager::RecordModelDispatch(ID3D12GraphicsCommandList* commandList,
     }
     // An OnnxRuntime model returns false here: ORT builds its own command
     // lists, so there is nothing to append. Use EnqueueModel for those.
+    //
+    // Note what this does NOT do: it records into the caller's list, so the
+    // work runs on the caller's queue, not the compute queue. That is the
+    // point of it -- it exists so a model can be folded into a render pass,
+    // where being ordered with the frame is the whole requirement and
+    // overlapping it is not wanted. Per-frame dispatch that nothing in the
+    // frame reads belongs in EnqueueModel instead.
     return it->second->RecordInto(commandList);
 }
 

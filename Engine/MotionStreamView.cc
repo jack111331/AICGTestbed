@@ -29,12 +29,10 @@ constexpr DirectX::XMFLOAT4 kTrailColour = {0.35f, 0.35f, 0.40f, 1.0f};
 
 bool MotionStreamView::Load(const std::filesystem::path& directory,
                             ID3D12Device* device,
-                            ID3D12CommandQueue* queue,
                             IDMLDevice* dmlDevice,
                             std::string* error) {
     m_directory = directory;
     m_device = device;
-    m_queue = queue;
     m_dmlDevice = dmlDevice;
 
     // On by default: it is the fastest configuration measured (60 ms against
@@ -246,8 +244,7 @@ bool MotionStreamView::Reload(std::string* error) {
     m_currentFrame = 0;
 
     std::string reason;
-    if (!m_pipeline.Load(m_directory, m_options, &reason, m_device, m_queue,
-                         m_dmlDevice)) {
+    if (!m_pipeline.Load(m_directory, m_options, &reason, m_device, m_dmlDevice)) {
         m_status = reason;
         m_hasStatusError = true;
         if (error != nullptr) {
@@ -438,6 +435,12 @@ void MotionStreamView::ShowPerformanceUi() {
                 ToString(m_pipeline.Device()),
                 ToString(m_pipeline.TextEncoderDevice()),
                 m_pipeline.StaticShapes() ? ", shapes pinned" : "");
+    // Worth stating next to the timings: on the GPU path these milliseconds
+    // are spent on a queue of the pipeline's own, so they are not frame time.
+    if (m_pipeline.ComputeQueue() != nullptr) {
+        ImGui::TextUnformatted("submitting to its own compute queue, not the "
+                               "renderer's");
+    }
     ImGui::Text("denoise %.2f ms, decode %.2f ms, total %.0f ms",
                 m_pipeline.LastDenoiseMs(), m_pipeline.LastDecodeMs(),
                 m_pipeline.GenerationMs());

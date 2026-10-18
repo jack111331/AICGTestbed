@@ -34,13 +34,15 @@ public:
     // legitimately has none; IsLoaded() stays false and the UI says what to
     // run. `error` receives the reason when a staged directory fails to load.
     //
-    // The three device pointers are what let the DirectML provider run on the
-    // renderer's own device and queue. Pass the ones ModelManager already
-    // created, so there is a single IDMLDevice on the adapter. Null pointers
-    // restrict this to FloodDiffusionDevice::Cpu.
+    // The two device pointers are what let the DirectML provider run on the
+    // renderer's own device. Pass the IDMLDevice ModelManager already created,
+    // so there is a single one on the adapter. Null pointers restrict this to
+    // FloodDiffusionDevice::Cpu.
+    //
+    // No command queue: the pipeline creates its own compute queue. Handing it
+    // the renderer's was what put a 61 ms generation on the graphics queue.
     bool Load(const std::filesystem::path& directory,
               ID3D12Device* device,
-              ID3D12CommandQueue* queue,
               IDMLDevice* dmlDevice,
               std::string* error);
 
@@ -134,7 +136,6 @@ private:
     // having to hand the devices over again.
     std::filesystem::path m_directory;
     ID3D12Device* m_device = nullptr;
-    ID3D12CommandQueue* m_queue = nullptr;
     IDMLDevice* m_dmlDevice = nullptr;
 
     // ImGui::InputText needs a fixed buffer.

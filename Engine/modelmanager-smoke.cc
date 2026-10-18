@@ -44,6 +44,37 @@ void Expect(const char* what, bool condition) {
     if (!condition) ++g_failures;
 }
 
+// The debug layer is the only thing that reports a command allocator reset
+// while its last submission is still running: Reset returns S_OK and corrupts
+// the allocator. DeviceResources sets break-on-error in _DEBUG, which turns
+// that into a breakpoint rather than a message, so this test turns the break
+// off and reads the queue itself -- a reported failure beats a crash with no
+// explanation.
+void ExpectNoDebugErrors(const char* what, ID3D12InfoQueue* infoQueue) {
+    if (infoQueue == nullptr) {
+        std::printf("  %-46s (no debug layer)\n", what);
+        return;
+    }
+    std::vector<std::string> errors;
+    const UINT64 count = infoQueue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count; ++i) {
+        SIZE_T length = 0;
+        if (FAILED(infoQueue->GetMessage(i, nullptr, &length))) continue;
+        std::vector<char> storage(length);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(infoQueue->GetMessage(i, message, &length))) continue;
+        if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR ||
+            message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+            errors.emplace_back(message->pDescription, message->DescriptionByteLength);
+        }
+    }
+    infoQueue->ClearStoredMessages();
+    Expect(what, errors.empty());
+    for (const std::string& error : errors) {
+        std::printf("    %s\n", error.c_str());
+    }
+}
+
 void ExpectFloat(const char* what, float got, float expected) {
     constexpr float kEps = 1e-4f;
     const bool ok = std::fabs(got - expected) < kEps;
@@ -425,7 +456,7 @@ int main() {
             list->Close();
 
             // EnqueueModel works for BOTH backends: that is the API a renderer
-            // uses, since the work lands on the shared queue either way.
+            // uses, since the work lands on the compute queue either way.
             error.clear();
             Expect("EnqueueModel works for the ORT model",
                    manager.EnqueueModel("mulrelu.ort", &error));
@@ -483,6 +514,73 @@ int main() {
             std::filesystem::remove(softmaxPath);
         }
         std::filesystem::remove(g_mulReluPath);
+    }
+
+    // ---------------------------------------------------------------------
+    // The compute queue.
+    //
+    // Model work used to go on the renderer's graphics queue, which ordered it
+    // against the frame for free and meant it could never overlap one. These
+    // checks are about the two halves of moving it off: that the queue really
+    // is a separate compute engine, and that repeated submission to it is
+    // sound -- which is where the bug was.
+    // ---------------------------------------------------------------------
+    std::cout << "the compute queue" << std::endl;
+    {
+        Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
+        if (SUCCEEDED(deviceResources->GetD3DDevice()->QueryInterface(
+                IID_PPV_ARGS(&infoQueue)))) {
+            // Report rather than break; see ExpectNoDebugErrors.
+            infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, false);
+            infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, false);
+            infoQueue->ClearStoredMessages();
+        }
+
+        ID3D12CommandQueue* compute = manager.ComputeQueue();
+        Expect("the manager owns a queue", compute != nullptr);
+        if (compute != nullptr) {
+            Expect("it is a COMPUTE queue, not a DIRECT one",
+                   compute->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            Expect("and it is not the renderer's",
+                   compute != deviceResources->GetCommandQueue());
+            Expect("the renderer's is still DIRECT",
+                   deviceResources->GetCommandQueue()->GetDesc().Type ==
+                       D3D12_COMMAND_LIST_TYPE_DIRECT);
+        }
+
+        // What a frame does: submit every frame and never wait. Each submission
+        // reuses the runner's one allocator, which may only be reset once the
+        // previous submission has FINISHED -- so without a fence signalled on
+        // every Enqueue, the second iteration resets an allocator still in
+        // flight. 32 iterations rather than 2 because the first few can win the
+        // race by finishing in time.
+        error.clear();
+        bool everyEnqueue = true;
+        for (int i = 0; i < 32; ++i) {
+            if (!manager.EnqueueModel("conv", &error)) {
+                everyEnqueue = false;
+                break;
+            }
+        }
+        Expect("32 back-to-back enqueues all submit", everyEnqueue);
+        if (!error.empty()) std::printf("    error: %s\n", error.c_str());
+        Expect("the GPU finishes them", manager.WaitForModelWork(&error));
+        if (!error.empty()) std::printf("    error: %s\n", error.c_str());
+        ExpectNoDebugErrors("no debug-layer errors from reusing the allocator",
+                            infoQueue.Get());
+
+        // The ordering that sharing the graphics queue used to provide for
+        // free, now explicit. A GPU-side wait, so it returns immediately.
+        error.clear();
+        Expect("the graphics queue can be ordered after model work",
+               manager.OrderAfterModelWork(deviceResources->GetCommandQueue(), &error));
+        if (!error.empty()) std::printf("    error: %s\n", error.c_str());
+        Expect("ordering a null queue is refused",
+               !manager.OrderAfterModelWork(nullptr, &error));
+        Expect("waiting again is cheap and still succeeds",
+               manager.WaitForModelWork(&error));
+        ExpectNoDebugErrors("no debug-layer errors from the cross-queue wait",
+                            infoQueue.Get());
     }
 
     std::printf("registered models: %zu\n", manager.ModelNames().size());

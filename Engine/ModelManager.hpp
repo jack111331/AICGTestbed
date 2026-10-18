@@ -11,16 +11,28 @@
 #include <string>
 #include <vector>
 
-// Neural models evaluated on the same D3D12 device as the renderer, so their
-// work is ordered against rendering by queue order alone and their buffers can
-// be shared rather than copied across an API boundary.
+// Neural models evaluated on the same D3D12 device as the renderer -- so their
+// buffers can be shared rather than copied across an API boundary -- but on
+// this manager's OWN compute queue rather than the renderer's graphics queue.
+//
+// Sharing the graphics queue bought ordering for free: anything submitted
+// after a model's work was guaranteed to see its output, with no fence
+// anywhere. It cost exactly what that guarantee is worth, which is that model
+// work and frame work could never overlap. A dispatch sat between two frames
+// instead of beside one.
+//
+// An independent queue gives the overlap back and takes the free ordering
+// away. A consumer of a model's output now has to say so, which is what
+// OrderAfterModelWork is for. Nothing in this project reads a model's output
+// on the GPU yet; the day something does, that call is the whole difference
+// between a correct frame and a race that only shows up under load.
 //
 // TODO future plan may need to integrate source from Ollama or HuggingFace
 namespace NeuralModelIntegrateTestbed {
 
 // How a registered model is executed. Both run on this project's own
-// ID3D12Device, IDMLDevice and ID3D12CommandQueue; they differ in who owns the
-// command list and in operator coverage.
+// ID3D12Device and IDMLDevice and submit to the manager's compute queue; they
+// differ in who owns the command list and in operator coverage.
 enum class ModelBackend {
     // The graph is translated into DirectMLX expressions here (Engine/
     // OnnxModel.cc for an .onnx file, or a hand-written NNModel) and compiled
@@ -29,12 +41,15 @@ enum class ModelBackend {
     // operators OnnxModel::SupportedOps() lists.
     DirectMLGraph,
 
-    // ONNX Runtime's DirectML execution provider, given our IDMLDevice and
-    // ID3D12CommandQueue. Full operator coverage without writing translations,
-    // and Run() records and returns rather than waiting -- measured at 0.08 ms
-    // against 1.36 ms of outstanding GPU work in //Engine:ortdml-smoke. It
-    // records onto its OWN command lists and submits them to the shared queue,
-    // so it cannot be recorded into a list we hand it.
+    // ONNX Runtime's DirectML execution provider, given our IDMLDevice and the
+    // manager's compute queue. Full operator coverage without writing
+    // translations, and Run() records and returns rather than waiting --
+    // measured at 0.08 ms against 1.36 ms of outstanding GPU work in
+    // //Engine:ortdml-smoke. It records onto its OWN command lists and submits
+    // them to that queue, so it cannot be recorded into a list we hand it.
+    //
+    // The DirectML EP accepts a DIRECT or a COMPUTE queue, which is what makes
+    // this backend movable at all.
     OnnxRuntime,
 };
 
@@ -118,8 +133,9 @@ public:
     // returns false, because ORT builds and submits its own lists.
     virtual bool RecordInto(ID3D12GraphicsCommandList* commandList) = 0;
 
-    // Submits this model's work on the shared queue. Ordered against anything
-    // else submitted there without a fence, and does not wait for completion.
+    // Submits this model's work on the manager's compute queue. Ordered against
+    // other model work on that queue without a fence, NOT against the
+    // renderer's; does not wait for completion.
     virtual bool Enqueue(std::string* error) = 0;
 
     // Uploads `input`, submits, waits and reads the result back. Synchronous by
@@ -137,6 +153,13 @@ public:
 
 class ModelManager {
 public:
+    // Drains the compute queue before anything it owns is released. Required
+    // rather than tidy: the manager owns the queue now, so nothing else is
+    // going to wait for it, and releasing a resource a submitted command list
+    // still references is a use-after-free the runtime reports as a device
+    // removal several frames later.
+    ~ModelManager();
+
     void Initialize(std::shared_ptr<DX::DeviceResources> deviceResources);
 
     // --- registration -------------------------------------------------------
@@ -166,11 +189,26 @@ public:
     bool RecordModelDispatch(ID3D12GraphicsCommandList* commandList,
                              const std::string& name);
 
-    // Submits `name`'s work on the shared command queue. Works for either
-    // backend. Because it goes on the same queue the renderer uses, the work is
-    // ordered against the renderer's submissions with no fence -- but that also
-    // means a pass that reads the output must be submitted AFTER this.
+    // Submits `name`'s work on the manager's compute queue. Works for either
+    // backend, and is the API a renderer should use: it is the only one that
+    // puts the work somewhere it can overlap the frame.
+    //
+    // Nothing orders this against the renderer. A pass that reads the output
+    // must be preceded by OrderAfterModelWork on the graphics queue.
     bool EnqueueModel(const std::string& name, std::string* error = nullptr);
+
+    // Makes `queue` wait until every model submission made so far has
+    // finished. This is the fence that replaces what sharing the graphics
+    // queue used to provide implicitly, and the call a pass reading a model's
+    // output cannot do without.
+    //
+    // A GPU-side wait: it returns immediately and costs the calling queue
+    // nothing until it reaches the wait.
+    bool OrderAfterModelWork(ID3D12CommandQueue* queue, std::string* error = nullptr);
+
+    // Blocks the CPU until every model submission made so far has finished.
+    // For teardown and for tests; a frame should use OrderAfterModelWork.
+    bool WaitForModelWork(std::string* error = nullptr);
 
     bool RunInference(const std::string& name,
                       const void* input,
@@ -195,10 +233,24 @@ public:
     // second one on the same adapter.
     IDMLDevice* DmlDevice() const { return m_dmlDevice.Get(); }
 
+    // The compute queue every model submits to. Exposed so another consumer of
+    // the same IDMLDevice can be put on it too rather than back on the
+    // renderer's queue, and so a test can assert what type it is.
+    ID3D12CommandQueue* ComputeQueue() const { return m_computeQueue.Get(); }
+
 private:
     std::shared_ptr<DX::DeviceResources> m_deviceResources;
     Microsoft::WRL::ComPtr<IDMLDevice> m_dmlDevice;
     Microsoft::WRL::ComPtr<IDMLCommandRecorder> m_dmlCommandRecorder;
+
+    // The queue, and the one fence every cross-queue wait is expressed
+    // through. One fence for the whole manager rather than one per model: a
+    // wait is always "after everything submitted so far", which is what a
+    // consumer of any model's output actually needs, and a monotonic counter
+    // on one queue gives that for free.
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_computeQueue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> m_computeFence;
+    std::uint64_t m_computeFenceValue = 0;
 
     // Keyed by name, which is what every execution call takes. std::map rather
     // than unordered_map so ModelNames() and the UI list in a stable order.

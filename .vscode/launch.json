@@ -35,7 +35,10 @@
             "stopAtEntry": false,
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
-            "environment": [],
+            "env": {
+                // "PTFLIO_SCENE": "resources/lightmap-uv/bistro-baked.gltf;resources/microphone_and_animated_char/scene_only_animated_char.gltf"
+                "PTFLIO_SCENE": "resources/microphone_and_animated_char/scene_only_animated_char.gltf"
+            },
             "console": "internalConsole"
         }
 

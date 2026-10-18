@@ -8,6 +8,7 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -246,6 +247,17 @@ struct FloodDiffusionPipeline::Impl {
     int staticLatentFrames = 0;
     int staticTime = 0;   // the pinned `time`: latentFrames + chunkSize
 
+    // Declared BEFORE the sessions on purpose: members are destroyed in
+    // reverse declaration order, and the queue an execution provider submits
+    // to has to outlive the sessions that submit to it.
+    //
+    // COMPUTE rather than DIRECT because that is the whole point -- a separate
+    // hardware engine, so a 61 ms generation is scheduled beside the frame
+    // instead of ahead of it. The DirectML EP documents DIRECT or COMPUTE.
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> computeQueue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    std::uint64_t fenceValue = 0;
+
     std::unique_ptr<Ort::Session> denoiser;
     std::unique_ptr<Ort::Session> vaeFirst;
     std::unique_ptr<Ort::Session> vaeStep;
@@ -253,7 +265,6 @@ struct FloodDiffusionPipeline::Impl {
 
     // Kept so the text encoder can be created on demand, long after Load.
     ID3D12Device* d3dDevice = nullptr;
-    ID3D12CommandQueue* queue = nullptr;
     IDMLDevice* dmlDevice = nullptr;
 
     // One entry per distinct prompt, including the empty one used as the
@@ -353,9 +364,13 @@ bool FloodDiffusionPipeline::Impl::MakeOptions(
         return true;
     }
 
-    if (d3dDevice == nullptr || queue == nullptr || dmlDevice == nullptr) {
-        SetOrtError(error, "FloodDiffusionDevice::DirectML needs the D3D12 device, "
-                           "command queue and DirectML device; pass them to Load");
+    if (d3dDevice == nullptr || dmlDevice == nullptr) {
+        SetOrtError(error, "FloodDiffusionDevice::DirectML needs the D3D12 device "
+                           "and the DirectML device; pass them to Load");
+        return false;
+    }
+    if (computeQueue == nullptr) {
+        SetOrtError(error, "the pipeline's compute queue was not created");
         return false;
     }
     const OrtDmlApi* dmlApi = SharedDmlApi(error);
@@ -371,8 +386,12 @@ bool FloodDiffusionPipeline::Impl::MakeOptions(
     // them and they cost nothing.
     out->DisableMemPattern();
     out->SetExecutionMode(ORT_SEQUENTIAL);
+    // The pipeline's own compute queue, not the caller's. Every session shares
+    // it, so their submissions are ordered against each other without a fence
+    // -- which the denoiser and the two VAE decoders rely on, since a decode
+    // reads what a denoise step produced.
     const OrtStatus* status = dmlApi->SessionOptionsAppendExecutionProvider_DML1(
-        *out, dmlDevice, queue);
+        *out, dmlDevice, computeQueue.Get());
     if (status != nullptr) {
         std::string message = Ort::GetApi().GetErrorMessage(status);
         Ort::GetApi().ReleaseStatus(const_cast<OrtStatus*>(status));
@@ -383,15 +402,90 @@ bool FloodDiffusionPipeline::Impl::MakeOptions(
 }
 
 FloodDiffusionPipeline::FloodDiffusionPipeline() : m_impl(std::make_unique<Impl>()) {}
-FloodDiffusionPipeline::~FloodDiffusionPipeline() = default;
+
+FloodDiffusionPipeline::~FloodDiffusionPipeline() {
+    // Explicit rather than defaulted: the sessions have to be released while
+    // the queue they submitted to is still alive AND idle. Member order gets
+    // the first half; this drain is the second. Skipping it does not fault
+    // here -- it surfaces later as a device removal with no obvious cause.
+    WaitForWork(nullptr);
+    m_impl->textEncoder.reset();
+    m_impl->vaeStep.reset();
+    m_impl->vaeFirst.reset();
+    m_impl->denoiser.reset();
+}
+
+ID3D12CommandQueue* FloodDiffusionPipeline::ComputeQueue() const {
+    return m_impl->computeQueue.Get();
+}
+
+bool FloodDiffusionPipeline::OrderAfterWork(ID3D12CommandQueue* queue,
+                                            std::string* error) {
+    Impl& impl = *m_impl;
+    if (impl.computeQueue == nullptr || impl.fence == nullptr) {
+        // The CPU path submits nothing, so there is nothing to order against
+        // and saying so as a failure would make every caller special-case it.
+        return true;
+    }
+    if (queue == nullptr) {
+        SetOrtError(error, "null queue");
+        return false;
+    }
+    ++impl.fenceValue;
+    if (FAILED(impl.computeQueue->Signal(impl.fence.Get(), impl.fenceValue))) {
+        SetOrtError(error, "fence signal failed");
+        return false;
+    }
+    if (FAILED(queue->Wait(impl.fence.Get(), impl.fenceValue))) {
+        SetOrtError(error, "cross-queue wait failed");
+        return false;
+    }
+    return true;
+}
+
+bool FloodDiffusionPipeline::WaitForWork(std::string* error) {
+    Impl& impl = *m_impl;
+    if (impl.computeQueue == nullptr || impl.fence == nullptr) {
+        return true;
+    }
+    ++impl.fenceValue;
+    if (FAILED(impl.computeQueue->Signal(impl.fence.Get(), impl.fenceValue))) {
+        SetOrtError(error, "fence signal failed");
+        return false;
+    }
+    if (impl.fence->GetCompletedValue() >= impl.fenceValue) {
+        return true;
+    }
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (event == nullptr) {
+        SetOrtError(error, "could not create a wait event");
+        return false;
+    }
+    impl.fence->SetEventOnCompletion(impl.fenceValue, event);
+    // Generous: a long generation's last submission can still be running, and
+    // the alternative to waiting is releasing a session underneath it.
+    const DWORD waited = WaitForSingleObject(event, 60000);
+    CloseHandle(event);
+    if (waited != WAIT_OBJECT_0) {
+        SetOrtError(error, "timed out waiting for the compute queue");
+        return false;
+    }
+    return true;
+}
 
 bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
                                   const FloodDiffusionOptions& options,
                                   std::string* error,
                                   ID3D12Device* device,
-                                  ID3D12CommandQueue* queue,
                                   IDMLDevice* dmlDevice) {
     Impl& impl = *m_impl;
+
+    // Before anything is released: a provider change destroys sessions whose
+    // submissions may still be running on the compute queue, and on a queue of
+    // our own nothing else is going to wait for them.
+    if (!WaitForWork(error)) {
+        return false;
+    }
 
     // Load is callable again to change provider, so everything a provider owns
     // has to go first. The text encoder matters most: it is created lazily, so
@@ -416,8 +510,28 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
     impl.directory = directory;
     impl.device = options.device;
     impl.d3dDevice = device;
-    impl.queue = queue;
     impl.dmlDevice = dmlDevice;
+
+    // The pipeline's own queue, created once and kept across provider changes:
+    // a fence value already handed out has to stay meaningful, and recreating
+    // the queue would reset the timeline out from under anyone holding one.
+    if (device != nullptr && impl.computeQueue == nullptr) {
+        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        if (FAILED(device->CreateCommandQueue(&queueDesc,
+                                              IID_PPV_ARGS(&impl.computeQueue)))) {
+            SetOrtError(error, "could not create the pipeline's compute queue");
+            return false;
+        }
+        impl.computeQueue->SetName(L"FloodDiffusion compute");
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                       IID_PPV_ARGS(&impl.fence)))) {
+            SetOrtError(error, "could not create the pipeline's fence");
+            return false;
+        }
+        impl.fence->SetName(L"FloodDiffusion fence");
+    }
 
     if (!impl.config.Load(directory / "pipeline.txt", error)) {
         return false;

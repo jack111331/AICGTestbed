@@ -23,7 +23,7 @@ namespace
     HDEVNOTIFY g_hNewAudio = nullptr;
 };
 
-LPCWSTR g_szAppName = L"DirectXTKSimpleSample12";
+LPCWSTR g_szAppName = L"AICGTestbed";
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
@@ -67,7 +67,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         wcex.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wcex.hbrBackground = (HBRUSH) (COLOR_WINDOW + 1);
         wcex.lpszMenuName = nullptr;
-        wcex.lpszClassName = L"DirectXTKSimpleSample12WindowClass";
+        wcex.lpszClassName = L"AICGTestBedWindowClass";
         wcex.hIconSm = LoadIconW(wcex.hInstance, L"IDI_ICON");
         if (!RegisterClassExW(&wcex))
             return 1;
@@ -80,7 +80,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
         AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
 
-        HWND hwnd = CreateWindowExW(0, L"DirectXTKSimpleSample12WindowClass", g_szAppName, WS_OVERLAPPEDWINDOW,
+        HWND hwnd = CreateWindowExW(0, L"AICGTestBedWindowClass", g_szAppName, WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, hInstance,
             nullptr);
 

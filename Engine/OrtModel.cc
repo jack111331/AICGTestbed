@@ -272,9 +272,12 @@ std::unique_ptr<OrtModelRunner> OrtModelRunner::Create(const std::string& name,
                     e.what());
     }
 
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+    // COMPUTE, matching the queue ModelManager hands in: a command list's type
+    // has to equal its queue's, and this list only ever does CopyBufferRegion,
+    // which a compute queue supports.
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
                                               IID_PPV_ARGS(&impl.allocator))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
                                          impl.allocator.Get(), nullptr,
                                          IID_PPV_ARGS(&impl.commandList))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&impl.fence)))) {
@@ -302,8 +305,9 @@ bool OrtModelRunner::Enqueue(std::string* error) {
     const char* outputNames[] = {impl.outputName.c_str()};
     try {
         // Records and returns. The work is submitted on the queue the EP was
-        // given, so it is ordered against the renderer's submissions without a
-        // fence -- but a pass that reads the output must be submitted after.
+        // given -- ModelManager's compute queue -- so it is ordered against
+        // other model work but NOT against the renderer. A pass reading the
+        // output needs ModelManager::OrderAfterModelWork first.
         impl.session->Run(Ort::RunOptions{nullptr}, inputNames, impl.inputValue.get(), 1,
                           outputNames, impl.outputValue.get(), 1);
     } catch (const Ort::Exception& e) {
