@@ -132,6 +132,20 @@ private:
     // correctly and nothing whatsoever is on screen.
     void FrameSceneWithCamera();
 
+    // The scene's bounds, radius and the drag speeds derived from them, without
+    // touching the camera. Split out because a manifest that pins the camera
+    // still needs all of it: the radius sets the shadow cascade distance and
+    // the lightmap's extent, neither of which is about where the view is.
+    //
+    // Returns false for a scene nothing can be measured from, which is a scene
+    // with no drawable geometry.
+    bool MeasureScene();
+
+    // The camera a scene manifest pinned, used instead of framing the scene.
+    // Measures the scene first, then overrides the eye, the target and whichever
+    // of the three projection values the manifest named.
+    void ApplySceneCamera(const NeuralModelIntegrateTestbed::SceneCamera &camera);
+
     // The camera and projection panel: eye, target, field of view, clip planes
     // and navigation speed. Lives here rather than on Camera because half of
     // what it edits -- the field of view and the clip planes -- belongs to the

@@ -132,3 +132,12 @@ desktop.ini
 
 # Python codes
 *.pyc
+# ---------------------------------------------------------------------------
+# Scene manifests
+# ---------------------------------------------------------------------------
+
+# The manifest the application loads when nothing names a scene, and what the
+# Scene tab's save button writes. It points at whatever is staged on this
+# machine -- often a scene outside the repository -- so it is local by nature.
+# scenes.example.json IS tracked, as the thing to copy.
+/scenes.json

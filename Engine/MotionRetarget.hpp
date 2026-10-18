@@ -239,9 +239,10 @@ private:
     void ResolveRestPose(const SceneGraph& graph);
 
     // World transform of a node's parent chain, from the AUTHORED local
-    // transforms plus `scenePlacement`. Authored rather than current, because
-    // the chain above a joint hierarchy is not what a retarget drives, and
-    // reading worldTransform would depend on a previous UpdateTransforms.
+    // transforms plus the node's own asset placement and `scenePlacement`.
+    // Authored rather than current, because the chain above a joint hierarchy
+    // is not what a retarget drives, and reading worldTransform would depend on
+    // a previous UpdateTransforms.
     static DirectX::SimpleMath::Matrix AuthoredParentWorld(
         const SceneGraph& graph, std::size_t nodeIndex,
         const DirectX::SimpleMath::Matrix& scenePlacement);

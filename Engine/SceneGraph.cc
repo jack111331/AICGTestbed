@@ -503,11 +503,24 @@ ImageColorSpaceClassification ClassifyImageColorSpaces(const fastgltf::Asset& as
     return result;
 }
 
-void SceneGraph::Build(const fastgltf::Asset& asset,
-                       std::size_t sceneIndex,
-                       const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& buffers,
-                       std::size_t imageDescriptorCount) {
+DirectX::SimpleMath::Matrix PlacementMatrix(const SceneTransform& transform) {
+    // CreateFromYawPitchRoll takes (Y, X, Z) in radians and applies roll about
+    // Z, then pitch about X, then yaw about Y -- the order DirectXMath fixes,
+    // and the one the sliders are labelled for.
+    return DirectX::SimpleMath::Matrix::CreateScale(transform.scale) *
+           DirectX::SimpleMath::Matrix::CreateFromYawPitchRoll(
+               DirectX::XMConvertToRadians(transform.rotation[1]),
+               DirectX::XMConvertToRadians(transform.rotation[0]),
+               DirectX::XMConvertToRadians(transform.rotation[2])) *
+           DirectX::SimpleMath::Matrix::CreateTranslation(
+               transform.translation[0], transform.translation[1],
+               transform.translation[2]);
+}
+
+void SceneGraph::Clear() {
     m_nodes.clear();
+    m_assetPlacements.clear();
+    m_assetVisible.clear();
     m_lights.clear();
     m_skins.clear();
     m_animations.clear();
@@ -518,30 +531,75 @@ void SceneGraph::Build(const fastgltf::Asset& asset,
     m_jointWeightFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
     m_roots.clear();
     m_drawOrder.clear();
+    m_staticDrawOrder.clear();
+    m_movingDrawOrder.clear();
+    m_staticGeometryNodes = 0;
+    m_movingGeometryNodes = 0;
     m_selected.reset();
     m_sceneName.clear();
+}
+
+void SceneGraph::Build(const fastgltf::Asset& asset,
+                       std::size_t sceneIndex,
+                       const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& buffers,
+                       std::size_t imageDescriptorCount) {
+    Clear();
+    Append(asset, sceneIndex, buffers, 0, imageDescriptorCount, 0);
+}
+
+std::size_t SceneGraph::Append(
+    const fastgltf::Asset& asset,
+    std::size_t sceneIndex,
+    const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& buffers,
+    std::size_t imageDescriptorBase,
+    std::size_t imageDescriptorCount,
+    std::size_t assetIndex) {
+    // Where this asset's indices land in the merged arrays. Everything the
+    // asset refers to by index -- children, parents, joints, animation targets
+    // -- is shifted by one of these on the way in, so the asset's own numbering
+    // never escapes this function.
+    const std::size_t nodeBase = m_nodes.size();
+    const std::size_t skinBase = m_skins.size();
+    const std::size_t animationBase = m_animations.size();
+
+    // Placements are addressed by assetIndex rather than by append order, so a
+    // caller that numbers its assets itself still gets the right slot.
+    if (assetIndex >= m_assetPlacements.size()) {
+        m_assetPlacements.resize(assetIndex + 1,
+                                 DirectX::SimpleMath::Matrix::Identity);
+    }
+    if (assetIndex >= m_assetVisible.size()) {
+        m_assetVisible.resize(assetIndex + 1, 1);
+    }
 
     // glTF allows an asset with no scenes at all. The previous renderer walked
     // Asset::nodes flat, so falling back to "every parentless node is a root"
     // keeps such an asset visible instead of silently drawing nothing.
     const bool hasScene = !asset.scenes.empty() && sceneIndex < asset.scenes.size();
+    std::string sceneName;
     if (hasScene) {
         const fastgltf::Scene& scene = asset.scenes[sceneIndex];
-        m_sceneName = scene.name.empty() ? std::string("(unnamed scene)")
-                                         : std::string(scene.name);
+        sceneName = scene.name.empty() ? std::string("(unnamed scene)")
+                                       : std::string(scene.name);
     } else {
-        m_sceneName = "(no scene; all parentless nodes treated as roots)";
+        sceneName = "(no scene; all parentless nodes treated as roots)";
     }
+    // One name per appended asset, so the hierarchy UI says which files are
+    // loaded rather than only the first one's scene.
+    m_sceneName = m_sceneName.empty() ? sceneName : (m_sceneName + " + " + sceneName);
 
-    // Kept parallel to asset.nodes so child indices need no remapping. glTF
-    // requires nodes to form a disjoint set of strict trees, so a node has at
-    // most one parent and this stays unambiguous.
-    m_nodes.resize(asset.nodes.size());
+    // This asset's nodes occupy one contiguous run starting at nodeBase, so an
+    // asset-local child index only needs that offset added. glTF requires nodes
+    // to form a disjoint set of strict trees, so a node has at most one parent
+    // and this stays unambiguous.
+    m_nodes.resize(nodeBase + asset.nodes.size());
     for (std::size_t i = 0; i < asset.nodes.size(); ++i) {
         const fastgltf::Node& src = asset.nodes[i];
-        SceneNode& dst = m_nodes[i];
+        SceneNode& dst = m_nodes[nodeBase + i];
 
-        dst.gltfNodeIndex = i;
+        dst.gltfNodeIndex = nodeBase + i;
+        dst.assetIndex = assetIndex;
+        dst.assetNodeIndex = i;
         dst.name = src.name.empty() ? ("node " + std::to_string(i))
                                     : std::string(src.name);
         dst.localTransform = ToSimpleMath(fastgltf::getLocalTransformMatrix(src));
@@ -559,12 +617,19 @@ void SceneGraph::Build(const fastgltf::Asset& asset,
             dst.baseTransform.scale = DirectX::SimpleMath::Vector3(
                 trs->scale[0], trs->scale[1], trs->scale[2]);
         }
-        dst.children.assign(src.children.begin(), src.children.end());
+        dst.children.clear();
+        dst.children.reserve(src.children.size());
+        for (const std::size_t child : src.children) {
+            if (child < asset.nodes.size()) {
+                dst.children.push_back(nodeBase + child);
+            }
+        }
 
         if (src.meshIndex.has_value() && src.meshIndex.value() < asset.meshes.size()) {
             dst.meshIndex = src.meshIndex.value();
             BuildPrimitives(asset, asset.meshes[dst.meshIndex.value()], buffers,
-                            imageDescriptorCount, dst.primitives);
+                            imageDescriptorBase, imageDescriptorCount,
+                            dst.primitives);
         }
 
         // Asset::lights is only populated when KHR_lights_punctual was enabled
@@ -576,7 +641,7 @@ void SceneGraph::Build(const fastgltf::Asset& asset,
 
             SceneLight light;
             light.gltfLightIndex = src.lightIndex.value();
-            light.gltfNodeIndex = i;
+            light.gltfNodeIndex = nodeBase + i;
             light.name = srcLight.name.empty()
                              ? ("light " + std::to_string(src.lightIndex.value()))
                              : std::string(srcLight.name);
@@ -606,11 +671,13 @@ void SceneGraph::Build(const fastgltf::Asset& asset,
 
     // Both need the nodes to exist: skins range-check joint indices against
     // them, animations range-check channel targets.
-    BuildSkins(asset);
-    BuildAnimations(asset);
+    BuildSkins(asset, nodeBase, skinBase);
+    BuildAnimations(asset, nodeBase, animationBase);
 
-    // Parent links, so the UI and any future picking can walk upwards.
-    for (std::size_t i = 0; i < m_nodes.size(); ++i) {
+    // Parent links, so the UI and any future picking can walk upwards. Only
+    // this asset's run: the nodes before nodeBase were linked by their own
+    // Append and nothing here can be a child of them.
+    for (std::size_t i = nodeBase; i < m_nodes.size(); ++i) {
         for (std::size_t child : m_nodes[i].children) {
             if (child < m_nodes.size()) {
                 m_nodes[child].parent = i;
@@ -620,12 +687,12 @@ void SceneGraph::Build(const fastgltf::Asset& asset,
 
     if (hasScene) {
         for (std::size_t root : asset.scenes[sceneIndex].nodeIndices) {
-            if (root < m_nodes.size()) {
-                m_roots.push_back(root);
+            if (root < asset.nodes.size()) {
+                m_roots.push_back(nodeBase + root);
             }
         }
     } else {
-        for (std::size_t i = 0; i < m_nodes.size(); ++i) {
+        for (std::size_t i = nodeBase; i < m_nodes.size(); ++i) {
             if (!m_nodes[i].parent.has_value()) {
                 m_roots.push_back(i);
             }
@@ -633,7 +700,51 @@ void SceneGraph::Build(const fastgltf::Asset& asset,
     }
 
     // Last, because it needs the animations, the skins and the parent links.
+    // Run over the whole graph rather than this asset's run: it recounts the
+    // static and moving totals from scratch, which has to include what was
+    // already there.
     MarkMovingNodes();
+    return nodeBase;
+}
+
+void SceneGraph::SetAssetPlacement(std::size_t assetIndex,
+                                   const DirectX::SimpleMath::Matrix& placement) {
+    if (assetIndex >= m_assetPlacements.size()) {
+        m_assetPlacements.resize(assetIndex + 1,
+                                 DirectX::SimpleMath::Matrix::Identity);
+    }
+    m_assetPlacements[assetIndex] = placement;
+}
+
+const DirectX::SimpleMath::Matrix& SceneGraph::AssetPlacement(
+    std::size_t assetIndex) const {
+    static const DirectX::SimpleMath::Matrix kIdentity =
+        DirectX::SimpleMath::Matrix::Identity;
+    return assetIndex < m_assetPlacements.size() ? m_assetPlacements[assetIndex]
+                                                 : kIdentity;
+}
+
+void SceneGraph::SetAssetVisible(std::size_t assetIndex, bool visible) {
+    if (assetIndex >= m_assetVisible.size()) {
+        m_assetVisible.resize(assetIndex + 1, 1);
+    }
+    m_assetVisible[assetIndex] = visible ? 1 : 0;
+}
+
+bool SceneGraph::AssetVisible(std::size_t assetIndex) const {
+    // An asset nothing has said anything about is shown, which is what makes a
+    // graph built before this existed behave as it did.
+    return assetIndex >= m_assetVisible.size() || m_assetVisible[assetIndex] != 0;
+}
+
+const DirectX::SimpleMath::Matrix& SceneGraph::PlacementForNode(
+    std::size_t nodeIndex) const {
+    static const DirectX::SimpleMath::Matrix kIdentity =
+        DirectX::SimpleMath::Matrix::Identity;
+    if (nodeIndex >= m_nodes.size()) {
+        return kIdentity;
+    }
+    return AssetPlacement(m_nodes[nodeIndex].assetIndex);
 }
 
 void SceneGraph::MarkMovingNodes() {
@@ -705,8 +816,16 @@ namespace {
 // Resolves a glTF texture reference down to an index into the renderer's
 // per-image SRV descriptor array, or nothing when the reference is missing,
 // out of range, or points at a texture with no image source.
+//
+// The asset's own image index is bounded by `imageDescriptorCount`, which is
+// how many images THIS asset has, and then offset by `imageDescriptorBase`,
+// where they start in the renderer's array. With several assets loaded the
+// range check has to come before the offset: adding first would let an asset's
+// malformed index reach into another asset's descriptors, which is a plausible
+// wrong texture rather than a detectable one.
 std::optional<std::size_t> ResolveTextureImage(const fastgltf::Asset& asset,
                                                std::size_t textureIndex,
+                                               std::size_t imageDescriptorBase,
                                                std::size_t imageDescriptorCount) {
     if (textureIndex >= asset.textures.size()) {
         return std::nullopt;
@@ -716,7 +835,7 @@ std::optional<std::size_t> ResolveTextureImage(const fastgltf::Asset& asset,
     if (!source.has_value() || source.value() >= imageDescriptorCount) {
         return std::nullopt;
     }
-    return source;
+    return imageDescriptorBase + source.value();
 }
 
 // Reads a primitive's local AABB out of its POSITION accessor. glTF makes
@@ -856,6 +975,7 @@ int AlphaModeToInt(fastgltf::AlphaMode mode) {
 
 void SceneGraph::ResolveMaterial(const fastgltf::Asset& asset,
                                  const fastgltf::Material& material,
+                                 std::size_t imageDescriptorBase,
                                  std::size_t imageDescriptorCount,
                                  PrimitiveResource& res) const {
     MaterialConstants& c = res.material;
@@ -934,7 +1054,9 @@ void SceneGraph::ResolveMaterial(const fastgltf::Asset& asset,
                             std::size_t texCoordIndex,
                             int& hasFlag,
                             int& texCoordOut) {
-        const auto image = ResolveTextureImage(asset, textureIndex, imageDescriptorCount);
+        const auto image = ResolveTextureImage(asset, textureIndex,
+                                               imageDescriptorBase,
+                                               imageDescriptorCount);
         res.textureImageIndex[static_cast<std::size_t>(slot)] = image;
         hasFlag = image.has_value() ? 1 : 0;
         texCoordOut = static_cast<int>(texCoordIndex);
@@ -998,6 +1120,7 @@ void SceneGraph::BuildPrimitives(
     const fastgltf::Asset& asset,
     const fastgltf::Mesh& mesh,
     const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& buffers,
+    std::size_t imageDescriptorBase,
     std::size_t imageDescriptorCount,
     std::vector<PrimitiveResource>& out) {
     out.clear();
@@ -1088,7 +1211,7 @@ void SceneGraph::BuildPrimitives(
         if (primitive.materialIndex.has_value() &&
             primitive.materialIndex.value() < asset.materials.size()) {
             ResolveMaterial(asset, asset.materials[primitive.materialIndex.value()],
-                            imageDescriptorCount, res);
+                            imageDescriptorBase, imageDescriptorCount, res);
         }
         // Primitives with no material keep MaterialConstants' defaults, which
         // are glTF's own defaults for a missing material.
@@ -1125,12 +1248,14 @@ AnimationInterpolation ToInterpolation(fastgltf::AnimationInterpolation interpol
 
 }  // namespace
 
-void SceneGraph::BuildAnimations(const fastgltf::Asset& asset) {
-    m_animations.resize(asset.animations.size());
+void SceneGraph::BuildAnimations(const fastgltf::Asset& asset,
+                                std::size_t nodeBase,
+                                std::size_t animationBase) {
+    m_animations.resize(animationBase + asset.animations.size());
 
     for (std::size_t a = 0; a < asset.animations.size(); ++a) {
         const fastgltf::Animation& src = asset.animations[a];
-        SceneAnimation& dst = m_animations[a];
+        SceneAnimation& dst = m_animations[animationBase + a];
 
         dst.name = src.name.empty() ? ("animation " + std::to_string(a))
                                     : std::string(src.name);
@@ -1192,7 +1317,7 @@ void SceneGraph::BuildAnimations(const fastgltf::Asset& asset) {
         for (const fastgltf::AnimationChannel& srcChannel : src.channels) {
             AnimationPath path;
             if (!srcChannel.nodeIndex.has_value() ||
-                srcChannel.nodeIndex.value() >= m_nodes.size() ||
+                srcChannel.nodeIndex.value() >= asset.nodes.size() ||
                 srcChannel.samplerIndex >= dst.samplers.size() ||
                 !ToAnimationPath(srcChannel.path, path) ||
                 path == AnimationPath::Weights) {
@@ -1203,7 +1328,7 @@ void SceneGraph::BuildAnimations(const fastgltf::Asset& asset) {
                 continue;
             }
             AnimationChannel channel;
-            channel.nodeIndex = srcChannel.nodeIndex.value();
+            channel.nodeIndex = nodeBase + srcChannel.nodeIndex.value();
             channel.path = path;
             channel.samplerIndex = srcChannel.samplerIndex;
             dst.channels.push_back(channel);
@@ -1254,10 +1379,18 @@ void SceneGraph::ResetToBasePose() {
 }
 
 bool SceneGraph::ApplyAnimation(std::size_t animationIndex, float time) {
-    if (animationIndex >= m_animations.size()) {
-        return false;
+    return ApplyAnimations({ActiveAnimation{animationIndex, time}});
+}
+
+bool SceneGraph::ApplyAnimations(const std::vector<ActiveAnimation>& active) {
+    // Checked up front, so a bad index leaves the pose alone rather than
+    // half-applied: a character posed by some of its channels is a shape no
+    // frame ever described.
+    for (const ActiveAnimation& clip : active) {
+        if (clip.animationIndex >= m_animations.size()) {
+            return false;
+        }
     }
-    const SceneAnimation& animation = m_animations[animationIndex];
 
     // Start from the authored pose every time. A channel overrides one
     // component, so without this reset the untouched components would keep
@@ -1271,26 +1404,32 @@ bool SceneGraph::ApplyAnimation(std::size_t animationIndex, float time) {
     }
     std::vector<NodeTransform>& pose = m_poseScratch;
 
-    for (const AnimationChannel& channel : animation.channels) {
-        const AnimationSampler& sampler = animation.samplers[channel.samplerIndex];
-        DirectX::XMFLOAT4 value;
-        if (!SampleAnimation(sampler, time, value)) {
-            continue;
-        }
-        NodeTransform& target = pose[channel.nodeIndex];
-        switch (channel.path) {
-            case AnimationPath::Translation:
-                target.translation = DirectX::SimpleMath::Vector3(value.x, value.y, value.z);
-                break;
-            case AnimationPath::Rotation:
-                target.rotation =
-                    DirectX::SimpleMath::Quaternion(value.x, value.y, value.z, value.w);
-                break;
-            case AnimationPath::Scale:
-                target.scale = DirectX::SimpleMath::Vector3(value.x, value.y, value.z);
-                break;
-            case AnimationPath::Weights:
-                break;  // filtered out at load
+    // Once over the authored pose, whatever the clip count: each clip writes
+    // the components its own channels target and leaves the rest. Two assets'
+    // clips never touch the same node, so they do not interact.
+    for (const ActiveAnimation& clip : active) {
+        const SceneAnimation& animation = m_animations[clip.animationIndex];
+        for (const AnimationChannel& channel : animation.channels) {
+            const AnimationSampler& sampler = animation.samplers[channel.samplerIndex];
+            DirectX::XMFLOAT4 value;
+            if (!SampleAnimation(sampler, clip.time, value)) {
+                continue;
+            }
+            NodeTransform& target = pose[channel.nodeIndex];
+            switch (channel.path) {
+                case AnimationPath::Translation:
+                    target.translation = DirectX::SimpleMath::Vector3(value.x, value.y, value.z);
+                    break;
+                case AnimationPath::Rotation:
+                    target.rotation =
+                        DirectX::SimpleMath::Quaternion(value.x, value.y, value.z, value.w);
+                    break;
+                case AnimationPath::Scale:
+                    target.scale = DirectX::SimpleMath::Vector3(value.x, value.y, value.z);
+                    break;
+                case AnimationPath::Weights:
+                    break;  // filtered out at load
+            }
         }
     }
 
@@ -1304,33 +1443,40 @@ bool SceneGraph::ApplyAnimation(std::size_t animationIndex, float time) {
     return true;
 }
 
-void SceneGraph::BuildSkins(const fastgltf::Asset& asset) {
-    // Parallel to Asset::skins, so Node::skinIndex carries over unchanged.
-    m_skins.resize(asset.skins.size());
+void SceneGraph::BuildSkins(const fastgltf::Asset& asset,
+                            std::size_t nodeBase,
+                            std::size_t skinBase) {
+    // One run per asset, so Node::skinIndex only needs skinBase added.
+    m_skins.resize(skinBase + asset.skins.size());
 
     for (std::size_t s = 0; s < asset.skins.size(); ++s) {
         const fastgltf::Skin& src = asset.skins[s];
-        SceneSkin& dst = m_skins[s];
+        SceneSkin& dst = m_skins[skinBase + s];
 
         dst.gltfSkinIndex = s;
         dst.name = src.name.empty() ? ("skin " + std::to_string(s))
                                     : std::string(src.name);
 
-        if (src.skeleton.has_value() && src.skeleton.value() < m_nodes.size()) {
-            dst.skeletonRoot = src.skeleton.value();
+        if (src.skeleton.has_value() && src.skeleton.value() < asset.nodes.size()) {
+            dst.skeletonRoot = nodeBase + src.skeleton.value();
         }
 
         // Joint order is what JOINTS_n indexes, so an out-of-range entry cannot
         // simply be skipped without shifting every joint after it. Keep the slot
-        // and point it at node 0, whose transform is at least valid; the
-        // diagnostic says which skin is affected.
+        // and point it at this asset's node 0, whose transform is at least
+        // valid; the diagnostic says which skin is affected. Note the range
+        // check is against the ASSET's node count, not the graph's: with
+        // another asset already appended the graph is larger, and an index past
+        // this asset's own nodes would otherwise silently name a joint in the
+        // other file.
         dst.joints.reserve(src.joints.size());
         for (const std::size_t joint : src.joints) {
-            if (joint < m_nodes.size()) {
-                dst.joints.push_back(joint);
+            if (joint < asset.nodes.size()) {
+                dst.joints.push_back(nodeBase + joint);
             } else {
-                m_skinDiagnostics.push_back({SkinIssue::JointIndexOutOfRange, s, joint});
-                dst.joints.push_back(0);
+                m_skinDiagnostics.push_back(
+                    {SkinIssue::JointIndexOutOfRange, skinBase + s, joint});
+                dst.joints.push_back(nodeBase);
             }
         }
 
@@ -1339,7 +1485,8 @@ void SceneGraph::BuildSkins(const fastgltf::Asset& asset) {
         }
 
         if (dst.joints.size() > kMaxJointMatrices) {
-            m_skinDiagnostics.push_back({SkinIssue::TooManyJoints, s, std::nullopt});
+            m_skinDiagnostics.push_back(
+                {SkinIssue::TooManyJoints, skinBase + s, std::nullopt});
         }
 
         dst.inverseBindMatrices.assign(dst.joints.size(),
@@ -1348,14 +1495,16 @@ void SceneGraph::BuildSkins(const fastgltf::Asset& asset) {
         if (!src.inverseBindMatrices.has_value()) {
             // Legal: glTF says to treat them as identity, which means the mesh
             // is already in each joint's space.
-            m_skinDiagnostics.push_back({SkinIssue::NoInverseBindMatrices, s, std::nullopt});
+            m_skinDiagnostics.push_back(
+                {SkinIssue::NoInverseBindMatrices, skinBase + s, std::nullopt});
             continue;
         }
 
         const std::size_t accessorIndex = src.inverseBindMatrices.value();
         if (!AccessorBytesAvailable(asset, accessorIndex)) {
             m_skinDiagnostics.push_back(
-                {SkinIssue::InverseBindMatricesUnreadable, s, std::nullopt});
+                {SkinIssue::InverseBindMatricesUnreadable, skinBase + s,
+                 std::nullopt});
             continue;
         }
 
@@ -1363,7 +1512,8 @@ void SceneGraph::BuildSkins(const fastgltf::Asset& asset) {
         if (accessor.type != fastgltf::AccessorType::Mat4 ||
             accessor.count != dst.joints.size()) {
             m_skinDiagnostics.push_back(
-                {SkinIssue::InverseBindMatrixCountMismatch, s, std::nullopt});
+                {SkinIssue::InverseBindMatrixCountMismatch, skinBase + s,
+                 std::nullopt});
             continue;
         }
 
@@ -1383,22 +1533,25 @@ void SceneGraph::BuildSkins(const fastgltf::Asset& asset) {
     }
 
     // Link the nodes, and check each skinned mesh has the attributes to use it.
-    for (std::size_t i = 0; i < asset.nodes.size() && i < m_nodes.size(); ++i) {
+    for (std::size_t i = 0; i < asset.nodes.size() && nodeBase + i < m_nodes.size();
+         ++i) {
         const fastgltf::Node& src = asset.nodes[i];
         if (!src.skinIndex.has_value()) {
             continue;
         }
-        const std::size_t skinIndex = src.skinIndex.value();
-        if (skinIndex >= m_skins.size()) {
+        if (src.skinIndex.value() >= asset.skins.size()) {
             continue;
         }
-        m_nodes[i].skinIndex = skinIndex;
+        const std::size_t skinIndex = skinBase + src.skinIndex.value();
+        const std::size_t nodeIndex = nodeBase + i;
+        m_nodes[nodeIndex].skinIndex = skinIndex;
 
         if (!src.meshIndex.has_value()) {
-            m_skinDiagnostics.push_back({SkinIssue::SkinnedNodeWithoutMesh, skinIndex, i});
+            m_skinDiagnostics.push_back(
+                {SkinIssue::SkinnedNodeWithoutMesh, skinIndex, nodeIndex});
             continue;
         }
-        CheckSkinningAttributes(asset, src.meshIndex.value(), skinIndex, i,
+        CheckSkinningAttributes(asset, src.meshIndex.value(), skinIndex, nodeIndex,
                                 m_skinDiagnostics);
 
         // Both halves are known only here: the node supplies the skin, the
@@ -1406,7 +1559,7 @@ void SceneGraph::BuildSkins(const fastgltf::Asset& asset) {
         // left unskinned so it renders in its bind pose -- with zero weights it
         // would otherwise collapse onto the origin, which reads as a transform
         // bug rather than a missing attribute.
-        for (PrimitiveResource& primitive : m_nodes[i].primitives) {
+        for (PrimitiveResource& primitive : m_nodes[nodeIndex].primitives) {
             primitive.material.isSkinned = primitive.CanSkin() ? 1 : 0;
         }
     }
@@ -1458,7 +1611,17 @@ void SceneGraph::UpdateTransforms(const DirectX::SimpleMath::Matrix& rootTransfo
         light.active = false;
     }
     for (std::size_t root : m_roots) {
-        VisitForTransform(root, rootTransform, true);
+        // Each asset's own placement sits between its nodes and the scene's
+        // root transform: row-vector order, so the inner transform is on the
+        // left. An asset nothing has placed has an identity here and composes
+        // to exactly what a single-asset graph did.
+        // The asset's visibility enters as the root's parent visibility, so a
+        // file switched off is skipped by exactly the mechanism a hidden node
+        // is -- there is no second rule for a pass to forget.
+        const std::size_t asset =
+            root < m_nodes.size() ? m_nodes[root].assetIndex : 0;
+        VisitForTransform(root, PlacementForNode(root) * rootTransform,
+                          AssetVisible(asset));
     }
 }
 
@@ -1616,6 +1779,12 @@ void SceneGraph::DrawHierarchyUI() {
 
     ImGui::Text("Scene: %s", m_sceneName.c_str());
     ImGui::Text("%zu nodes, %zu drawn", m_nodes.size(), m_drawOrder.size());
+    if (m_assetPlacements.size() > 1) {
+        // Worth saying: every count on this panel is the total over all the
+        // files, and the roots below are one group per file.
+        ImGui::Text("%zu glTF file(s) merged into this graph",
+                    m_assetPlacements.size());
+    }
 
     // Lights are easy to get silently wrong -- an asset exported without the
     // extension, or a light parented outside the scene, both just read as
@@ -1637,8 +1806,13 @@ void SceneGraph::DrawHierarchyUI() {
                                "%zu light(s) beyond the %zu PBR_Constants holds",
                                dropped, kMaxShaderLights);
         }
-        for (const SceneLight& light : m_lights) {
+        for (std::size_t l = 0; l < m_lights.size(); ++l) {
+            const SceneLight& light = m_lights[l];
+            // Keyed on the index, not the name: two merged files routinely
+            // repeat a name, and ImGui would then treat both as one tree node.
+            ImGui::PushID(static_cast<int>(l));
             if (!ImGui::TreeNode(light.name.c_str())) {
+                ImGui::PopID();
                 continue;
             }
             ImGui::Text("Type: %s%s", ToString(light.type),
@@ -1667,6 +1841,7 @@ void SceneGraph::DrawHierarchyUI() {
             }
             ImGui::Text("Node: %s", m_nodes[light.gltfNodeIndex].name.c_str());
             ImGui::TreePop();
+            ImGui::PopID();
         }
     }
     // Skins, and anything suspect about them. A rig that silently fell back to
@@ -1674,11 +1849,15 @@ void SceneGraph::DrawHierarchyUI() {
     // diagnostics are worth having in front of you rather than in a log.
     if (!m_skins.empty()) {
         ImGui::Text("%zu skin(s)", m_skins.size());
-        for (const SceneSkin& skin : m_skins) {
+        for (std::size_t sk = 0; sk < m_skins.size(); ++sk) {
+            const SceneSkin& skin = m_skins[sk];
             char label[256];
             std::snprintf(label, sizeof(label), "%s  [%zu joints]", skin.name.c_str(),
                           skin.JointCount());
+            // Index-keyed for the same reason as the lights above.
+            ImGui::PushID(static_cast<int>(sk));
             if (!ImGui::TreeNode(label)) {
+                ImGui::PopID();
                 continue;
             }
             ImGui::Text("Inverse bind matrices: %s",
@@ -1698,6 +1877,7 @@ void SceneGraph::DrawHierarchyUI() {
                 ImGui::TreePop();
             }
             ImGui::TreePop();
+            ImGui::PopID();
         }
     }
     if (!m_skinDiagnostics.empty()) {

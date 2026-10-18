@@ -1688,6 +1688,355 @@ void TestLightmapPacking() {
     Expect("...while the others do", mixed.charts[1].placed && mixed.charts[3].placed);
 }
 
+// Several glTF files merged into one graph, which is how a skinned character in
+// its own file ends up standing in a set authored in another.
+//
+// Everything here is about the index offsets. An asset's node, skin, animation
+// and image indices are all asset-local, and a missed offset does not fail --
+// it silently names something in the OTHER file, which renders as the wrong
+// mesh in the wrong place with the wrong texture. So each one is asserted
+// numerically.
+void TestMultipleAssets() {
+    using DirectX::SimpleMath::Matrix;
+    std::cout << "multiple assets merged into one graph" << std::endl;
+
+    auto skinAsset = Parse(kSkinGltf);
+    auto animAsset = Parse(kAnimGltf);
+    if (skinAsset.error() != fastgltf::Error::None ||
+        animAsset.error() != fastgltf::Error::None) {
+        std::cerr << "merge assets failed to parse" << std::endl;
+        ++g_failures;
+        return;
+    }
+
+    const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> noBuffers;
+    SceneGraph graph;
+    graph.Clear();
+
+    // Asset 0: four nodes, one skin whose joints are its nodes 1 and 2.
+    const std::size_t firstBase =
+        graph.Append(skinAsset.get(), 0, noBuffers, 0, 0, 0);
+    Expect("the first asset starts at node 0", firstBase == 0);
+    Expect("the first asset's nodes are all there", graph.NodeCount() == 4);
+
+    // Asset 1: four more nodes and two animations.
+    const std::size_t secondBase =
+        graph.Append(animAsset.get(), animAsset->defaultScene.value_or(0),
+                     noBuffers, 0, 0, 1);
+    ExpectEqualU("the second asset starts after the first",
+                 static_cast<std::uint32_t>(secondBase), 4);
+    ExpectEqualU("both assets' nodes are in the graph",
+                 static_cast<std::uint32_t>(graph.NodeCount()), 8);
+
+    // Asset 2: the first asset again, which is the case most likely to expose a
+    // missed offset -- every index it carries is one the graph already has.
+    const std::size_t thirdBase =
+        graph.Append(skinAsset.get(), 0, noBuffers, 0, 0, 2);
+    ExpectEqualU("a repeated asset starts after the second",
+                 static_cast<std::uint32_t>(thirdBase), 8);
+    ExpectEqualU("every node is in the graph",
+                 static_cast<std::uint32_t>(graph.NodeCount()), 12);
+    ExpectEqualU("three assets are registered",
+                 static_cast<std::uint32_t>(graph.AssetCount()), 3);
+
+    const std::vector<SceneNode>& nodes = graph.Nodes();
+
+    std::cout << "  node identity" << std::endl;
+    Expect("each node knows which asset it came from",
+           nodes[0].assetIndex == 0 && nodes[4].assetIndex == 1 &&
+               nodes[8].assetIndex == 2);
+    Expect("each node keeps its asset-local index",
+           nodes[4].assetNodeIndex == 0 && nodes[9].assetNodeIndex == 1);
+    Expect("gltfNodeIndex is the merged index", nodes[9].gltfNodeIndex == 9);
+    Expect("the repeated asset's nodes are named the same",
+           nodes[8].name == nodes[0].name);
+
+    std::cout << "  hierarchy" << std::endl;
+    // Three roots, one per asset, in append order.
+    Expect("one root per asset", graph.RootNodes().size() == 3);
+    Expect("the roots are each asset's own",
+           graph.RootNodes()[0] == 0 && graph.RootNodes()[1] == 4 &&
+               graph.RootNodes()[2] == 8);
+    // The repeated asset's "Root" has children 1,2,3 in its own numbering,
+    // which must come out as 9,10,11 and not as 1,2,3.
+    Expect("children are offset into the appended asset",
+           nodes[8].children.size() == 3 && nodes[8].children[0] == 9 &&
+               nodes[8].children[2] == 11);
+    Expect("parents are offset too", nodes[9].parent.has_value() &&
+                                         nodes[9].parent.value() == 8);
+    Expect("the first asset's links are untouched",
+           nodes[1].parent.has_value() && nodes[1].parent.value() == 0);
+
+    std::cout << "  skins" << std::endl;
+    Expect("each asset contributed its skin", graph.Skins().size() == 2);
+    Expect("the first skin keeps its own joints",
+           graph.Skins()[0].joints.size() == 2 && graph.Skins()[0].joints[0] == 1 &&
+               graph.Skins()[0].joints[1] == 2);
+    Expect("the repeated skin's joints are offset",
+           graph.Skins()[1].joints.size() == 2 && graph.Skins()[1].joints[0] == 9 &&
+               graph.Skins()[1].joints[1] == 10);
+    Expect("the repeated skin's skeleton root is offset",
+           graph.Skins()[1].skeletonRoot.has_value() &&
+               graph.Skins()[1].skeletonRoot.value() == 9);
+    // Node 3 of the repeated asset is its skinned mesh, so node 11 must point
+    // at skin 1 -- pointing at skin 0 would deform it with the other copy's
+    // joints, which sit in the same place here and so would look right.
+    Expect("the repeated mesh uses the repeated skin",
+           nodes[11].skinIndex.has_value() && nodes[11].skinIndex.value() == 1);
+    Expect("the first mesh still uses the first skin",
+           nodes[3].skinIndex.has_value() && nodes[3].skinIndex.value() == 0);
+    Expect("joints are flagged in both copies", nodes[1].isJoint && nodes[9].isJoint);
+
+    std::cout << "  animations" << std::endl;
+    // Only the middle asset has any, and its channels target its own nodes.
+    Expect("the animated asset contributed its clips", graph.Animations().size() == 2);
+    bool channelsOffset = !graph.Animations()[0].channels.empty();
+    for (const auto& channel : graph.Animations()[0].channels) {
+        if (channel.nodeIndex < 4 || channel.nodeIndex > 7) {
+            channelsOffset = false;
+        }
+    }
+    Expect("every channel targets the asset it came from", channelsOffset);
+    Expect("an out-of-range clip is rejected",
+           !graph.ApplyAnimations({SceneGraph::ActiveAnimation{99, 0.0f}}));
+
+    std::cout << "  per-asset placement" << std::endl;
+    // 100 units along +X, so the two copies of the same asset are
+    // distinguishable: without the placement they would sit on top of each
+    // other, which is exactly what makes a missed offset invisible.
+    graph.SetAssetPlacement(2, Matrix::CreateTranslation(100.0f, 0.0f, 0.0f));
+    graph.UpdateTransforms(Matrix::Identity);
+    // Joint0 is authored at x=5 in both copies.
+    ExpectVec("the first copy stays where it was authored",
+              nodes[1].worldTransform.Translation(), 5.0f, 0.0f, 0.0f);
+    ExpectVec("the placed copy moves with its asset",
+              nodes[9].worldTransform.Translation(), 105.0f, 0.0f, 0.0f);
+    ExpectVec("an unplaced asset is unaffected",
+              nodes[4].worldTransform.Translation(), 0.0f, 0.0f, 0.0f);
+
+    // The scene placement still applies outside every asset's own.
+    graph.UpdateTransforms(Matrix::CreateTranslation(0.0f, 1.0f, 0.0f));
+    ExpectVec("the scene placement composes outside the asset's",
+              nodes[9].worldTransform.Translation(), 105.0f, 1.0f, 0.0f);
+
+    // Scale inside the translation, which is the order the UI's two controls
+    // mean: the position is in world units and must not be multiplied by the
+    // scale. Joint0 is authored at x=5, so x2 puts it at 10 and the move then
+    // adds 100 -- the other order would give (5+100)*2.
+    graph.SetAssetPlacement(2, Matrix::CreateScale(2.0f) *
+                                   Matrix::CreateTranslation(100.0f, 0.0f, 0.0f));
+    graph.UpdateTransforms(Matrix::Identity);
+    ExpectVec("a scaled asset scales about its own origin",
+              nodes[9].worldTransform.Translation(), 110.0f, 0.0f, 0.0f);
+    graph.SetAssetPlacement(2, Matrix::CreateTranslation(100.0f, 0.0f, 0.0f));
+    graph.UpdateTransforms(Matrix::Identity);
+
+    std::cout << "  one clip per asset" << std::endl;
+    // The animated asset's node 1 goes to (10,20,0) at t=2 by its own
+    // keyframes; the two static assets must not budge.
+    Expect("a clip from one asset applies",
+           graph.ApplyAnimations({SceneGraph::ActiveAnimation{0, 2.0f}}));
+    graph.UpdateTransforms(Matrix::Identity);
+    ExpectVec("the animated asset's node is posed",
+              nodes[5].worldTransform.Translation(), 10.0f, 20.0f, 0.0f);
+    ExpectVec("the other assets are untouched by it",
+              nodes[1].worldTransform.Translation(), 5.0f, 0.0f, 0.0f);
+    Expect("no clips at all is not an error", graph.ApplyAnimations({}));
+
+    std::cout << "  material image indices" << std::endl;
+    auto meshAsset = Parse(kMeshGltf);
+    if (meshAsset.error() != fastgltf::Error::None) {
+        std::cerr << "mesh asset failed to parse" << std::endl;
+        ++g_failures;
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                 IID_PPV_ARGS(&device)))) {
+        std::cout << "  material image indices: skipped, no D3D12 device"
+                  << std::endl;
+        return;
+    }
+    Microsoft::WRL::ComPtr<ID3D12Resource> gltfBuffer;
+    const CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+    const auto bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(256);
+    if (FAILED(device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&gltfBuffer)))) {
+        std::cerr << "CreateCommittedResource failed" << std::endl;
+        ++g_failures;
+        return;
+    }
+    const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> buffers{gltfBuffer};
+
+    SceneGraph textured;
+    textured.Clear();
+    // The same five-texture asset twice. The second copy's images live at 5..9
+    // in the renderer's descriptor array, so its material must resolve there --
+    // resolving to 0..4 would sample the first copy's textures, which are the
+    // same file and so would look correct.
+    textured.Append(meshAsset.get(), 0, buffers, 0, 5, 0);
+    textured.Append(meshAsset.get(), 0, buffers, 5, 5, 1);
+    textured.UpdateTransforms(Matrix::Identity);
+    ExpectEqualU("both copies are drawn",
+                 static_cast<std::uint32_t>(textured.DrawOrder().size()), 2);
+    if (textured.DrawOrder().size() == 2) {
+        const auto& first =
+            textured.Nodes()[textured.DrawOrder()[0]].primitives.at(0);
+        const auto& second =
+            textured.Nodes()[textured.DrawOrder()[1]].primitives.at(0);
+        using NeuralModelIntegrateTestbed::MaterialTextureSlot;
+        Expect("the first copy's base colour is image 0",
+               first.ImageIndex(MaterialTextureSlot::BaseColor).value_or(999) == 0);
+        Expect("the second copy's base colour is offset to image 5",
+               second.ImageIndex(MaterialTextureSlot::BaseColor).value_or(999) == 5);
+        Expect("the first copy's emissive is image 4",
+               first.ImageIndex(MaterialTextureSlot::Emissive).value_or(999) == 4);
+        Expect("the second copy's emissive is offset to image 9",
+               second.ImageIndex(MaterialTextureSlot::Emissive).value_or(999) == 9);
+    }
+
+    std::cout << "  per-asset visibility" << std::endl;
+    // Switching one file off has to take it out of the draw order itself, not
+    // leave it to be drawn somewhere it cannot be seen -- the shadow passes and
+    // the light upload read the same walk.
+    textured.SetAssetVisible(1, false);
+    textured.UpdateTransforms(Matrix::Identity);
+    ExpectEqualU("hiding one file leaves the other drawn",
+                 static_cast<std::uint32_t>(textured.DrawOrder().size()), 1);
+    Expect("the file still showing is the one left",
+           textured.DrawOrder().size() == 1 &&
+               textured.Nodes()[textured.DrawOrder()[0]].assetIndex == 0);
+    textured.SetAssetVisible(0, false);
+    textured.UpdateTransforms(Matrix::Identity);
+    Expect("hiding every file draws nothing", textured.DrawOrder().empty());
+    textured.SetAssetVisible(0, true);
+    textured.SetAssetVisible(1, true);
+    textured.UpdateTransforms(Matrix::Identity);
+    ExpectEqualU("switching them back on restores both",
+                 static_cast<std::uint32_t>(textured.DrawOrder().size()), 2);
+    Expect("an asset nothing has spoken about is shown", textured.AssetVisible(7));
+
+    // An asset whose images were not loaded resolves nothing, and must not
+    // reach the base offset either: a descriptor index it never earned would
+    // point into another asset's textures.
+    SceneGraph noImages;
+    noImages.Clear();
+    noImages.Append(meshAsset.get(), 0, buffers, 0, 5, 0);
+    noImages.Append(meshAsset.get(), 0, buffers, 5, 0, 1);
+    noImages.UpdateTransforms(Matrix::Identity);
+    if (noImages.DrawOrder().size() == 2) {
+        const auto& second =
+            noImages.Nodes()[noImages.DrawOrder()[1]].primitives.at(0);
+        using NeuralModelIntegrateTestbed::MaterialTextureSlot;
+        Expect("an asset with no images resolves no texture",
+               !second.ImageIndex(MaterialTextureSlot::BaseColor).has_value());
+    }
+}
+
+// The placement a scene manifest describes, composed into a matrix. Every way
+// of getting this wrong still renders something: the wrong compose order puts
+// a scaled file at a scaled-up position, and a degrees/radians slip turns it by
+// a plausible-looking amount. So the three are asserted against hand-computed
+// results.
+void TestPlacementMatrix() {
+    using DirectX::SimpleMath::Matrix;
+    using DirectX::SimpleMath::Vector3;
+    using NeuralModelIntegrateTestbed::PlacementMatrix;
+    using NeuralModelIntegrateTestbed::SceneTransform;
+    std::cout << "manifest placement -> matrix" << std::endl;
+
+    {
+        SceneTransform identity;
+        const Matrix m = PlacementMatrix(identity);
+        ExpectVec("the default placement moves nothing",
+                  Vector3::Transform(Vector3(1.0f, 2.0f, 3.0f), m), 1.0f, 2.0f,
+                  3.0f);
+    }
+    {
+        // Scale INSIDE the translation: the point at x=1 scales to 2 and the
+        // move then adds 10. The other order would give (1+10)*2 = 22, which is
+        // the mistake that makes a position slider behave differently depending
+        // on the scale.
+        SceneTransform t;
+        t.scale = 2.0f;
+        t.translation[0] = 10.0f;
+        ExpectVec("scale applies before the translation",
+                  Vector3::Transform(Vector3(1.0f, 0.0f, 0.0f),
+                                     PlacementMatrix(t)),
+                  12.0f, 0.0f, 0.0f);
+    }
+    {
+        // 90 degrees about Y takes +X onto -Z in this project's left-handed
+        // convention. Degrees, not radians: a transform given 90 and read as
+        // radians would turn by about 5157 degrees and land somewhere arbitrary.
+        SceneTransform t;
+        t.rotation[1] = 90.0f;
+        ExpectVec("a yaw of 90 degrees turns +X onto -Z",
+                  Vector3::Transform(Vector3(1.0f, 0.0f, 0.0f),
+                                     PlacementMatrix(t)),
+                  0.0f, 0.0f, -1.0f);
+    }
+    {
+        // 180 degrees is what a character facing away from the camera needs,
+        // which is the case the example manifest covers.
+        SceneTransform t;
+        t.rotation[1] = 180.0f;
+        ExpectVec("a yaw of 180 degrees reverses +Z",
+                  Vector3::Transform(Vector3(0.0f, 0.0f, 1.0f),
+                                     PlacementMatrix(t)),
+                  0.0f, 0.0f, -1.0f);
+    }
+    {
+        // +Y onto +Z, not -Z: XMMatrixRotationX turns the second axis towards
+        // the third for a positive angle, and a yaw does the opposite (+X onto
+        // -Z, above) because the axis it turns about is the second one. The two
+        // signs looking inconsistent is the convention, not a slip.
+        SceneTransform t;
+        t.rotation[0] = 90.0f;
+        ExpectVec("a pitch of 90 degrees turns +Y onto +Z",
+                  Vector3::Transform(Vector3(0.0f, 1.0f, 0.0f),
+                                     PlacementMatrix(t)),
+                  0.0f, 0.0f, 1.0f);
+    }
+    {
+        // All three at once, in the order the comment claims: the point is
+        // scaled, then turned, then moved. x=1 -> x=2 -> z=-2 -> (5, 0, -2).
+        SceneTransform t;
+        t.scale = 2.0f;
+        t.rotation[1] = 90.0f;
+        t.translation[0] = 5.0f;
+        ExpectVec("scale, then rotation, then translation",
+                  Vector3::Transform(Vector3(1.0f, 0.0f, 0.0f),
+                                     PlacementMatrix(t)),
+                  5.0f, 0.0f, -2.0f);
+    }
+    {
+        // What the renderer actually does with it: hand the matrix to
+        // SetAssetPlacement and the file's nodes move by it.
+        auto asset = Parse(kSkinGltf);
+        if (asset.error() != fastgltf::Error::None) {
+            std::cerr << "placement asset failed to parse" << std::endl;
+            ++g_failures;
+            return;
+        }
+        const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> noBuffers;
+        SceneGraph graph;
+        graph.Build(asset.get(), 0, noBuffers, 0);
+        SceneTransform t;
+        t.rotation[1] = 90.0f;
+        t.translation[1] = 1.0f;
+        graph.SetAssetPlacement(0, PlacementMatrix(t));
+        graph.UpdateTransforms(Matrix::Identity);
+        // Joint0 is authored at x=5, so a yaw of 90 puts it at z=-5 and the
+        // move lifts it to y=1.
+        ExpectVec("a manifest placement reaches the nodes",
+                  graph.Nodes()[1].worldTransform.Translation(), 0.0f, 1.0f,
+                  -5.0f);
+    }
+}
+
 int main() {
     auto asset = Parse(kGltf);
     if (asset.error() != fastgltf::Error::None) {
@@ -2740,6 +3089,8 @@ int main() {
     TestSunEuler();
     TestSceneSunView();
     TestLightmapPacking();
+    TestMultipleAssets();
+    TestPlacementMatrix();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed" << std::endl;

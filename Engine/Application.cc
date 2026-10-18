@@ -106,21 +106,101 @@ std::string FirstGltfIn(const std::filesystem::path &directory) {
     return candidates.front();
 }
 
+// Splits a ';'-separated list, dropping empty entries. Semicolon rather than
+// ':' or ',' because these are Windows paths: a drive letter contains a colon,
+// and nothing stops a directory name containing a comma.
+std::vector<std::string> SplitPathList(const std::string &list) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const std::size_t end = list.find(';', start);
+        const std::string piece =
+            list.substr(start, end == std::string::npos ? std::string::npos
+                                                        : end - start);
+        if (!piece.empty()) {
+            out.push_back(piece);
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+// Whether a path names a scene manifest rather than a glTF file. By extension,
+// because that is what the person typed and the alternative -- opening it to
+// see -- would have to decide what a file that is neither means.
+bool IsSceneManifestPath(const std::string &path) {
+    return std::filesystem::path(path).extension() == ".json";
+}
+
+// Every glTF file to load, drawn as one scene. More than one because the
+// renderer now merges them: a skinned character is easier to keep in its own
+// file than to re-export into whatever set it is standing in, and the two have
+// to share the material heap, the lightmap atlas and the shadow cascades to be
+// lit together.
+//
 // PTFLIO_SCENE overrides everything, so a scene staged anywhere can be loaded
-// without a rebuild.
-std::string ResolveScenePath() {
+// without a rebuild; it takes a ';'-separated list, and the first entry is the
+// one the skybox is looked for beside.
+std::vector<std::string> ResolveScenePaths() {
     if (const char *fromEnvironment = std::getenv("PTFLIO_SCENE")) {
         if (*fromEnvironment != '\0') {
-            return fromEnvironment;
+            std::vector<std::string> fromList;
+            for (const std::string &entry : SplitPathList(fromEnvironment)) {
+                // A manifest named here was already tried as a manifest, so
+                // this is only reached when it could not be read. Handing it to
+                // the glTF parser as well would report the same file failing
+                // twice and then draw nothing; falling through to the search
+                // below at least puts a scene on the screen under the error.
+                if (!IsSceneManifestPath(entry)) {
+                    fromList.push_back(entry);
+                }
+            }
+            if (!fromList.empty()) {
+                return fromList;
+            }
         }
     }
     for (const char *directory : kSceneDirectories) {
         const std::string found = FirstGltfIn(directory);
         if (!found.empty()) {
-            return found;
+            return {found};
         }
     }
-    return kFallbackScene;
+    return {kFallbackScene};
+}
+
+// The manifest to load, if there is one. In order: PTFLIO_SCENE naming a
+// .json, then the default file in the working directory, then the one beside
+// the staged assets.
+//
+// The default matters more than it looks. The point of the manifest is that a
+// scene of several files with a placement each stops needing an environment
+// variable at all: put scenes.json where the app runs -- which is also where
+// the Scene tab's save button writes it -- and `bazelisk run` picks it up.
+std::vector<std::string> SceneManifestCandidates() {
+    std::vector<std::string> candidates;
+    if (const char *fromEnvironment = std::getenv("PTFLIO_SCENE")) {
+        if (*fromEnvironment != '\0') {
+            for (const std::string &entry : SplitPathList(fromEnvironment)) {
+                if (IsSceneManifestPath(entry)) {
+                    // Named explicitly, so a manifest that is missing or
+                    // malformed is an error worth reporting rather than
+                    // something to fall past.
+                    return {entry};
+                }
+            }
+            // The variable named glTF files, which is the older form and still
+            // wins over any manifest lying around.
+            return {};
+        }
+    }
+    candidates.emplace_back(
+        NeuralModelIntegrateTestbed::kDefaultSceneManifest);
+    candidates.emplace_back("resources/scenes.json");
+    return candidates;
 }
 
 // Which environment map to use as the sky.
@@ -223,25 +303,102 @@ void Sample::Initialize(HWND window, int width, int height)
     //
     // Reported on stderr, not stdout: this is a WINDOWS-subsystem binary, so
     // stdout goes nowhere when the app is launched normally.
-    const std::string scenePath = ResolveScenePath();
-    const std::uint32_t maxTextureDimension = ResolveMaxTextureDimension();
-    std::fprintf(stderr, "scene: %s\n", scenePath.c_str());
+    // A manifest first: it names the files AND where each one goes, which is
+    // the only form that can describe a character placed in a set without a
+    // slider being dragged on every run. Falling back to bare paths keeps every
+    // older way of starting the app working.
+    NeuralModelIntegrateTestbed::SceneManifest manifest;
+    bool haveManifest = false;
+    for (const std::string &candidate : SceneManifestCandidates()) {
+        std::error_code error;
+        if (!std::filesystem::exists(candidate, error)) {
+            continue;
+        }
+        std::string manifestError;
+        if (NeuralModelIntegrateTestbed::LoadSceneManifest(candidate, manifest,
+                                                           &manifestError)) {
+            haveManifest = true;
+            std::fprintf(stderr, "scene manifest: %s (%zu file(s))\n",
+                         candidate.c_str(), manifest.scenes.size());
+            break;
+        }
+        // Said plainly and then skipped. A manifest with a typo in it is the
+        // likeliest thing to go wrong about this format, and an app that
+        // silently rendered the fallback scene instead would be the worst way
+        // to find out.
+        std::fprintf(stderr, "scene manifest: %s\n", manifestError.c_str());
+    }
+
+    std::vector<std::string> scenePaths;
+    if (haveManifest) {
+        for (const auto &entry : manifest.scenes) {
+            scenePaths.push_back(entry.resolvedPath);
+        }
+    } else {
+        scenePaths = ResolveScenePaths();
+    }
+
+    // The manifest's cap if it names one, so a scene that needs a smaller one
+    // carries that with it rather than needing the environment variable too.
+    const std::uint32_t maxTextureDimension =
+        haveManifest && manifest.hasMaxTextureDimension
+            ? manifest.maxTextureDimension
+            : ResolveMaxTextureDimension();
 
     m_gltfAdapter.SetMaxTextureDimension(maxTextureDimension);
-    m_gltfAdapter.Initialize(scenePath);
+    // One AddScene per file; they are merged into one scene graph, so the
+    // passes below do not change with the file count. A file that fails to
+    // parse is reported and skipped rather than taking the others with it.
+    for (std::size_t i = 0; i < scenePaths.size(); ++i) {
+        const std::string &scenePath = scenePaths[i];
+        std::fprintf(stderr, "scene: %s\n", scenePath.c_str());
+        const NeuralModelIntegrateTestbed::SceneTransform placement =
+            haveManifest ? manifest.scenes[i].transform
+                         : NeuralModelIntegrateTestbed::SceneTransform{};
+        const std::string manifestPath =
+            haveManifest ? manifest.scenes[i].path : std::string();
+        if (m_gltfAdapter.AddScene(scenePath, placement, manifestPath) !=
+            fastgltf::Error::None) {
+            std::fprintf(stderr, "scene: %s could not be loaded; skipped\n",
+                         scenePath.c_str());
+        }
+    }
+    // Handed over whether or not one was loaded: with none, the Scene tab's
+    // save button writes a new one, which is how a scene assembled by dragging
+    // sliders becomes reproducible.
+    m_gltfAdapter.SetManifest(manifest);
+    std::fflush(stderr);
     m_gltfAdapter.SetCommonStates(m_states);
     m_gltfAdapter.AssignCamera(m_camera);
     m_gltfAdapter.PrepareBuffer(m_deviceResources);
     m_gltfAdapter.PrepareImage(m_deviceResources);
     m_gltfAdapter.BuildSceneGraph();
     m_gltfAdapter.PreparePSO(m_deviceResources);
-    // After PreparePSO, because it needs the scene graph built and the
+    // After PreparePSO, because either path needs the scene graph built and the
     // transforms composable.
-    FrameSceneWithCamera();
+    //
+    // A manifest camera wins over framing the scene: the computed view is a
+    // guess that is right the first time a scene is opened and wrong as soon as
+    // the shot matters, and a pinned one is the whole reason to write it down.
+    if (haveManifest && manifest.hasCamera)
+    {
+        ApplySceneCamera(manifest.camera);
+    }
+    else
+    {
+        FrameSceneWithCamera();
+    }
 
     // The sky. A scene without one renders against the clear colour, so a
     // failure here is reported and then shrugged off rather than thrown.
-    const std::string skyboxPath = ResolveSkyboxPath(scenePath);
+    // The manifest's skybox if it names one; otherwise beside the first file,
+    // which with several loaded is the one the scene is named after -- a
+    // character file would not ship an environment map.
+    const std::string skyboxPath =
+        haveManifest && !manifest.resolvedSkybox.empty()
+            ? manifest.resolvedSkybox
+            : (scenePaths.empty() ? std::string()
+                                  : ResolveSkyboxPath(scenePaths.front()));
     if (!skyboxPath.empty()) {
         std::string skyboxError;
         if (!m_deferred.LoadEnvironment(*m_deviceResources, skyboxPath, &skyboxError)) {
@@ -807,13 +964,13 @@ void Sample::RecordScreenOverlays(ID3D12GraphicsCommandList* commandList)
     PIXEndEvent(commandList);
 }
 
-void Sample::FrameSceneWithCamera()
+bool Sample::MeasureScene()
 {
     DirectX::XMFLOAT3 minimum = {};
     DirectX::XMFLOAT3 maximum = {};
     if (!m_gltfAdapter.SceneBounds(minimum, maximum))
     {
-        return;
+        return false;
     }
 
     const Vector3 low(minimum.x, minimum.y, minimum.z);
@@ -829,6 +986,74 @@ void Sample::FrameSceneWithCamera()
     // The shadow distance follows the scene, so the cascades are worth having
     // in a two-metre fixture and a hundred-and-sixty-metre street alike.
     m_deferred.SetSceneScale(radius);
+
+    // Roughly "cross the scene in a second of dragging". Rotation is in radians
+    // and has nothing to do with scene size, so it is left alone.
+    m_cameraMoveSpeed = radius * 0.05f;
+    return true;
+}
+
+// A camera the manifest pinned, used instead of framing the scene.
+//
+// The measurement above still happens: the bounds and the radius drive the
+// shadow cascade distance, the lightmap bake and the drag speeds, none of which
+// is about where the camera stands. Only the eye, the target and the lens come
+// from the manifest.
+void Sample::ApplySceneCamera(const NeuralModelIntegrateTestbed::SceneCamera &camera)
+{
+    const bool measured = MeasureScene();
+
+    m_camera->Set(Vector3(camera.position[0], camera.position[1], camera.position[2]),
+                  Vector3(camera.target[0], camera.target[1], camera.target[2]),
+                  Vector3(camera.up[0], camera.up[1], camera.up[2]));
+
+    if (camera.hasFov)
+    {
+        m_fovDegrees = camera.fovDegrees;
+    }
+    // The clip planes are kept together with the scene's own scaling: a
+    // manifest that pins only the near plane would otherwise be paired with a
+    // far plane computed for a camera that is no longer there.
+    if (camera.hasNear)
+    {
+        m_near = camera.nearPlane;
+    }
+    else if (measured)
+    {
+        m_near = std::max(0.01f, m_sceneRadius * 0.001f);
+    }
+    if (camera.hasFar)
+    {
+        m_far = camera.farPlane;
+    }
+    else if (measured)
+    {
+        // Far enough to hold the scene from wherever the manifest put the eye,
+        // which is not the framed distance any more.
+        const Vector3 eye(camera.position[0], camera.position[1], camera.position[2]);
+        const float toFar = (m_sceneCentre - eye).Length() + m_sceneRadius * 2.0f;
+        m_far = std::max(m_near * 10.0f, toFar);
+    }
+
+    UpdateProjection();
+
+    std::fprintf(stderr,
+                 "[camera] from the manifest: eye (%.2f, %.2f, %.2f), target "
+                 "(%.2f, %.2f, %.2f), fov %.1f deg, near %.4f, far %.1f\n",
+                 camera.position[0], camera.position[1], camera.position[2],
+                 camera.target[0], camera.target[1], camera.target[2],
+                 m_fovDegrees, m_near, m_far);
+    std::fflush(stderr);
+}
+
+void Sample::FrameSceneWithCamera()
+{
+    if (!MeasureScene())
+    {
+        return;
+    }
+    const Vector3 centre = m_sceneCentre;
+    const float radius = m_sceneRadius;
 
     // Far enough back that the bounding sphere fits the vertical field of view,
     // with a little margin. 70 degrees is what CreateWindowSizeDependentResources
@@ -849,10 +1074,6 @@ void Sample::FrameSceneWithCamera()
     // far plane of 400 would be 40000 and z-fight in the distance.
     m_near = std::max(0.01f, radius * 0.001f);
     m_far = distance + radius * 2.0f;
-
-    // Roughly "cross the scene in a second of dragging". Rotation is in radians
-    // and has nothing to do with scene size, so it is left alone.
-    m_cameraMoveSpeed = radius * 0.05f;
 
     UpdateProjection();
 
@@ -1366,6 +1587,11 @@ void Sample::UpdateProjection()
     // teapot keep the previous projection and stop lining up with the scene.
     m_lineEffect->SetProjection(m_projection);
     m_shapeEffect->SetProjection(m_projection);
+
+    // The lens, for the Scene tab's save button. Pushed from here because this
+    // is the one place the three are settled, whether they came from a
+    // manifest, from framing the scene or from the sliders.
+    m_gltfAdapter.SetCameraProjection(m_fovDegrees, m_near, m_far);
 }
 
 void Sample::OnDeviceLost()

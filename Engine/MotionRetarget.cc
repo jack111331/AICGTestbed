@@ -118,8 +118,14 @@ Matrix MotionRetargeter::AuthoredParentWorld(const SceneGraph& graph,
                                              std::size_t nodeIndex,
                                              const Matrix& scenePlacement) {
     const std::vector<SceneNode>& nodes = graph.Nodes();
+    // The character's own file may be placed somewhere in the merged scene, and
+    // that placement is part of the chain from the hips up to the world without
+    // being a node in it -- UpdateTransforms applies it just inside the scene
+    // placement, so this has to as well. Identity when only one file is loaded,
+    // or when nothing has moved this one.
+    const Matrix outer = graph.PlacementForNode(nodeIndex) * scenePlacement;
     if (nodeIndex >= nodes.size() || !nodes[nodeIndex].parent.has_value()) {
-        return scenePlacement;
+        return outer;
     }
 
     // Collect the chain, then compose root-outward. Row-vector convention, so a
@@ -131,7 +137,7 @@ Matrix MotionRetargeter::AuthoredParentWorld(const SceneGraph& graph,
         cursor = nodes[*cursor].parent;
     }
 
-    Matrix world = scenePlacement;
+    Matrix world = outer;
     for (auto ancestor = chain.rbegin(); ancestor != chain.rend(); ++ancestor) {
         world = AuthoredLocal(nodes[*ancestor]) * world;
     }

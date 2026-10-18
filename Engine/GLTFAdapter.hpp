@@ -14,7 +14,12 @@
 #include "Descriptors/RootSignature.hpp"
 #include "Lightmap.hpp"
 #include "SceneGraph.hpp"
+#include "SceneManifest.hpp"
 #include "Ui.hpp"
+
+// Referenced by the per-file upload helpers below. Declared rather than
+// included: DirectXTK12's own header comes in through pch.h on the .cc side.
+namespace DirectX { class ResourceUploadBatch; }
 
 static constexpr std::size_t kBackBufferSize = 2;
 static constexpr std::size_t kWorkerThreadSize = 4;
@@ -78,7 +83,63 @@ namespace NeuralModelIntegrateTestbed {
     // The node describe what things in a scene will input into AI model or what things need AI model to evaluate
     class GLTFAdapter {
     public:
-        fastgltf::Expected<fastgltf::Asset> Initialize(const std::string &gltfFilepath);
+        // Parses one glTF file and adds it to the set this renderer draws.
+        // Call it once per file, before PrepareBuffer: the files are kept
+        // separate as assets but merged into ONE scene graph, so they share the
+        // material descriptor heap, the lightmap atlas, the shadow cascades and
+        // the light list rather than each needing its own.
+        //
+        // That is what makes a character in one file and the set it stands in
+        // in another work: they are drawn by the same passes, and the character
+        // casts a shadow onto the set.
+        //
+        // Returns fastgltf::Error::None on success, having appended the asset;
+        // anything else leaves the set unchanged, so one unreadable file does
+        // not take the others with it.
+        // `manifestPath` is the path as a manifest spelled it, kept only so a
+        // save writes back the same spelling; pass nothing for a file named on
+        // the command line.
+        fastgltf::Error AddScene(const std::string &gltfFilepath,
+                                 const SceneTransform &placement = {},
+                                 const std::string &manifestPath = {});
+
+        // How many files AddScene has taken.
+        std::size_t SceneCount() const { return m_scenes.size(); }
+
+        // The manifest this scene was loaded from, kept so the Scene tab can
+        // write the sliders back to it. Its `scenes` array is rebuilt from the
+        // live placements on save; everything else in it -- the name, the
+        // skybox, the texture cap -- is carried through untouched, because this
+        // class knows nothing about those and must not drop them.
+        //
+        // An empty manifest (no sourcePath) means the scene came from paths on
+        // the command line or the environment, and the save button offers a
+        // default file instead.
+        void SetManifest(const SceneManifest &manifest) {
+            m_manifest = manifest;
+            m_saveCamera = manifest.hasCamera;
+        }
+
+        // The manifest as it would be written now: the stored one with every
+        // entry's transform, and the camera, taken from the live state.
+        SceneManifest CurrentManifest() const;
+
+        // The projection the application settled on, for CurrentManifest to
+        // write. Pushed in rather than read out because the field of view and
+        // the clip planes belong to Sample, not to the camera this class holds
+        // -- and a saved manifest naming a stale lens would be worse than one
+        // naming none.
+        void SetCameraProjection(float fovDegrees, float nearPlane,
+                                 float farPlane) {
+            m_cameraFovDegrees = fovDegrees;
+            m_cameraNear = nearPlane;
+            m_cameraFar = farPlane;
+        }
+
+
+        // Uploads the buffers and images of every file added so far. Files
+        // already uploaded by an earlier call are skipped, so adding a file and
+        // calling these again costs only the new one.
         void PrepareBuffer(std::shared_ptr<DX::DeviceResources> deviceResources);
         void PrepareImage(std::shared_ptr<DX::DeviceResources> deviceResources);
 
@@ -272,13 +333,13 @@ namespace NeuralModelIntegrateTestbed {
         // transform and the buffer views needed to draw it.
         const SceneGraph &Scene() const { return m_sceneGraph; }
 
-        // Where the whole scene sits. Retargeting needs this to aim at a WORLD
-        // position: the hips translation it writes is in the hips' parent
-        // space, and this placement is the outermost part of that chain, so
-        // ignoring it would offset the character by exactly this much.
+        // Where the whole scene sits, how it is turned and how big it is.
+        // Retargeting needs this to aim at a WORLD position: the hips
+        // translation it writes is in the hips' parent space, and this
+        // placement is the outermost part of that chain, so ignoring it would
+        // offset, turn and scale the character by exactly this much.
         DirectX::SimpleMath::Matrix ScenePlacement() const {
-            return DirectX::SimpleMath::Matrix::CreateTranslation(
-                m_position[0], m_position[1], m_position[2]);
+            return PlacementMatrix(m_sceneTransform);
         }
 
         // World-space bounds of the loaded scene, for framing a camera on it.
@@ -294,7 +355,105 @@ namespace NeuralModelIntegrateTestbed {
         // composes the world transforms.
         SceneGraph &Scene() { return m_sceneGraph; }
     private:
-        fastgltf::Asset m_gltf;
+        // One glTF file: its asset, the GPU resources that belong to it, and
+        // where its indices land in the merged arrays this class keeps.
+        //
+        // The asset is held rather than merged into one fastgltf::Asset because
+        // every index inside it -- accessors, buffer views, materials, meshes --
+        // is asset-local, and rewriting all of them would be a second parser.
+        // Only the three things that cross file boundaries are offset: the
+        // image descriptors, the scene graph's nodes, and the animations.
+        struct LoadedScene {
+            std::string path;
+            // The path exactly as the manifest spelled it, so saving writes
+            // back what was read rather than a resolved, machine-specific one.
+            // Empty for a file named on the command line or in the
+            // environment, where `path` is all there is.
+            std::string manifestPath;
+            // The file name alone, for the UI; the whole path is too long to
+            // use as a collapsing header.
+            std::string label;
+            fastgltf::Asset asset;
+            // Where this file lives. Image URIs resolve against it, so two
+            // files in different directories each find their own textures.
+            std::filesystem::path directory;
+            // Parallel to asset.buffers, so a buffer view's index needs no
+            // offset: the scene graph is handed this vector, not a merged one.
+            std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> buffers;
+            // Where this file's images start in m_imageDescriptors / images,
+            // and how many it has. A material's texture index is range-checked
+            // against the count and then moved by the base.
+            std::size_t imageBase = 0;
+            std::size_t imageCount = 0;
+            ImageColorSpaceClassification imageColorSpaces;
+            // Which scene of the file is drawn, and where its nodes and
+            // animations landed in the merged graph.
+            std::size_t sceneIndex = 0;
+            std::size_t nodeBase = 0;
+            std::size_t nodeCount = 0;
+            std::size_t animationBase = 0;
+            std::size_t animationCount = 0;
+
+            // Where this file sits, how it is turned, how big it is and
+            // whether it is shown, on top of the whole scene's placement. This
+            // is the point of loading files separately: the character has to be
+            // placed in the set without the set moving with it.
+            //
+            // The same struct the manifest parser fills, so what the sliders
+            // are left at is exactly what the save button writes.
+            SceneTransform placement;
+
+            // Playback, per file. A merged graph may hold a walking character
+            // from one file and a turning fan from another, and those are two
+            // clips running at once rather than a choice between them -- see
+            // SceneGraph::ApplyAnimations.
+            //
+            // The index is into the MERGED animation list, so it is directly
+            // usable against SceneGraph::Animations().
+            std::optional<std::size_t> activeAnimation;
+            bool animationAutoSelected = false;
+            float animationTime = 0.0f;
+            float animationSpeed = 1.0f;
+            bool animationPlaying = true;
+            bool animationLoop = true;
+
+            // So PrepareBuffer and PrepareImage can be called again after a
+            // file is added without re-uploading what is already resident.
+            bool buffersUploaded = false;
+            bool imagesUploaded = false;
+        };
+        std::vector<LoadedScene> m_scenes;
+
+        // One file's buffers, and one file's images, into the caller's upload
+        // batch. Split out because each is a long job with a lot of per-image
+        // detail, and nesting either inside the loop over the files would put
+        // that detail two levels deep in a function whose shape is just "for
+        // each file not yet resident".
+        void UploadSceneBuffers(LoadedScene &scene,
+                                DirectX::ResourceUploadBatch &resourceUpload,
+                                ID3D12Device *device);
+        void UploadSceneImages(LoadedScene &scene,
+                               DirectX::ResourceUploadBatch &resourceUpload,
+                               ID3D12Device *device);
+
+        // Pushes each file's placement and visibility into the scene graph
+        // before a transform walk. Called by everything that walks, so a
+        // control moved this frame is reflected this frame.
+        void SyncAssetState();
+        // The per-file UI: its visibility, placement and animation playback.
+        void ShowSceneFileUi(std::size_t index);
+        // Position, rotation and scale, used for the whole scene and for each
+        // file. Visibility is not here: the whole scene has no use for it.
+        //
+        // `id` scopes the widgets. The Scene tab draws the camera's own
+        // "Position" slider in the same window, and ImGui keys a widget on its
+        // label, so without a scope the two would share an ID.
+        static void TransformUi(const char *id, SceneTransform &transform);
+        // One scale control, used by TransformUi.
+        static void ScaleSliderUi(const char *label, float &scale);
+        // Which manifest this came from, and the button that writes it back.
+        void ShowManifestUi();
+
         Microsoft::WRL::ComPtr<ID3D12PipelineState> m_pso;
         // The same pipeline with CullMode NONE, for materials glTF marks
         // doubleSided. Selected per primitive; a scene with none of them never
@@ -305,11 +464,14 @@ namespace NeuralModelIntegrateTestbed {
         // needs shadowing is single-sided geometry seen from the sun's side as
         // often as not.
         Microsoft::WRL::ComPtr<ID3D12PipelineState> m_shadowPso;
-        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> buffers;
+        // Every file's images, in append order: file k occupies
+        // [imageBase, imageBase + imageCount). Buffers are NOT pooled this way
+        // -- they stay in their LoadedScene, because the scene graph resolves a
+        // buffer view against one file's buffer array at a time.
         std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> images;
         Microsoft::WRL::ComPtr<ID3D12Resource> cbuffer;
-        std::size_t m_currentSceneIdx = 0;
-        // Built once in PrepareImage, walked top-down every frame in Render.
+        // Built once by BuildSceneGraph from every loaded file, walked
+        // top-down every frame.
         SceneGraph m_sceneGraph;
         std::shared_ptr<Camera> m_camera;
         std::shared_ptr<DirectX::CommonStates> m_commonStates;
@@ -335,7 +497,9 @@ namespace NeuralModelIntegrateTestbed {
         // destructor returns it to its page.
         std::unique_ptr<Descriptors::DescriptorAllocator> m_srvAllocator;
         std::vector<Descriptors::DescriptorAllocation> m_imageDescriptors;
-        // Filled at the top of PrepareImage, before any texture is created.
+        // Every file's per-image classification concatenated, so the indices
+        // match m_imageDescriptors. Each file's own copy stays in its
+        // LoadedScene, since classification is per asset.
         ImageColorSpaceClassification m_imageColorSpaces;
         // A 1x1 opaque white texture, staged into any material texture slot the
         // material leaves empty. Keeps every descriptor in the five-wide SRV
@@ -385,13 +549,26 @@ namespace NeuralModelIntegrateTestbed {
         // Keeps the material SRV heap and the DirectXTK12 sampler heap bound
         // together.
         Descriptors::HeapBinder m_heapBinder;
-        float m_position[3] = {3.0f, -2.0f, -4.0f};
+        // The whole scene's placement, outside every file's own. The default
+        // translation is the one the authored microphone-and-character scene
+        // was framed with and is kept so that scene looks as it did.
+        SceneTransform m_sceneTransform = {{3.0f, -2.0f, -4.0f}};
+        // The manifest to write back to, if the scene came from one.
+        SceneManifest m_manifest;
+        // Whether a save writes the live camera into it. Follows what the
+        // loaded manifest had, so saving does not quietly pin a camera in a
+        // scene that was being framed automatically -- and so a scene that was
+        // pinned stays pinned.
+        bool m_saveCamera = false;
+        // Kept in step by SetCameraProjection.
+        float m_cameraFovDegrees = 70.0f;
+        float m_cameraNear = 0.01f;
+        float m_cameraFar = 100.0f;
+        // What the last save button press did, shown beside it: a write that
+        // failed on a read-only file is otherwise indistinguishable from one
+        // that worked.
+        std::string m_manifestStatus;
         bool m_frustumCulling = true;
-
-        // Where the .gltf lives. Image URIs are resolved against it, because
-        // images are no longer pre-loaded by fastgltf -- PrepareImage opens them
-        // itself so a missing file is a warning rather than a failed parse.
-        std::filesystem::path m_assetDirectory;
 
         // 0 means unlimited; see SetMaxTextureDimension.
         std::uint32_t m_maxTextureDimension = 0;
@@ -422,16 +599,9 @@ namespace NeuralModelIntegrateTestbed {
         bool m_shadowStatsStale = true;
 
         // --- Animation playback ---------------------------------------------
-        // Empty when the asset has no animations, or when the user selects
-        // "none" to see the authored bind pose.
-        std::optional<std::size_t> m_activeAnimation;
-        // Distinguishes "no clip chosen yet" from "the user deliberately chose
-        // the authored pose". Without it an empty selection is indistinguishable
-        // from a fresh start and clip 0 gets re-selected every frame.
-        bool m_animationAutoSelected = false;
-        float m_animationTime = 0.0f;
-        float m_animationSpeed = 1.0f;
-        bool m_animationPlaying = true;
-        bool m_animationLoop = true;
+        // Per file now, in LoadedScene: the selected clip, its time and the
+        // play/loop/speed controls. Scratch for the list handed to
+        // SceneGraph::ApplyAnimations, kept to avoid a per-frame allocation.
+        std::vector<SceneGraph::ActiveAnimation> m_activeAnimations;
     };
 }

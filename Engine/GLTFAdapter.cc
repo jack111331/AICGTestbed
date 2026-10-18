@@ -147,8 +147,61 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
 
 }  // namespace
 
-    fastgltf::Expected<fastgltf::Asset> GLTFAdapter::Initialize(const std::string &gltfFilepath) {
+    SceneManifest GLTFAdapter::CurrentManifest() const {
+        SceneManifest manifest = m_manifest;
+
+        // Where the camera is now, which after flying around with the mouse is
+        // not where any file said it should be. Written only when asked: see
+        // m_saveCamera.
+        manifest.hasCamera = m_saveCamera;
+        if (m_saveCamera && m_camera) {
+            SceneCamera &camera = manifest.camera;
+            const DirectX::SimpleMath::Vector3 eye(m_camera->mEye);
+            const DirectX::SimpleMath::Vector3 at(m_camera->mAt);
+            const DirectX::SimpleMath::Vector3 up(m_camera->mUp);
+            camera.position[0] = eye.x;
+            camera.position[1] = eye.y;
+            camera.position[2] = eye.z;
+            camera.target[0] = at.x;
+            camera.target[1] = at.y;
+            camera.target[2] = at.z;
+            camera.up[0] = up.x;
+            camera.up[1] = up.y;
+            camera.up[2] = up.z;
+            // All three together: the near and far planes a scene was framed
+            // with belong to the distance the eye was at, and saving the eye
+            // without them would pin a view whose depth range was computed for
+            // a different one.
+            camera.hasFov = true;
+            camera.fovDegrees = m_cameraFovDegrees;
+            camera.hasNear = true;
+            camera.nearPlane = m_cameraNear;
+            camera.hasFar = true;
+            camera.farPlane = m_cameraFar;
+        }
+        // Rebuilt rather than patched in place: a file may have been added
+        // since the manifest was read, and the entries have to stay in the
+        // order the scenes were appended so the paths and placements line up.
+        manifest.scenes.clear();
+        manifest.scenes.reserve(m_scenes.size());
+        for (const LoadedScene &scene : m_scenes) {
+            SceneManifestEntry entry;
+            // The path as it was written where there is one, so saving does not
+            // turn a relative manifest into a machine-specific one.
+            entry.path = scene.manifestPath.empty() ? scene.path
+                                                    : scene.manifestPath;
+            entry.resolvedPath = scene.path;
+            entry.transform = scene.placement;
+            manifest.scenes.push_back(std::move(entry));
+        }
+        return manifest;
+    }
+
+    fastgltf::Error GLTFAdapter::AddScene(const std::string &gltfFilepath,
+                                          const SceneTransform &placement,
+                                          const std::string &manifestPath) {
         #if defined(_DEBUG)
+        // Idempotent, and this may now be the second or third file.
         Microsoft::WRL::ComPtr<ID3D12Debug> debugController;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
             debugController->EnableDebugLayer();
@@ -190,39 +243,36 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
         //
         // LoadExternalBuffers stays: the geometry is one 91 MB .bin and there is
         // nothing optional about it.
-        m_assetDirectory = absPath.parent_path();
         auto loadedGLTF = parser.loadGltfJson(data.get(), absPath.parent_path(),
                              fastgltf::Options::LoadGLBBuffers |
                              fastgltf::Options::LoadExternalBuffers);
-        if (loadedGLTF.error() == fastgltf::Error::None) {
-            m_gltf = std::move(loadedGLTF.get());
-        } else {
+        if (loadedGLTF.error() != fastgltf::Error::None) {
+            // Nothing is appended, so the files that did load are unaffected.
+            std::fprintf(stderr, "scene: %s: parse failed\n", gltfFilepath.c_str());
+            std::fflush(stderr);
             return loadedGLTF.error();
         }
-        return fastgltf::Error::None;
 
+        LoadedScene loaded;
+        loaded.path = gltfFilepath;
+        loaded.placement = placement;
+        loaded.manifestPath = manifestPath;
+        loaded.label = absPath.filename().generic_string();
+        loaded.directory = absPath.parent_path();
+        loaded.asset = std::move(loadedGLTF.get());
+        // glTF's `scene` property picks the one to display; fall back to the
+        // first if the file does not name one.
+        loaded.sceneIndex = loaded.asset.defaultScene.value_or(0);
+        m_scenes.push_back(std::move(loaded));
+        return fastgltf::Error::None;
     }
 
-    void GLTFAdapter::PrepareBuffer(std::shared_ptr<DX::DeviceResources> deviceResources) {
-        auto device = deviceResources->GetD3DDevice();
-
-        // The ported descriptor classes reach for the device and the frame
-        // number through this context, so it has to exist before any of them
-        // are constructed. Idempotent: safe to call again after a device reset.
-        Descriptors::Context().Initialize(device);
-
-        // CPU-visible staging descriptors, grown a page at a time. 256 per page
-        // is the upstream default; glTF images are allocated one descriptor at
-        // a time so a page covers 256 textures before another is created.
-        m_srvAllocator = std::make_unique<Descriptors::DescriptorAllocator>(
-            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256);
-
-        ResourceUploadBatch resourceUpload(device);
-
+    void GLTFAdapter::UploadSceneBuffers(LoadedScene &scene,
+                                        ResourceUploadBatch &resourceUpload,
+                                        ID3D12Device *device) {
         const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
-
-        resourceUpload.Begin();
-        for (const auto &buffer: m_gltf.buffers) {
+        const fastgltf::Asset &asset = scene.asset;
+        for (const auto &buffer: asset.buffers) {
 
             const auto desc = CD3DX12_RESOURCE_DESC::Buffer(buffer.byteLength);
 
@@ -234,7 +284,9 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
                 nullptr,
                 IID_GRAPHICS_PPV_ARGS(createdBuffer.GetAddressOf())));
             createdBuffer->SetName(L"GLTF buffer 1");
-            buffers.push_back(createdBuffer);
+            // Into this file's own array, parallel to its asset.buffers, so a
+            // buffer view index needs no offset.
+            scene.buffers.push_back(createdBuffer);
 
             SetDebugObjectName(createdBuffer.Get(), L"ModelMeshPart");
 
@@ -281,8 +333,8 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
                 },
                 [&](const fastgltf::sources::BufferView& view) {
                     // TODO haven't implement loading from view
-                    auto& bufferView = m_gltf.bufferViews[view.bufferViewIndex];
-                    const auto& buffer = m_gltf.buffers[bufferView.bufferIndex];
+                    auto& bufferView = asset.bufferViews[view.bufferViewIndex];
+                    const auto& buffer = asset.buffers[bufferView.bufferIndex];
                     // Yes, we've already loaded every buffer into some GL buffer. However, with GL it's simpler
                     // to just copy the buffer data again for the texture. Besides, this is just an example.
                     std::visit(fastgltf::visitor {
@@ -303,6 +355,45 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
+        }
+    }
+
+    void GLTFAdapter::PrepareBuffer(std::shared_ptr<DX::DeviceResources> deviceResources) {
+        auto device = deviceResources->GetD3DDevice();
+
+        // The ported descriptor classes reach for the device and the frame
+        // number through this context, so it has to exist before any of them
+        // are constructed. Idempotent: safe to call again after a device reset.
+        Descriptors::Context().Initialize(device);
+
+        // CPU-visible staging descriptors, grown a page at a time. 256 per page
+        // is the upstream default; glTF images are allocated one descriptor at
+        // a time so a page covers 256 textures before another is created.
+        //
+        // Created once, not per call: m_imageDescriptors hold allocations out
+        // of this allocator's pages, so replacing it while a file is already
+        // loaded would leave every one of them pointing at a freed page. A
+        // second call -- which is what adding another file does -- keeps the
+        // allocator and simply takes more descriptors from it.
+        if (!m_srvAllocator) {
+            m_srvAllocator = std::make_unique<Descriptors::DescriptorAllocator>(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256);
+        }
+
+        ResourceUploadBatch resourceUpload(device);
+
+        const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+
+        resourceUpload.Begin();
+        // Every file not already resident. One upload batch covers them all,
+        // so adding a second file costs one more set of CreateCommittedResource
+        // calls rather than a second fence wait.
+        for (LoadedScene &scene : m_scenes) {
+            if (scene.buffersUploaded) {
+                continue;
+            }
+            scene.buffersUploaded = true;
+            UploadSceneBuffers(scene, resourceUpload, device);
         }
 
         /*
@@ -347,59 +438,67 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
         // it belongs behind the graph, one list per pass, not one per class.
     }
 
-    void GLTFAdapter::PrepareImage(std::shared_ptr<DX::DeviceResources> deviceResources) {
-        m_textureBytes = 0;
-        m_texturesDownscaled = 0;
-        m_texturesOverBudget = 0;
-        m_imagesMissing = 0;
-        m_imagesFailed = 0;
-        m_imagesUnused = 0;
+    void GLTFAdapter::UploadSceneImages(LoadedScene &scene,
+                                       ResourceUploadBatch &resourceUpload,
+                                       ID3D12Device *device) {
+        const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        const fastgltf::Asset &asset = scene.asset;
+        // Where this file's images start in the shared descriptor array. Every
+        // material texture index this file resolves is offset by it, so two
+        // files' textures cannot be confused -- see SceneGraph::Append.
+        scene.imageBase = m_imageDescriptors.size();
+        scene.imageCount = asset.images.size();
 
         // Which images any texture actually points at. An MSFT_texture_dds
         // asset lists two images per texture -- the .dds it uses and a .png it
         // does not -- so loading every image in the file decodes the whole
         // second set to RGBA8 for nothing. Measured on the Lumberyard Bistro
         // that was 5.8 GB instead of 1.2 GB once the .png files were present.
-        std::vector<bool> imageUsed(m_gltf.images.size(), false);
-        for (const fastgltf::Texture& texture : m_gltf.textures) {
+        std::vector<bool> imageUsed(asset.images.size(), false);
+        for (const fastgltf::Texture& texture : asset.textures) {
             const std::optional<std::size_t> source = TextureImageSource(texture);
             if (source.has_value() && source.value() < imageUsed.size()) {
                 imageUsed[source.value()] = true;
             }
         }
         // Decide each image's colour space from the material slots that
-        // reference it, before any texture resource is created.
-        m_imageColorSpaces = ClassifyImageColorSpaces(m_gltf);
+        // reference it, before any texture resource is created. Per file,
+        // because a material only ever references its own file's images.
+        scene.imageColorSpaces = ClassifyImageColorSpaces(asset);
         {
             std::size_t srgbCount = 0;
-            for (const ImageColorSpace space : m_imageColorSpaces.perImage) {
+            for (const ImageColorSpace space : scene.imageColorSpaces.perImage) {
                 if (space == ImageColorSpace::Srgb) {
                     ++srgbCount;
                 }
             }
-            std::printf("glTF images: %zu total, %zu sRGB, %zu linear\n",
-                        m_imageColorSpaces.perImage.size(), srgbCount,
-                        m_imageColorSpaces.perImage.size() - srgbCount);
-            for (const std::size_t imageIdx : m_imageColorSpaces.conflicts) {
+            std::printf("glTF images (%s): %zu total, %zu sRGB, %zu linear\n",
+                        scene.label.c_str(),
+                        scene.imageColorSpaces.perImage.size(), srgbCount,
+                        scene.imageColorSpaces.perImage.size() - srgbCount);
+            for (const std::size_t imageIdx : scene.imageColorSpaces.conflicts) {
                 std::printf("  warning: image %zu is used as both colour and linear "
                             "data; loaded as sRGB\n", imageIdx);
             }
+        }
+        // Concatenated into the merged view the UI reads, the conflict indices
+        // moved into the merged numbering.
+        m_imageColorSpaces.perImage.insert(m_imageColorSpaces.perImage.end(),
+                                           scene.imageColorSpaces.perImage.begin(),
+                                           scene.imageColorSpaces.perImage.end());
+        for (const std::size_t conflict : scene.imageColorSpaces.conflicts) {
+            m_imageColorSpaces.conflicts.push_back(scene.imageBase + conflict);
         }
 
         // Light definitions are shared; how many actually get instanced depends
         // on the nodes, which BuildSceneGraph resolves later. Printed here
         // because an asset exported without KHR_lights_punctual is otherwise
         // indistinguishable from one deliberately lit by nothing.
-        std::printf("glTF lights: %zu definition(s) in the asset\n", m_gltf.lights.size());
+        std::printf("glTF lights (%s): %zu definition(s) in the asset\n",
+                    scene.label.c_str(), asset.lights.size());
 
-        auto device = deviceResources->GetD3DDevice();
-        ResourceUploadBatch resourceUpload(device);
-
-        const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
-
-        resourceUpload.Begin();
         std::size_t imageIndex = 0;
-        for (const auto &image: m_gltf.images) {
+        for (const auto &image: asset.images) {
             // Create staging buffer via GraphicsMemory and upload buffer data via memcpy, save allocation time using paging mechanism
             // https://github.com/microsoft/DirectXTK12/blob/f003171e0c6a30cc61444864ef756bd3cf2fc310/Src/GraphicsMemory.cpp#L126
             // TODO do we need to hold the SharedGraphicsResource even when the upload is finished?
@@ -436,7 +535,7 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
                     // resolved from.
                     const std::string relative(filePath.uri.path().begin(),
                                                filePath.uri.path().end());
-                    const std::filesystem::path full = m_assetDirectory / relative;
+                    const std::filesystem::path full = scene.directory / relative;
                     std::ifstream file(full, std::ios::binary | std::ios::ate);
                     if (!file) {
                         // Not fatal. An MSFT_texture_dds asset names a .png
@@ -470,8 +569,8 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
                     encodedSize = vector.bytes.size();
                 },
                 [&](const fastgltf::sources::BufferView& view) {
-                    const auto& bufferView = m_gltf.bufferViews[view.bufferViewIndex];
-                    const auto& owner = m_gltf.buffers[bufferView.bufferIndex];
+                    const auto& bufferView = asset.bufferViews[view.bufferViewIndex];
+                    const auto& owner = asset.buffers[bufferView.bufferIndex];
                     std::visit(fastgltf::visitor {
                         [](const auto&) {},
                         [&](const fastgltf::sources::Array& vector) {
@@ -485,7 +584,8 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
 
             }
 
-            const ImageColorSpace colorSpace = m_imageColorSpaces.perImage[imageIndex];
+            const ImageColorSpace colorSpace =
+                scene.imageColorSpaces.perImage[imageIndex];
 
             // Step two: DDS or not. A DDS is already block compressed with its
             // own mip chain, so DirectXTK12 uploads it as-is -- no decode, no
@@ -658,10 +758,32 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
 
             ++imageIndex;
         }
+    }
+
+    void GLTFAdapter::PrepareImage(std::shared_ptr<DX::DeviceResources> deviceResources) {
+        // The counters are NOT reset here. A second call uploads only the files
+        // that are not resident yet, and their cost adds to what the earlier
+        // ones already reported; resetting would leave the UI describing the
+        // last file as if it were the whole scene.
+        auto device = deviceResources->GetD3DDevice();
+        ResourceUploadBatch resourceUpload(device);
+
+        const CD3DX12_HEAP_PROPERTIES heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+
+        resourceUpload.Begin();
+        for (LoadedScene &scene : m_scenes) {
+            if (scene.imagesUploaded) {
+                continue;
+            }
+            scene.imagesUploaded = true;
+            UploadSceneImages(scene, resourceUpload, device);
+        }
 
         // The fallback that fills unused material texture slots. Created here so
-        // it rides along with the same upload batch as the glTF images.
-        {
+        // it rides along with the same upload batch as the glTF images. Once,
+        // whatever the file count: it is one white pixel, and every file's
+        // empty material slots point at the same descriptor.
+        if (!m_fallbackTexture) {
             const auto fallbackDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1);
             DX::ThrowIfFailed(device->CreateCommittedResource(&heapProperties,
                 D3D12_HEAP_FLAG_NONE,
@@ -698,7 +820,7 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
         std::fprintf(stderr,
                      "images: %zu loaded, %.1f MB of video memory, %zu unreferenced, "
                      "%zu file(s) absent, %zu failed to decode\n",
-                     m_gltf.images.size() - m_imagesMissing - m_imagesFailed -
+                     m_imageDescriptors.size() - m_imagesMissing - m_imagesFailed -
                          m_imagesUnused,
                      static_cast<double>(m_textureBytes) / 1048576.0, m_imagesUnused,
                      m_imagesMissing, m_imagesFailed);
@@ -709,11 +831,47 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
     }
 
 
+    void GLTFAdapter::SyncAssetState() {
+        // Pushed in every frame rather than only when a control moves: it is a
+        // matrix and a bool per file, and the alternative is a dirty flag that
+        // has to be set by every path that can change either.
+        for (std::size_t i = 0; i < m_scenes.size(); ++i) {
+            const LoadedScene &scene = m_scenes[i];
+            m_sceneGraph.SetAssetPlacement(i, PlacementMatrix(scene.placement));
+            m_sceneGraph.SetAssetVisible(i, scene.placement.visible);
+        }
+    }
+
     void GLTFAdapter::BuildSceneGraph() {
-        // glTF's `scene` property picks the one to display; fall back to the
-        // first if the asset does not name one.
-        m_currentSceneIdx = m_gltf.defaultScene.value_or(0);
-        m_sceneGraph.Build(m_gltf, m_currentSceneIdx, buffers, m_imageDescriptors.size());
+        // Every file, merged into one graph: one hierarchy, one draw order, one
+        // light list. Each file's own scene is chosen by its `scene` property,
+        // falling back to the first -- see AddScene.
+        //
+        // Rebuilt from scratch rather than appended to, so calling this again
+        // after adding a file cannot leave a half-updated graph behind.
+        m_sceneGraph.Clear();
+        for (std::size_t i = 0; i < m_scenes.size(); ++i) {
+            LoadedScene &scene = m_scenes[i];
+            scene.animationBase = m_sceneGraph.Animations().size();
+            scene.nodeBase = m_sceneGraph.Append(scene.asset, scene.sceneIndex,
+                                                 scene.buffers, scene.imageBase,
+                                                 scene.imageCount, i);
+            scene.nodeCount = scene.asset.nodes.size();
+            scene.animationCount =
+                m_sceneGraph.Animations().size() - scene.animationBase;
+            // A clip selected before a rebuild is an index into the old merged
+            // list, which the rebuild may have renumbered. Dropped rather than
+            // guessed at; UpdateAnimation picks the file's first clip again.
+            scene.activeAnimation.reset();
+            scene.animationAutoSelected = false;
+            std::fprintf(stderr,
+                         "scene %zu: %s -- %zu node(s) at offset %zu, "
+                         "%zu image(s) at offset %zu, %zu animation(s)\n",
+                         i, scene.label.c_str(), scene.nodeCount, scene.nodeBase,
+                         scene.imageCount, scene.imageBase, scene.animationCount);
+        }
+        std::fflush(stderr);
+        SyncAssetState();
 
         // What can be baked into a cached shadow map and what cannot. Worth
         // printing at load: a scene where most nodes move has nothing to gain
@@ -1062,6 +1220,7 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
         // placed and how it was scaled, not of the mesh. Done here rather than
         // assumed, so this does not depend on the caller having framed the
         // scene yet.
+        SyncAssetState();
         m_sceneGraph.UpdateTransforms(ScenePlacement());
 
         m_lightmapCharts = 0;
@@ -1151,8 +1310,10 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
         // same transform, cannot drift from what is actually drawn.
         //
         // Top-down pass: each node's world transform is its local transform
-        // composed with its parent's, and hidden subtrees drop out of the draw
-        // order here rather than being tested per draw.
+        // composed with its parent's, then its file's own placement, and hidden
+        // subtrees drop out of the draw order here rather than being tested per
+        // draw.
+        SyncAssetState();
         m_sceneGraph.UpdateTransforms(ScenePlacement());
     }
 
@@ -1740,40 +1901,65 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
             return;
         }
 
-        // Pick the first clip once, so an animated asset moves without the UI
-        // being touched. After that an empty selection means the user asked for
-        // the authored pose, and must be left alone.
-        if (!m_animationAutoSelected) {
-            m_animationAutoSelected = true;
-            m_activeAnimation = 0;
-            m_animationTime = 0.0f;
-        }
-        if (!m_activeAnimation.has_value()) {
-            return;
-        }
-        if (m_activeAnimation.value() >= animations.size()) {
-            m_activeAnimation = 0;
-        }
-
-        const SceneAnimation &animation = animations[m_activeAnimation.value()];
-
-        if (m_animationPlaying && animation.duration > 0.0f) {
-            m_animationTime += deltaSeconds * m_animationSpeed;
-            if (m_animationLoop) {
-                // fmod keeps a negative speed working too, where plain
-                // subtraction would walk off the start of the timeline.
-                m_animationTime = std::fmod(m_animationTime, animation.duration);
-                if (m_animationTime < 0.0f) {
-                    m_animationTime += animation.duration;
-                }
-            } else {
-                m_animationTime = std::min(m_animationTime, animation.duration);
+        // One clip per file, advanced independently and applied together: a
+        // character walking in one file and a fan turning in another both have
+        // to run, which a single global selection could not express.
+        m_activeAnimations.clear();
+        for (LoadedScene &scene : m_scenes) {
+            if (scene.animationCount == 0) {
+                continue;
             }
+
+            // Pick the file's first clip once, so an animated file moves
+            // without the UI being touched. After that an empty selection
+            // means the user asked for the authored pose, and must be left
+            // alone.
+            if (!scene.animationAutoSelected) {
+                scene.animationAutoSelected = true;
+                scene.activeAnimation = scene.animationBase;
+                scene.animationTime = 0.0f;
+            }
+            if (!scene.activeAnimation.has_value()) {
+                continue;
+            }
+            // Clamped into this file's own range, not the merged list's: an
+            // index that escaped into another file's clips would animate the
+            // wrong character.
+            if (scene.activeAnimation.value() < scene.animationBase ||
+                scene.activeAnimation.value() >=
+                    scene.animationBase + scene.animationCount) {
+                scene.activeAnimation = scene.animationBase;
+            }
+
+            const SceneAnimation &animation = animations[scene.activeAnimation.value()];
+
+            if (scene.animationPlaying && animation.duration > 0.0f) {
+                scene.animationTime += deltaSeconds * scene.animationSpeed;
+                if (scene.animationLoop) {
+                    // fmod keeps a negative speed working too, where plain
+                    // subtraction would walk off the start of the timeline.
+                    scene.animationTime =
+                        std::fmod(scene.animationTime, animation.duration);
+                    if (scene.animationTime < 0.0f) {
+                        scene.animationTime += animation.duration;
+                    }
+                } else {
+                    scene.animationTime =
+                        std::min(scene.animationTime, animation.duration);
+                }
+            }
+
+            m_activeAnimations.push_back(
+                {scene.activeAnimation.value(), scene.animationTime});
         }
 
-        // Poses the nodes. Render's UpdateTransforms then composes them and
-        // ComputeJointMatrices turns the joints into the b2 matrices.
-        m_sceneGraph.ApplyAnimation(m_activeAnimation.value(), m_animationTime);
+        // Poses the nodes, every clip against the same authored pose. Render's
+        // UpdateTransforms then composes them and ComputeJointMatrices turns
+        // the joints into the b2 matrices.
+        //
+        // Called even with nothing selected, so clearing the last file's clip
+        // restores the authored pose instead of freezing the previous frame.
+        m_sceneGraph.ApplyAnimations(m_activeAnimations);
     }
 
     void GLTFAdapter::ShowImgui(UiSection section) {
@@ -1791,59 +1977,209 @@ std::uint64_t TextureBytes(int width, int height, bool hasMipChain) {
         ImGui::Checkbox("Frustum culling", &m_frustumCulling);
     }
 
-    void GLTFAdapter::ShowSceneUi() {
-        ImGui::SliderFloat3("GLTF position", m_position, -10.0, 10.0);
-        ImGui::Separator();
-        if (ImGui::CollapsingHeader("Animation", ImGuiTreeNodeFlags_DefaultOpen)) {
-            const auto &animations = m_sceneGraph.Animations();
-            if (animations.empty()) {
-                ImGui::TextUnformatted("This asset has no animations.");
-            } else {
-                // "none" restores the authored pose, which is the only way to
-                // see the bind pose once playback has started.
-                const char *current = m_activeAnimation.has_value()
-                                          ? animations[m_activeAnimation.value()].name.c_str()
-                                          : "(none -- authored pose)";
-                if (ImGui::BeginCombo("Clip", current)) {
-                    if (ImGui::Selectable("(none -- authored pose)",
-                                          !m_activeAnimation.has_value())) {
-                        m_activeAnimation.reset();
-                        m_sceneGraph.ResetToBasePose();
-                    }
-                    for (std::size_t i = 0; i < animations.size(); ++i) {
-                        const bool selected = m_activeAnimation.has_value() &&
-                                              m_activeAnimation.value() == i;
-                        if (ImGui::Selectable(animations[i].name.c_str(), selected)) {
-                            m_activeAnimation = i;
-                            m_animationTime = 0.0f;
-                        }
-                    }
-                    ImGui::EndCombo();
-                }
+    void GLTFAdapter::TransformUi(const char *id, SceneTransform &transform) {
+        // Scoped, because an ImGui ID is the label hashed against whatever is
+        // pushed and the Scene tab draws the camera's own "Position" in the
+        // same window. Two widgets with one ID is not cosmetic: clicking one
+        // drives the other, and 1.92 raises an ID-conflict error window over
+        // the whole UI. The id is pushed rather than baked into the labels so
+        // the sliders still read as "Position" wherever they are shown.
+        ImGui::PushID(id);
+        ImGui::SliderFloat3("Position", transform.translation, -20.0f, 20.0f);
+        // Degrees, and the same three numbers the manifest holds -- the sliders
+        // and the file are one representation, so neither can disagree with the
+        // other about a convention. Wider than 360 on purpose: dragging past a
+        // turn is how a slider is used, and the matrix does not care.
+        ImGui::SliderFloat3("Rotation (deg)", transform.rotation, -360.0f, 360.0f);
+        ScaleSliderUi("Scale", transform.scale);
+        ImGui::PopID();
+    }
 
-                if (m_activeAnimation.has_value()) {
-                    const SceneAnimation &animation = animations[m_activeAnimation.value()];
-                    ImGui::Checkbox("Play", &m_animationPlaying);
-                    ImGui::SameLine();
-                    ImGui::Checkbox("Loop", &m_animationLoop);
-                    ImGui::SliderFloat("Speed", &m_animationSpeed, -2.0f, 2.0f);
-                    // Scrubbing while paused is the useful case; dragging while
-                    // playing just gets overwritten on the next frame.
-                    if (ImGui::SliderFloat("Time", &m_animationTime, 0.0f,
-                                           animation.duration > 0.0f ? animation.duration
-                                                                     : 1.0f)) {
-                        m_sceneGraph.ApplyAnimation(m_activeAnimation.value(),
-                                                    m_animationTime);
-                    }
-                    ImGui::Text("%.3f / %.3f s, %zu channels", m_animationTime,
-                                animation.duration, animation.channels.size());
-                    if (animation.skippedChannels != 0) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
-                                           "%zu channel(s) skipped (morph weights "
-                                           "are not supported)",
-                                           animation.skippedChannels);
-                    }
+    void GLTFAdapter::ShowManifestUi() {
+        // Where this scene came from, and the way back. Without this the
+        // sliders are worth little: a placement found by dragging is lost on
+        // exit, and the next run starts from the authored origin again.
+        const bool haveManifest = !m_manifest.sourcePath.empty();
+        if (haveManifest) {
+            ImGui::Text("Manifest: %s", m_manifest.sourcePath.c_str());
+        } else {
+            ImGui::TextUnformatted("Manifest: none (loaded from paths)");
+        }
+
+        // Off by default for a scene that was being framed automatically:
+        // pinning the camera changes what the next run looks like, and that is
+        // a decision rather than a side effect of saving a placement.
+        ImGui::Checkbox("Save the camera too", &m_saveCamera);
+        if (m_saveCamera) {
+            ImGui::TextDisabled("the next run opens on this view instead of "
+                                "framing the scene");
+        }
+
+        // The default name is the one the application looks for when nothing is
+        // set, so saving here and restarting is enough to get the placement
+        // back -- no environment variable in between, which is the whole point.
+        const std::string target =
+            haveManifest ? m_manifest.sourcePath : std::string(kDefaultSceneManifest);
+        char label[320];
+        std::snprintf(label, sizeof(label), "Save to %s", target.c_str());
+        if (ImGui::Button(label)) {
+            SceneManifest manifest = CurrentManifest();
+            std::string error;
+            if (SaveSceneManifest(target, manifest, &error)) {
+                manifest.sourcePath = target;
+                m_manifest = manifest;
+                m_manifestStatus = "saved " + target;
+            } else {
+                m_manifestStatus = error;
+            }
+        }
+        if (!m_manifestStatus.empty()) {
+            ImGui::TextDisabled("%s", m_manifestStatus.c_str());
+        }
+    }
+
+    void GLTFAdapter::ScaleSliderUi(const char *label, float &scale) {
+        // Logarithmic, and over six decades. A units mismatch is a factor of
+        // 100 (an asset authored in centimetres) or 1/100, sometimes 0.0254
+        // (inches), so the useful values are spread over orders of magnitude --
+        // on a linear slider from 0 to 100 everything below 1 is the leftmost
+        // pixel.
+        ImGui::PushID(label);
+        ImGui::SliderFloat(label, &scale, 0.001f, 1000.0f, "%.4f",
+                           ImGuiSliderFlags_Logarithmic);
+        ImGui::SameLine();
+        // Getting back to exactly 1 by dragging a log slider is luck, and 1 is
+        // the value worth returning to: it means "the size it was authored".
+        if (ImGui::SmallButton("1x")) {
+            scale = 1.0f;
+        }
+        ImGui::PopID();
+        // Clamped rather than trusted. Zero collapses the scene to a point and
+        // makes every world matrix singular, and ComputeJointMatrices inverts
+        // the skinned node's -- so a skinned character would come out as NaNs
+        // rather than as something very small.
+        scale = std::max(scale, 1e-4f);
+    }
+
+    void GLTFAdapter::ShowSceneFileUi(std::size_t index) {
+        if (index >= m_scenes.size()) {
+            return;
+        }
+        LoadedScene &scene = m_scenes[index];
+
+        // Keyed on the index: two files can have the same name, and a
+        // collapsing header is identified by its label.
+        ImGui::PushID(static_cast<int>(index));
+
+        // Off hides this file's geometry AND its lights: it drops out of the
+        // draw order, out of both shadow halves and out of the light upload,
+        // rather than being drawn somewhere invisible. That makes it the way to
+        // answer "which of these files is that", and the way to see what the
+        // set looks like without the character standing in it.
+        ImGui::Checkbox("Visible", &scene.placement.visible);
+
+        // Where this file sits, how it is turned and how big it is, on top of
+        // the whole scene's placement above. This is what loading files
+        // separately buys: the character can be placed in the set without the
+        // set moving with it.
+        TransformUi("placement", scene.placement);
+        ImGui::Text("%zu node(s), %zu image(s)", scene.nodeCount, scene.imageCount);
+        // The whole path, since the header only has room for the file name and
+        // two exports of the same character are told apart by their directory.
+        ImGui::TextDisabled("%s", scene.path.c_str());
+
+        const auto &animations = m_sceneGraph.Animations();
+        if (scene.animationCount == 0) {
+            ImGui::TextUnformatted("No animations in this file.");
+            ImGui::PopID();
+            return;
+        }
+
+        // "none" restores the authored pose, which is the only way to see the
+        // bind pose once playback has started.
+        const char *current = scene.activeAnimation.has_value()
+                                  ? animations[scene.activeAnimation.value()].name.c_str()
+                                  : "(none -- authored pose)";
+        if (ImGui::BeginCombo("Clip", current)) {
+            if (ImGui::Selectable("(none -- authored pose)",
+                                  !scene.activeAnimation.has_value())) {
+                scene.activeAnimation.reset();
+                // Only this file's nodes; the other files keep playing, and
+                // their next ApplyAnimations re-poses them from the same base.
+                m_sceneGraph.ResetToBasePose();
+            }
+            // This file's own clips only, which is why the loop is over its
+            // slice of the merged list rather than over all of it.
+            for (std::size_t i = scene.animationBase;
+                 i < scene.animationBase + scene.animationCount; ++i) {
+                const bool selected = scene.activeAnimation.has_value() &&
+                                      scene.activeAnimation.value() == i;
+                if (ImGui::Selectable(animations[i].name.c_str(), selected)) {
+                    scene.activeAnimation = i;
+                    scene.animationTime = 0.0f;
                 }
+            }
+            ImGui::EndCombo();
+        }
+
+        if (scene.activeAnimation.has_value()) {
+            const SceneAnimation &animation = animations[scene.activeAnimation.value()];
+            ImGui::Checkbox("Play", &scene.animationPlaying);
+            ImGui::SameLine();
+            ImGui::Checkbox("Loop", &scene.animationLoop);
+            ImGui::SliderFloat("Speed", &scene.animationSpeed, -2.0f, 2.0f);
+            // Scrubbing while paused is the useful case; dragging while
+            // playing just gets overwritten on the next frame.
+            if (ImGui::SliderFloat("Time", &scene.animationTime, 0.0f,
+                                   animation.duration > 0.0f ? animation.duration
+                                                             : 1.0f)) {
+                // Through UpdateAnimation's own path on the next frame for the
+                // other files; applied here so a paused scrub moves the
+                // character while the slider is dragged.
+                m_sceneGraph.ApplyAnimation(scene.activeAnimation.value(),
+                                            scene.animationTime);
+            }
+            ImGui::Text("%.3f / %.3f s, %zu channels", scene.animationTime,
+                        animation.duration, animation.channels.size());
+            if (animation.skippedChannels != 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                                   "%zu channel(s) skipped (morph weights "
+                                   "are not supported)",
+                                   animation.skippedChannels);
+            }
+        }
+        ImGui::PopID();
+    }
+
+    void GLTFAdapter::ShowSceneUi() {
+        // The whole scene: every file is placed inside this, so moving,
+        // turning or resizing it takes every file with it. Under a header of
+        // its own, because the Scene tab also carries the camera's position and
+        // two unlabelled position sliders in one panel is a guess.
+        if (ImGui::CollapsingHeader("All glTF files",
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+            TransformUi("scene", m_sceneTransform);
+        }
+        ImGui::Separator();
+        ShowManifestUi();
+        ImGui::Separator();
+
+        // One section per loaded file, each with its own visibility, placement
+        // and animation playback. A single file keeps its section open, so
+        // nothing moved for the common case.
+        if (m_scenes.empty()) {
+            ImGui::TextUnformatted("No glTF file loaded.");
+        }
+        for (std::size_t i = 0; i < m_scenes.size(); ++i) {
+            char header[320];
+            // The header says whether the file is showing, so a hidden one is
+            // obvious with its section collapsed -- otherwise an empty frame
+            // and a file switched off look the same.
+            std::snprintf(header, sizeof(header), "%s%s##file%zu",
+                          m_scenes[i].label.c_str(),
+                          m_scenes[i].placement.visible ? "" : "  (hidden)", i);
+            if (ImGui::CollapsingHeader(header, ImGuiTreeNodeFlags_DefaultOpen)) {
+                ShowSceneFileUi(i);
             }
         }
         ImGui::Separator();

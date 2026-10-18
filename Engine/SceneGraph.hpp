@@ -20,9 +20,25 @@
 #include <string>
 #include <vector>
 
+#include "SceneManifest.hpp"
 #include "SimpleMath.h"
 
 namespace NeuralModelIntegrateTestbed {
+
+// Composes one file's placement -- see SceneTransform -- into the matrix
+// SetAssetPlacement takes.
+//
+// Scale, then rotation, then translation, in the row-vector order this project
+// uses throughout: the same order NodeTransform::ToMatrix composes a glTF
+// node's own TRS in, so a placement behaves exactly as a parent node would.
+// It also keeps the translation in world units, which the reverse order would
+// multiply by the scale -- halving the scale would then halve the distance the
+// file had been moved.
+//
+// Rotation arrives as XYZ Euler angles in DEGREES, which is what the manifest
+// holds and what the sliders show; this is the one place that turns them into a
+// matrix, so there is nowhere for two conventions to disagree.
+DirectX::SimpleMath::Matrix PlacementMatrix(const SceneTransform& transform);
 
 // The texture slots of a glTF metallic-roughness material, in the order they
 // occupy the shader's SRV descriptor table (t0..t4).
@@ -634,9 +650,18 @@ class SceneNode {
 public:
     std::string name;
 
-    // Index into Asset::nodes. SceneGraph keeps its node array parallel to the
-    // asset's, so this doubles as the node's own index.
+    // This node's own index in SceneGraph::Nodes(). With one asset loaded the
+    // node array is parallel to Asset::nodes, so it is also the asset's node
+    // index; with several appended it is not -- each asset's nodes are offset
+    // by however many were already in the graph. `assetNodeIndex` below is the
+    // asset-local one.
     std::size_t gltfNodeIndex = 0;
+
+    // Which appended asset this node came from, and its index within that
+    // asset's own Asset::nodes. Both are 0-based and, for a graph built from a
+    // single asset, assetIndex is 0 and assetNodeIndex == gltfNodeIndex.
+    std::size_t assetIndex = 0;
+    std::size_t assetNodeIndex = 0;
 
     // The node's own transform, from its TRS or matrix, converted once at build
     // time. Row-vector convention, as DirectXMath expects. Overwritten by
@@ -703,18 +728,75 @@ public:
 
 class SceneGraph {
 public:
-    // Resolves the scene's nodes and their primitives' buffer views.
+    // Resolves the scene's nodes and their primitives' buffer views, discarding
+    // anything already in the graph.
     // `buffers` are the uploaded glTF buffers, indexed as Asset::buffers is;
     // `imageDescriptorCount` bounds the base-colour image indices so a malformed
     // asset cannot produce an out-of-range descriptor lookup at draw time.
+    //
+    // Equivalent to Clear() followed by one Append of asset 0, which is what
+    // every caller loading a single file wants.
     void Build(const fastgltf::Asset& asset,
                std::size_t sceneIndex,
                const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& buffers,
                std::size_t imageDescriptorCount);
 
+    void Clear();
+
+    // Appends one more asset's scene, keeping everything already in the graph.
+    // This is how a character in one glTF and the set it stands in in another
+    // end up as one hierarchy, one draw order and one set of lights -- so they
+    // share the material heap, the lightmap atlas and the cascade fit instead
+    // of each needing its own.
+    //
+    // Every index the asset carries is asset-local and is offset on the way in:
+    // node children and parents, skin joints, animation channel targets, and a
+    // material's texture indices, which move by `imageDescriptorBase` so two
+    // assets' images cannot be confused. `imageDescriptorCount` is how many
+    // images THIS asset has, the same bound Build applies.
+    //
+    // `assetIndex` selects which SetAssetPlacement transform this asset's roots
+    // are composed onto. Returns the index of the first node appended, which is
+    // the offset this asset's own node indices moved by.
+    std::size_t Append(const fastgltf::Asset& asset,
+                       std::size_t sceneIndex,
+                       const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& buffers,
+                       std::size_t imageDescriptorBase,
+                       std::size_t imageDescriptorCount,
+                       std::size_t assetIndex);
+
+    // Where one appended asset sits, applied inside `rootTransform`: a node's
+    // world transform is its local chain, then its asset's placement, then the
+    // root transform. Identity for an asset that was never given one, so a
+    // single-asset graph behaves exactly as it did before placements existed.
+    //
+    // Separate from the node hierarchy on purpose: putting it in a synthetic
+    // parent node would renumber every node in the asset.
+    void SetAssetPlacement(std::size_t assetIndex,
+                           const DirectX::SimpleMath::Matrix& placement);
+    const DirectX::SimpleMath::Matrix& AssetPlacement(std::size_t assetIndex) const;
+    std::size_t AssetCount() const { return m_assetPlacements.size(); }
+
+    // Whether one appended asset is shown. False takes its whole subtree out of
+    // the draw order, out of both shadow halves and out of the light upload, by
+    // entering its roots as hidden -- which is the same mechanism
+    // SceneNode::visible uses, so an asset switched off cannot be drawn by one
+    // pass and skipped by another.
+    //
+    // It does not clear the per-node flags, so switching an asset back on
+    // restores exactly what was showing before.
+    void SetAssetVisible(std::size_t assetIndex, bool visible);
+    bool AssetVisible(std::size_t assetIndex) const;
+
+    // The placement that applies to `nodeIndex`, i.e. its asset's. Retargeting
+    // needs it: it composes a node's authored ancestor chain by hand, and the
+    // placement is part of that chain without being a node in it.
+    const DirectX::SimpleMath::Matrix& PlacementForNode(std::size_t nodeIndex) const;
+
     // Walks roots to leaves, composing each node's local transform onto its
     // parent's world transform. `rootTransform` is applied outermost, so it
-    // behaves as the whole scene's placement.
+    // behaves as the whole scene's placement; each asset's own placement sits
+    // just inside it.
     void UpdateTransforms(const DirectX::SimpleMath::Matrix& rootTransform);
 
     bool Empty() const { return m_nodes.empty(); }
@@ -777,6 +859,26 @@ public:
     //
     // Returns false for an out-of-range index, having changed nothing.
     bool ApplyAnimation(std::size_t animationIndex, float time);
+
+    // One clip being played, for ApplyAnimations below.
+    struct ActiveAnimation {
+        std::size_t animationIndex = 0;
+        float time = 0.0f;
+    };
+
+    // The same, for several clips at once. Needed because the graph may hold
+    // more than one asset and each has its own playback: a walking character in
+    // one file and a turning fan in another are two clips running together, not
+    // a choice between them.
+    //
+    // Every clip starts from the SAME authored pose -- the reset is done once,
+    // not per clip -- so two clips targeting the same node is last-one-wins per
+    // component rather than either one being composed onto the other's output.
+    // Clips from different assets cannot overlap at all, since no node belongs
+    // to two assets.
+    //
+    // Returns false if any index is out of range, having changed nothing.
+    bool ApplyAnimations(const std::vector<ActiveAnimation>& active);
 
     // Restores every node to the TRS the asset authored.
     void ResetToBasePose();
@@ -855,11 +957,13 @@ private:
     void BuildPrimitives(const fastgltf::Asset& asset,
                          const fastgltf::Mesh& mesh,
                          const std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>& buffers,
+                         std::size_t imageDescriptorBase,
                          std::size_t imageDescriptorCount,
                          std::vector<PrimitiveResource>& out);
 
     void ResolveMaterial(const fastgltf::Asset& asset,
                          const fastgltf::Material& material,
+                         std::size_t imageDescriptorBase,
                          std::size_t imageDescriptorCount,
                          PrimitiveResource& res) const;
 
@@ -877,17 +981,28 @@ private:
 
     // Resolves Asset::skins into m_skins and links the nodes that reference
     // them. Runs after the nodes exist, since it range-checks joint indices
-    // against them.
-    void BuildSkins(const fastgltf::Asset& asset);
+    // against them. `nodeBase` and `skinBase` are where this asset's nodes and
+    // skins start in the merged arrays.
+    void BuildSkins(const fastgltf::Asset& asset,
+                    std::size_t nodeBase,
+                    std::size_t skinBase);
 
     // Copies every animation's keyframes to the CPU. Runs after the nodes
     // exist, since channel targets are range-checked against them.
-    void BuildAnimations(const fastgltf::Asset& asset);
+    void BuildAnimations(const fastgltf::Asset& asset,
+                         std::size_t nodeBase,
+                         std::size_t animationBase);
     // Flags every node whose world transform can change. Runs last: it needs
     // the animations parsed, the skins resolved and the parent links set.
     void MarkMovingNodes();
 
     std::vector<SceneNode> m_nodes;
+    // One per appended asset, indexed by SceneNode::assetIndex. Grown by
+    // Append, so an asset always has an entry even if nothing ever places it.
+    std::vector<DirectX::SimpleMath::Matrix> m_assetPlacements;
+    // Parallel to m_assetPlacements. Not a bitset: this is read once per root
+    // per frame, and std::vector<bool> here would buy nothing but surprise.
+    std::vector<char> m_assetVisible;
     std::size_t m_staticGeometryNodes = 0;
     std::size_t m_movingGeometryNodes = 0;
     std::vector<SceneLight> m_lights;

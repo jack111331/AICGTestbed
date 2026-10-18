@@ -112,6 +112,23 @@ cc_library(
     deps = [":pch"],
 )
 
+# The JSON scene manifest: which glTF files make up a scene and where each one
+# sits. No D3D12 and no fastgltf, so the smoke test covers the parser directly
+# -- which matters because every way a hand-written manifest can be wrong has to
+# come back as a message naming the field rather than as a missing building.
+#
+# simdjson comes from the fastgltf checkout, which vendors it and exposes it as
+# its own target; depending on that costs nothing to build and saves adding a
+# vcpkg port that would have to be installed by hand.
+cc_library(
+    name = "SceneManifest",
+    srcs = ["SceneManifest.cc"],
+    hdrs = ["SceneManifest.hpp"],
+    defines = SAMPLE_DEFINES,
+    includes = ["."],
+    deps = ["@fastgltf//:simdjson"],
+)
+
 # Retargeting HumanML3D motion onto a rigged glTF character: a port of the
 # KeeMap Blender addon that momask-codes' README uses, driven by the bone
 # mapping tools/prepare_retarget.py converts from momask's assets/mapping.json.
@@ -138,6 +155,7 @@ cc_library(
         ":Descriptors",
         ":GBuffer",
         ":Lightmap",
+        ":SceneManifest",
         ":ShadowCascades",
         ":Ui",
         ":pch",
@@ -449,6 +467,12 @@ cc_binary(
     name = "stb-smoke",
     srcs = ["stb-smoke.cc"],
     deps = ["//third:stb"],
+)
+
+cc_binary(
+    name = "scenemanifest-smoke",
+    srcs = ["scenemanifest-smoke.cc"],
+    deps = [":SceneManifest"],
 )
 
 cc_binary(
