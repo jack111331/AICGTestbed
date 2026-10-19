@@ -1,0 +1,26 @@
+{
+  "name": "Animated character standing in the shadow-test set",
+  "maxTextureDimension": 2048,
+  "camera": {
+    "position": [-22.202, -0.007, 8.096],
+    "target": [-3.881, 1.936, 0.250],
+    "up": [0.0, 1.0, 0.0],
+    "fovDegrees": 45.0
+  },
+  "scenes": [
+    {
+      "path": "resources/lightmap-uv/bistro-baked.gltf",
+      "translation": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "scale": 1.0,
+      "visible": true
+    },
+    {
+      "path": "resources/microphone_and_animated_char/scene_only_animated_char.gltf",
+      "translation": [-19.266, 0.28, 9.091],
+      "rotation": [0.0, -212.727, 0.0],
+      "scale": 1.05,
+      "visible": true
+    }
+  ]
+}
