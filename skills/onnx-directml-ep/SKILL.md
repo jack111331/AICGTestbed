@@ -28,12 +28,73 @@ whole process, not a per-session one — and if some other component in your app
 already needs CUDA, you cannot also have DirectML.
 
 **Check the package is still alive.** As of 2026-10 the DirectML redist's
-latest stable was **1.24.4** while the GPU redist was at **1.31.0**. A frozen
+latest stable was **1.24.4**, published 2026-03-17, while core ORT was at
+**1.31.0** (2026-10-09) and had shipped 1.25 through 1.31 in between. A frozen
 package is a signal about where effort is going. Query it rather than assuming:
 
 ```
 https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/index.json
 ```
+
+**And check what "upgrade" would even mean, because for DirectML there is no
+prebuilt newer anything.** Four things to confirm before planning one, all
+cheap and all decisive:
+
+* The **core** package does not carry the DML EP as a fallback. Read the
+  nupkg's zip central directory with a ranged request rather than downloading
+  160 MB of it: `Microsoft.ML.OnnxRuntime` 1.31.0 ships `cpu_provider_factory.h`
+  and no `dml_provider_factory.h`, and `runtimes/win-x64/native/` holds only
+  `onnxruntime.dll` and `onnxruntime_providers_shared.dll`.
+* The **GitHub releases** carry no DirectML asset either, at any recent tag.
+* The **plugin EP** scheme that ORT 1.24 introduced, and that 1.31's notes
+  defer provider detail to, has published CUDA and WebGPU only
+  (`plugin-ep-cuda/v0.3.0`, `plugin-ep-webgpu/v0.4.0`). There is no DirectML
+  plugin EP.
+* The EP is nonetheless **still in the source tree and still being fixed** —
+  1.31.0's notes mention validating DirectML upload-heap allocations. So the
+  only route to a newer DML EP is a from-source build with `--use_dml`.
+
+The official position matches: the EP docs say "DirectML is in sustained
+engineering" — supported, but new feature work has moved to WinML, which wraps
+the same ORT APIs and **chooses** the provider for you. That last part is the
+catch for a renderer: this project hands ORT its own `ID3D12Device`,
+`IDMLDevice` and a private compute queue through
+`SessionOptionsAppendExecutionProvider_DML1` (§8), and an EP that selects
+itself is not obviously able to take them. Price that before treating WinML as
+the migration path.
+
+**We built 1.31.0 from source and it was not worth adopting.** Recorded so the
+next person does not spend the build on it. `v1.31.0` with
+
+```
+python tools\ci_build\build.py --build_dir build\Windows --config Release ^
+  --build_shared_lib --parallel --use_dml --skip_tests --skip_submodule_sync ^
+  --compile_no_warning_as_error ^
+  --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF CMAKE_POLICY_VERSION_MINIMUM=3.5
+```
+
+builds clean on VS 17.14 and CMake 4.2.7, restores `Microsoft.AI.DirectML
+1.15.4` itself, and drops a 24.6 MB `onnxruntime.dll` with the DML EP linked
+in. Staging it needs the headers from `include/onnxruntime/core/session/*.h`
+plus the two provider factories and `core/framework/provider_options.h` — 1.31
+added `onnxruntime_error_code.h` and others the 1.24.4 redist did not have, so
+copy the directory rather than the old file list. Our code compiled against it
+unchanged.
+
+What it bought: **both bugs in §5 reproduce exactly** — the pinned
+`vae_decoder_first` still returns a null for `cache_out_9`, and `IoBinding` on
+`vae_decoder_step` still fails with the same three errors in the same three
+configurations. The denoiser is unchanged (1.64 ms static against 1.7). The
+whole generation was 348.3 ms against 354.1, which is noise. Not worth trading
+a two-constant redist fetch for a local build.
+
+The one real difference is a **trap**, and it is the lesson worth keeping:
+`vae_decoder_step` in isolation went **5.42 → 1.62 ms** a call, and 0.80 ms
+with its `batch` pinned — suddenly beating the CPU's 1.3 ms and apparently
+reversing §5.1. It does not survive the pipeline. Measured end to end with the
+decoders moved back to DirectML, the generation went **348 → 513 ms**: the
+decode total came out at 185 ms rather than the 96 the per-call figure
+predicted, *and denoising rose from 281 to 327 ms*. See §5.1 for why.
 
 **`DirectML.dll` is not in the package.** `onnxruntime.dll` imports it and
 resolves against the in-box `%WINDIR%\System32\DirectML.dll`. The nuspec
@@ -193,6 +254,10 @@ whole exercise.
 | VAE step | 3.3 ms | 1.3 ms |
 | text encoder (1.1 GB) | 46 ms | 9.4 ms |
 
+The VAE row held up when measured properly, over a threaded sequence at the
+shipped shapes rather than one call: 5.4 ms against 1.4. Acting on it was the
+pipeline's biggest win — §5.1.
+
 ### The diagnostic that tells you why, in one table
 
 **Sweep the workload size and watch how the time responds.**
@@ -243,6 +308,218 @@ consumes the output on the GPU (`OrtDmlApi::CreateGPUAllocationFromD3DResource`
 wraps your own `ID3D12Resource` into an `Ort::Value`), and as a *prerequisite*
 for graph capture, which does attack the remaining per-submission cost. So do
 not reach for it first, and do not rule it out either.
+
+**Confirmed end to end, later.** The sampler was then built both ways -- host
+tensors against every denoiser tensor in a D3D12 buffer with `Ort::IoBinding`
+plus the guidance combine and Euler step as a compute shader -- and measured
+over a whole 60-latent generation:
+
+| | total | denoising | VAE decode |
+|---|---|---|---|
+| host round trip | 506.9 ms | 318.9 ms | 187.3 ms |
+| latents on the GPU | 508.7 ms | 53.8 ms | 454.7 ms |
+
+The accounting moves and the total does not. The denoising half gets six times
+cheaper because the device path never waits -- `Run` records and returns -- and
+that time reappears at the one place that does wait, reading a finalised latent
+back for the decoder. **The generation is bound by GPU execution, not by the
+copies**, exactly as the paragraph above predicted.
+
+Both rows had the VAE decoders on DirectML. Moving them to the CPU provider
+(§5.1) later took the host row to 354.1 ms and the device row to 330.5, so the
+binding is worth a few percent once the thing it was competing with is gone --
+still not what the per-call copy saving suggested.
+
+### Timing a device-resident Run: `SynchronizeOutputs` is not a wait
+
+The trap that nearly reversed the conclusion above. With the output already in
+device memory there is nothing for `IoBinding::SynchronizeOutputs()` to copy
+back, so it returns as soon as the work is **submitted**:
+
+```cpp
+session.Run(Ort::RunOptions{nullptr}, binding);
+binding.SynchronizeOutputs();       // records nothing; does NOT wait
+const double ms = Since(began);     // measures submission, not execution
+```
+
+Measured that way, device-resident looked 5x faster than host memory (2.56
+against 13.12 ms). The host path waits because reading the prediction back
+forces it to, so the comparison was a wait against no wait. Signal a fence on
+the queue the EP submits to and wait for it:
+
+```cpp
+queue->Signal(fence.Get(), ++value);
+while (fence->GetCompletedValue() < value) {}
+```
+
+The same comparison then came out 3.0 against 2.0 ms -- a real but much
+smaller difference -- and the whole-generation numbers above showed even that
+not reaching the total. If a device-resident configuration looks several times
+faster, check what you are timing before believing it.
+
+### Where the time actually was
+
+Worth recording because it was not where anyone looked: of a 507 ms generation,
+the VAE decoder was about 190 ms across 60 calls while the denoiser was about
+320 ms across 128.
+
+**The fix was not a better binding. It was the other provider, for that model
+group only** — see §5.1. Pinning the decoder's `batch` looked like the lead and
+was not, and the three measurements that disposed of it are worth more than the
+conclusion, because each one is a mistake that is easy to repeat.
+
+**Measure the call that runs many times, not the one that is convenient.** The
+`1.48 -> 0.47 ms per call` from pinning `batch` (§2) was measured on
+`vae_decoder_first`, which runs **once** per generation. The 59 other calls are
+`vae_decoder_step`, and pinning *its* `batch` is worth nothing measurable: 5.42
+against 5.50 ms a call, which is run-to-run noise. A 3× win on 1/60th of the
+work is a 1 ms win.
+
+**Read the error as a statement about the EP, not about your code.** Pinning
+`batch` on `vae_decoder_first` makes the DML EP return a **null for one of its
+21 outputs** — `cache_out_9` — so the next session's `Run` reports:
+
+```
+Unexpected input data type. Actual: (((null))) , expected: ((tensor(float)))
+```
+
+That was long read as "a statically-shaped session cannot hand its outputs to
+another". It is narrower and worse: a tensor is lost inside the fused graph.
+Check your outputs with `IsTensor()` and the message stops being mysterious.
+
+### 5.0 The null output, root-caused: the EP deletes an initializer that is a graph output
+
+Chased to the line under `cdb` against a Debug `--use_dml` build of 1.31.0,
+because it reproduces there too. Every link below was checked, not inferred.
+
+1. **The model.** `cache_out_9` is the only one of the twenty cache outputs
+   produced by a `ConstantOfShape`; the other nineteen are `Slice`s.
+   `cache_out_14` is an `Identity` of it.
+2. **Constant folding converts it to an initializer.** Pinning `batch` makes
+   the `ConstantOfShape`'s shape input (`val_48`) statically computable, so
+   ORT's `ConstantFolding` evaluates the node and replaces its output with a
+   graph initializer *of the same name* — `constant_folding.cc`,
+   `graph.AddInitializedOrtValue`. Nothing there checks that the folded output
+   is also a **graph output**. That is legal on its own: an initializer that is
+   a graph output is valid ONNX, and the CPU EP serves it correctly.
+3. **The DirectML EP then deletes it.** Graph fusion collects partition inputs
+   that are initializers into `isInitializerTransferable`, marked removable
+   (`DmlGraphFusionTransformer.cpp`), and
+   `DmlGraphFusionHelper::ProcessInputData` hits the branch commented *"If the
+   input isn't actually used by the graph, nothing ever needs to be bound"* —
+   `if (!inputsUsed[i]) { graph.RemoveInitializedTensor(...) }`. It is unused
+   because the one consumer, the `Identity` behind `cache_out_14`, was folded
+   away too. The stack is unambiguous:
+
+   ```
+   onnxruntime!onnxruntime::Graph::RemoveInitializedTensor
+   onnxruntime!Dml::DmlGraphFusionHelper::ProcessInputData+0xe2b
+   onnxruntime!Dml::DmlGraphFusionHelper::FusePartitionAndRegisterKernel+0x6ea
+   onnxruntime!Dml::DmlGraphFusionTransformer::ApplyImplHelper+0x1ed7
+   onnxruntime!onnxruntime::InferenceSession::TransformGraph+0x2f72
+   ```
+4. **Nothing guards it.** `Graph::RemoveInitializedTensor` erases the entry
+   from `name_to_initial_tensor_` and from the proto with no check that the
+   name is in `graph.GetOutputs()`.
+5. So the session output has neither a producer node nor an initializer, and
+   the fetched `OrtValue` is empty. `IsTensor()` is false, and `Get<Tensor>()`
+   throws the `(((null)))` message above.
+
+**The defect is step 3** — the EP may not delete an initializer that is a graph
+output — and it is latent because it needs all of: folding that produces an
+initializer, that initializer also being a graph output, and the fused
+partition not consuming it.
+
+Two things fall out that are worth having:
+
+* **The workaround is one config entry**, and it does unblock the pin:
+  `optimization.disable_specified_optimizers` = `ConstantFolding` (the key is
+  `kOrtSessionOptionsDisableSpecifiedOptimizers`). With it, no `cache_out_*` is
+  ever passed to `RemoveInitializedTensor` and all 21 outputs come back. We do
+  not use it: it costs the rest of constant folding, and the pinned DirectML
+  decode is still 4.45 ms a call against the CPU's 1.36 (§5.1).
+* **How to confirm this class of bug quickly.** Break on
+  `onnxruntime!onnxruntime::Graph::RemoveInitializedTensor` and print the name;
+  if anything your session is supposed to output appears there, this is your
+  bug. In a Debug build the STL string has a container-proxy pointer first, so
+  the characters are at `+0x08` and the capacity at `+0x20`, not `+0x00` and
+  `+0x18`:
+
+  ```
+  bm onnxruntime!onnxruntime::Graph::RemoveInitializedTensor ".block {
+       .if (poi(@rdx+0x20) > 0xf) { r $t0 = poi(@rdx+0x8) } .else { r $t0 = @rdx+0x8 };
+       .printf \"REMOVED %ma\\n\", @$t0; gc }"
+  ```
+
+  Use `bm`, not `bp`: at the initial break the symbol may not be resolvable
+  yet. Drive `cdb` with `-cf <script>` from a shell that does not rewrite
+  quotes — PowerShell mangles the nested `\"` and the breakpoint silently never
+  arms.
+
+**`Ort::IoBinding` is not universally available.** The plan was to remove the
+hand-off entirely by binding the 20 caches to D3D12 buffers both sessions
+share. `IoBinding` on `vae_decoder_step` fails in **every** configuration —
+`batch` pinned or symbolic, fusion on or off — while the identical values
+through the ordinary `Run(names, values, ...)` API work in all of them:
+
+| configuration | `IoBinding` | ordinary `Run` |
+|---|---|---|
+| pinned, fusion on | `Missing Input: cache_in_10` | works |
+| pinned, fusion off | access violation in `Concat` | works |
+| symbolic | `The parameter is incorrect` in `Shape` | works |
+
+The control that settles it: bind the same twenty tensors in **host** memory
+and it fails identically. So it is the binding, not the memory, and no amount
+of device residency gets round it. `vae_decoder_first` — one input, 21 outputs
+— binds fine, so "many bound outputs" is not the trigger; many bound *inputs*
+is. Keep an ordinary-`Run` path working before you build on `IoBinding`.
+
+**This one is NOT root-caused.** It reproduces on 1.31.0 unchanged and we have
+only narrowed it: the pinned+fusion symptom is the same *shape* of failure as
+§5.0 — `OpKernelContext::Input` finds an `OrtValue` that is present but holds
+no tensor — so it may well be another lost tensor rather than a binding
+mismatch. What is already ruled out: the model (`cache_in_10` is consumed by a
+plain `Concat`, exactly like the other nineteen), the memory kind, and fusion
+(it fails with fusion off too, differently). The apparatus in §5.0 is what to
+point at it next.
+
+### 5.1 Pick the provider per model group, not per pipeline
+
+The denoiser wants DirectML and the two decoders want the CPU, in the same
+process, on the same hardware, at the same time:
+
+| | DirectML | CPU |
+|---|---|---|
+| `vae_decoder_step`, per call, threaded ×59 | 5.4 ms | 1.4 ms |
+
+End to end at 60 latents that is a generation of **512.3 ms → 354.1 ms**, with
+the decode total going **188.5 ms → 69.2 ms**. It is the largest single saving
+found in this pipeline, it needed no re-export, no binding and no new
+synchronisation, and it took one extra `SessionOptions`.
+
+Part of the mechanism is the one §5 names — the decoder is a small graph run
+with a batch of one, so it never fills the GPU — but that is **not the main
+reason, and believing it will mislead you.** The from-source 1.31 build proved
+it: there, the decoder's isolated per-call cost beat the CPU's (0.80 ms against
+1.3) and moving it to DirectML still made the generation 165 ms *slower*.
+
+The real reason is that **the CPU is a second processor and the GPU queue is
+not.** Every session in this pipeline shares one compute queue, because that is
+what orders a decode after the denoising step that produced its latent without
+a fence (§8). So a DirectML decode does not merely cost its own time: it queues
+behind the denoiser, and the denoiser then queues behind it. That is visible in
+the end-to-end pair — moving the decoders to DirectML raised the DECODE from 69
+to 185 ms *and the denoising from 281 to 327*, neither of which a per-call
+benchmark on an idle queue can show. On the CPU provider the decode runs on
+cores that were otherwise idle, concurrently with GPU denoising, and costs the
+critical path almost nothing.
+
+Two things follow. **A per-call benchmark of one session predicts nothing about
+a pipeline that shares a queue** — measure the whole generation, both halves
+reported separately, which is what localises this. And the provider is worth
+making a per-model decision with its own measurement: a model may belong on the
+CPU because the GPU is busy with something more valuable, not because it is
+slow there. Ours has three such decisions: sampler, prompt encoder, decoders.
 
 ---
 
@@ -527,4 +804,10 @@ a file when verifying something inside a windowed application.
    switch.
 10. Drain the GPU before resetting an allocator; expect queue contention with
    rendering.
-11. Separate cold from warm timings, and keep the provider selectable per model.
+11. Separate cold from warm timings, and keep the provider selectable per
+   model *group* — measure each one, because the answer differs within one
+   pipeline.
+12. Time the call that runs many times. A 3x win on the once-per-generation
+   model is worth a millisecond.
+13. Before building on `Ort::IoBinding`, check the same tensors go through the
+   ordinary `Run` API, and keep that path working.

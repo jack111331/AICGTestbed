@@ -27,6 +27,55 @@ _DXC_DEBUG_FLAGS = select({
 
 _DXC_PATH = "\"C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\dxc.exe\""
 
+def hlsl_compute(name, src, entries, library, profile = "6_0", out = None):
+    """Compiles compute shaders out of one HLSL file.
+
+    Separate from hlsl_shader rather than a flag on it: that rule compiles a
+    VS and a PS for every entry it is given, which is the wrong shape for a
+    compute shader, and it hardcodes the cc_library name so a second call would
+    collide with the first.
+
+    Args:
+      name:    target name; also the genrule that runs dxc.
+      src:     the .hlsl file, relative to Engine/.
+      entries: {entry point: C symbol}. "CSLatentStep": "g_latent_step"
+               compiles that entry into g_latent_step_bytecode.
+      library: the cc_library name consumers depend on.
+      profile: shader model, without the cs_ prefix.
+      out:     generated header name; defaults to <name>.h.
+    """
+    if not out:
+        out = name + ".h"
+    if not entries:
+        fail("hlsl_compute(%s): `entries` must name at least one entry point" % name)
+
+    src_path = "Engine/" + src
+
+    cmd = ": > $(OUTS)"
+    for entry, symbol in entries.items():
+        part = "$(OUTS)." + entry
+        cmd = cmd + (
+            " && " + _DXC_PATH + " -T cs_" + profile + " -E " + entry + " "
+        ) + _DXC_DEBUG_FLAGS + (
+            " -Fh " + part + " -Vn " + symbol + "_bytecode " + src_path +
+            " && cat " + part + " >> $(OUTS)"
+        )
+
+    native.genrule(
+        name = name,
+        srcs = [src],
+        outs = [out],
+        cmd = cmd,
+        visibility = ["//visibility:private"],
+    )
+
+    cc_library(
+        name = library,
+        hdrs = [":" + name],
+        includes = ["."],
+        visibility = ["//visibility:public"],
+    )
+
 def hlsl_shader(name, src, entries, profile = "6_0", out = None):
     """Compiles one or more vertex/pixel shader pairs out of a single HLSL file.
 

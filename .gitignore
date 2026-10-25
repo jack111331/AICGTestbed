@@ -37,6 +37,12 @@
 # committing a binary into history. See README.md.
 /third/onnxruntime/
 
+# A from-source `--use_dml` build staged here to test whether a newer DML EP
+# fixes the two bugs in skills/onnx-directml-ep/SKILL.md section 5. It does
+# not, so this is a spare rather than the dependency; swapping it in is a
+# directory rename. Delete it freely -- rebuilding it is in the skill.
+/third/onnxruntime-*/
+
 # ---------------------------------------------------------------------------
 # FloodDiffusion ONNX models
 # ---------------------------------------------------------------------------
@@ -141,3 +147,8 @@ desktop.ini
 # machine -- often a scene outside the repository -- so it is local by nature.
 # scenes.example.json IS tracked, as the thing to copy.
 /scenes.json
+
+# ONNX Runtime profiling output. //Engine:fd-probe section 8 enables profiling
+# to count how many nodes the DirectML EP dispatches, and ORT names each file
+# after the run's timestamp, so they accumulate wherever the probe was run.
+/fd_*.json

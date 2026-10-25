@@ -31,8 +31,10 @@
 // latents it finalised get decoded and appended.
 //
 // Either execution provider runs these models, and the choice is per
-// generation (FloodDiffusionOptions::device, and textEncoderDevice for the
-// prompt encoder separately).
+// generation and per model group: FloodDiffusionOptions::device for the
+// denoiser, textEncoderDevice for the prompt encoder, vaeDevice for the two
+// decoders. They are separate because the answer is genuinely different for
+// each -- the denoiser wants DirectML, the other two want the CPU.
 //
 // The first export could only run on the CPU: the DirectML EP faulted on the
 // attention mask, which was built inside the graph from context_lens by a
@@ -44,6 +46,11 @@
 //   denoiser           37-40 ms        1.4-10.5 ms
 //   VAE step            3.3 ms          1.3 ms
 //   text encoder       46 ms           9.4 ms
+//
+// Those were one-off per-call numbers and the VAE row has since been measured
+// properly, over a threaded sequence at the shipped length: 5.4 ms a call on
+// DirectML against 1.4 on the CPU. It held, and it is why the decoders now
+// default to the CPU provider -- see FloodDiffusionOptions::vaeDevice.
 //
 // So DirectML WORKS but is currently slower, and the reason is visible in the
 // shape of the numbers: the denoiser costs the same 40 ms whether one latent
@@ -176,6 +183,33 @@ struct FloodDiffusionOptions {
     // Exponential moving average over output joint positions. 1 is off.
     float smoothingAlpha = 1.0f;
 
+    // Motion frames to keep decoded ahead of the frame a consumer has reached.
+    // Non-zero takes decoding OUT of Step and makes it the caller's, through
+    // DecodeAhead; zero decodes every finalised latent inside Step, which is
+    // what a batch generation wants.
+    //
+    // This is the difference between generating a clip and streaming one. The
+    // sampler finishes long before playback does -- at 60 latents it produces
+    // 11.85 s of motion in about 2.1 s -- and eager decoding therefore pays
+    // all sixty decodes during that burst, whether or not anyone watches the
+    // motion. Paced, a stream needs one vae_decoder_step per four motion
+    // frames, which at 20 fps is five decodes a second however far ahead the
+    // sampler has got.
+    //
+    // It does not reduce the total work for a clip watched to the end; what it
+    // changes is WHEN the work happens, and that decoding a latent nobody
+    // reaches never happens at all. Both halves stay strictly in order, so
+    // this defers decoding and never skips or reorders it.
+    //
+    // The number is the slack that absorbs a slow frame. Four frames is one
+    // latent, so it has to be more than that; twelve is 0.6 s of motion, and
+    // the burst at the start is bounded by it -- three decodes, once.
+    //
+    // WITH THIS SET, Step DECODES NOTHING, so a caller that never calls
+    // DecodeAhead will denoise to the end and then report IsRunning() forever,
+    // because the generation is not finished until the motion exists.
+    int decodeAheadFrames = 0;
+
     // Where the denoiser and the VAE decoders run. DirectML needs the device
     // pointers to have been passed to Load.
     FloodDiffusionDevice device = FloodDiffusionDevice::DirectML;
@@ -188,6 +222,50 @@ struct FloodDiffusionOptions {
     // same split for the same reason (its --text-encoder-device exists to keep
     // the 11 GB umT5-XXL encoder off a small GPU).
     FloodDiffusionDevice textEncoderDevice = FloodDiffusionDevice::Cpu;
+
+    // Where the two VAE decoders run, kept separate from `device` for the same
+    // reason as the prompt encoder: it is a different workload, and the answer
+    // came out the other way round.
+    //
+    // CPU BY DEFAULT, and this is the single largest saving in the pipeline.
+    // The decode is where a generation's wall time is -- vae_decoder_step runs
+    // 59 times of 60, against the denoiser's 128 -- and the two providers are
+    // not close on it. Measured per call over a threaded sequence of 59,
+    // which is what //Engine:fd-probe section 11 does:
+    //
+    //   DirectML    5.4 ms per call    about 320 ms for 59
+    //   CPU         1.4 ms per call    about  80 ms for 59
+    //
+    // So it is roughly 4x, and it is the opposite of the denoiser's answer --
+    // which is why the two are separate options. End to end at 60 latents it
+    // takes the decode total from 188.5 ms to 69.2 ms and the whole generation
+    // from 512.3 ms to 354.1 ms.
+    //
+    // THE REASON IS NOT the small graph failing to fill the GPU, though that
+    // is true of it. It is that the CPU is a SECOND PROCESSOR and this
+    // pipeline's compute queue is not: every session shares that one queue,
+    // because that is what orders a decode after the denoising step that
+    // produced its latent without a fence. A DirectML decode therefore queues
+    // behind the denoiser and the denoiser queues behind it -- moving the
+    // decoders back to DirectML raises the decode from 69 to 185 ms AND the
+    // denoising from 281 to 327. On the CPU the decode runs on cores that were
+    // idle anyway, concurrently with the GPU, and costs the critical path
+    // almost nothing.
+    //
+    // Which is why the per-call figures above are the weaker evidence. A
+    // from-source ORT 1.31 build takes the DirectML decode to 1.62 ms a call,
+    // and 0.80 ms with `batch` pinned -- beating the CPU outright -- and the
+    // generation measured 513 ms against this path's 348 all the same. See
+    // skills/onnx-directml-ep/SKILL.md section 5.1.
+    //
+    // Pinning the decoders' `batch` is NOT the lever it looked like, and the
+    // write-up is on vaeDims in Load: the 1.48 -> 0.47 ms in fd-probe section
+    // 6 was measured on vae_decoder_first, which runs ONCE per generation, so
+    // it is worth a millisecond rather than sixty.
+    //
+    // It costs nothing in plumbing. The decoder has always read its latent
+    // from host memory, so a CPU session is what it was already being fed.
+    FloodDiffusionDevice vaeDevice = FloodDiffusionDevice::Cpu;
 
     // Pin every symbolic input dimension so ONNX Runtime's DirectML EP can
     // compile the graph instead of dispatching it operator by operator.
@@ -217,6 +295,63 @@ struct FloodDiffusionOptions {
     //
     // No effect on the CPU provider, which does not fuse.
     bool staticShapes = false;
+
+    // Keep the latents in GPU memory for the whole generation, and run the
+    // guidance combine and the Euler step there as a compute shader, instead
+    // of reading the prediction back and uploading the latents again.
+    //
+    // OFF BY DEFAULT, AND THE REASON IS WORTH READING BEFORE TURNING IT ON.
+    //
+    // The round trip looks like it should be expensive. With host-memory
+    // tensors ONNX Runtime copies all five denoiser inputs up and the
+    // prediction back on every Run, and at the shipped shapes that is 772 KB
+    // per step of which effectively all is the text context -- a buffer that
+    // does not change for a whole generation and is re-sent 128 times.
+    //
+    // Measured end to end at 60 latents on an RTX 5080, with the decoders on
+    // DirectML as they were when this was written, it bought nothing:
+    //
+    //   host round trip          506.9 ms     denoising 318.9  decode 187.3
+    //   latents kept on the GPU  508.7 ms     denoising  53.8  decode 454.7
+    //
+    // The accounting moves and the total does not. The denoising half gets six
+    // times cheaper because this path never waits -- Run records and returns
+    // -- so the time reappears at the one place that does wait, the readback
+    // of a finalised latent for the decoder. The generation is bound by GPU
+    // execution, not by the copies, which is what
+    // skills/onnx-directml-ep/SKILL.md already said about binding and which
+    // this confirms at the shipped shapes rather than the probe's small ones.
+    //
+    // WITH vaeDevice ON THE CPU, which is now the default, the same pair reads
+    //
+    //   host round trip          354.1 ms     denoising 284.1  decode  69.2
+    //   latents kept on the GPU  330.5 ms     denoising  54.3  decode 276.0
+    //
+    // so it is now worth a few percent of the total as well. The resident
+    // column's decode is still most of its time for the reason above: that is
+    // where the generation waits for the denoising the GPU is actually doing.
+    //
+    // It would be worth having even at parity, for three reasons that are not
+    // speed:
+    //   * the sampler's arithmetic is where the data is, so the only thing
+    //     crossing the bus per step is a 520-byte noise ramp;
+    //   * device-resident tensors are the entry fee for
+    //     ep.dml.enable_graph_capture, which host memory cannot use at all;
+    //   * it is the half of a fully device-resident pipeline that is done.
+    //     The other half will not be: the VAE decoders are faster on the CPU
+    //     provider than on DirectML, and Ort::IoBinding refuses
+    //     vae_decoder_step outright. See vaeDevice and vaeDims in Load.
+    //
+    // Needs DirectML and staticShapes: the buffers are created once with the
+    // pinned shapes, and a growing `time` would mean rebuilding them and the
+    // IoBinding every step. Load fails rather than falling back silently.
+    //
+    // The motion is identical, not merely close: measured at 0.00000 m of
+    // joint difference over a whole take, because the shader does the same
+    // arithmetic in the same order. //Engine:flooddiffusion-smoke asserts it
+    // to within a centimetre, which is the tolerance that would catch a
+    // transposed index rather than float noise.
+    bool gpuLatents = false;
 };
 
 // Load once, then Begin a prompt and Step it. Holds the four sessions, the
@@ -298,9 +433,14 @@ public:
     // only by failing, never by silently falling back.
     FloodDiffusionDevice Device() const;
     FloodDiffusionDevice TextEncoderDevice() const;
+    FloodDiffusionDevice VaeDevice() const;
 
     // True when the sessions were created with their input dimensions pinned.
     bool StaticShapes() const;
+
+    // True when the latents live in GPU memory for the whole generation. See
+    // FloodDiffusionOptions::gpuLatents.
+    bool GpuLatents() const;
 
     // The latent-frame count this pipeline was loaded for. Only meaningful in
     // static-shape mode, where Begin refuses anything else.
@@ -313,10 +453,27 @@ public:
                const FloodDiffusionOptions& options,
                std::string* error);
 
-    // One denoising step, followed by decoding any latents that step finalised.
-    // Returns false only on a real failure; reaching the end is reported by
-    // Done() rather than as an error, so a frame loop can call this blindly.
+    // One denoising step, followed by decoding any latents that step finalised
+    // -- or, when FloodDiffusionOptions::decodeAheadFrames is set, no decoding
+    // at all, because then it is DecodeAhead's. Returns false only on a real
+    // failure; reaching the end is reported by Done() rather than as an error,
+    // so a frame loop can call this blindly.
+    //
+    // At the shipped schedule this decodes at most ONE latent: 60 latents
+    // finalise over 128 steps, one every other step, so eager decoding is
+    // already spread rather than bunched. What decodeAheadFrames changes is
+    // that the spreading follows playback instead of the sampler.
     bool Step(std::string* error);
+
+    // Decodes as far as a consumer that has reached `consumedFrame` needs,
+    // plus the lookahead the generation was begun with, and no further. Call
+    // it once per tick of whatever is consuming the motion; it is a no-op
+    // without decodeAheadFrames, where Step has already done the decoding.
+    //
+    // Bounded by what the sampler has finalised, so it cannot run ahead of
+    // generation, and it never decodes a latent twice -- FrameCount() says how
+    // much motion came of it. False only on a real failure.
+    bool DecodeAhead(int consumedFrame, std::string* error = nullptr);
 
     bool IsRunning() const;
     bool Done() const;
@@ -328,6 +485,12 @@ public:
     // Frames available so far. Each is JointCount() positions, root first.
     int FrameCount() const;
     int JointCount() const;
+
+    // How far each half of the pipeline has got, in latents. The pair is what
+    // shows pacing working: eager, they move together; paced, the decoder sits
+    // a fixed distance behind the sampler.
+    int DecodedLatents() const;
+    int FinalisedLatents() const;
 
     // Null when `index` is out of range. Valid until the next Step or Begin.
     const DirectX::XMFLOAT3* Frame(int index) const;
@@ -356,6 +519,16 @@ public:
     double LastDecodeMs() const;
     double GenerationMs() const;
     bool TextEncoderLoaded() const;
+
+    // Where a generation's wall time went, summed over the whole thing rather
+    // than the last call. Worth having as a pair: this is what localised the
+    // decode as the pipeline's real cost and then showed the fix working. On
+    // an RTX 5080 at the shipped 60 latents, with the latents on the host, the
+    // decode was 188.5 ms of a 512.3 ms generation with the decoders on
+    // DirectML and is 69.2 ms of 354.1 ms with them on the CPU. See
+    // FloodDiffusionOptions::vaeDevice and ::gpuLatents.
+    double DenoiseTotalMs() const;
+    double DecodeTotalMs() const;
 
     // Ids the prompt tokenised to, and the text they decode back to. For the
     // UI, and for checking a prompt was understood rather than silently turned

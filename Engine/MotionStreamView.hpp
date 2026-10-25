@@ -127,6 +127,12 @@ private:
         DirectX::SimpleMath::Matrix::Identity;
     BindPoseMetrics m_characterMetrics;
     bool m_retargetRootMotion = true;
+
+    // Which of the feature vector's two pose encodings drives the character.
+    // Positions by default: the rotation block does not describe the same pose
+    // on this export, measured at 51.7 degrees of mean scatter by
+    // //Engine:retarget-probe. See the note on RetargetSource.
+    bool m_retargetFromPositions = true;
     bool m_hideSkeletonWhenRetargeting = false;
 
     FloodDiffusionPipeline m_pipeline;

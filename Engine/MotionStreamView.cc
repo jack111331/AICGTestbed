@@ -42,6 +42,22 @@ bool MotionStreamView::Load(const std::filesystem::path& directory,
     // sampler; the checkbox in ShowImgui turns it off.
     m_options.staticShapes = true;
 
+    // Decoding follows the PLAYHEAD here, not the sampler. This view is the
+    // streaming consumer the pipeline was built for: one vae_decoder_step is
+    // four motion frames, which at 20 fps is 0.2 s of playback, so the stream
+    // needs about five decodes a second however far ahead the sampler has run
+    // -- and at 60 latents it runs a long way ahead, finishing 11.85 s of
+    // motion in roughly 2.1 s. Eagerly that spends the whole 70 ms decode
+    // budget inside the generating burst, on motion the viewer has not reached
+    // and may never ask for.
+    //
+    // Twelve frames of lookahead is three latents, 0.6 s of slack: enough that
+    // a dropped frame or two does not starve playback, small enough that the
+    // catch-up at the start of a generation is three decodes rather than
+    // sixty. Update calls DecodeAhead every tick, which is what makes this the
+    // caller's job rather than Step's.
+    m_options.decodeAheadFrames = 12;
+
     if (!std::filesystem::exists(directory / "pipeline.txt")) {
         m_status = "not staged; run tools/prepare_flooddiffusion.py";
         m_hasStatusError = false;
@@ -209,13 +225,25 @@ void MotionStreamView::PoseCharacter() {
         }
     }
 
-    // A WORLD-space target, which is what makes the character stand on the
-    // ground plane: the motion's own root height already places its feet at
-    // about zero, so aiming the hips there puts the feet there too -- provided
-    // the legs are the right length, which the scale above arranges.
+    // In the CHARACTER'S OWN FILE space, not world space. ApplyFrame carries it
+    // out through that file's placement, so the motion follows the glTF it is
+    // retargeted onto: the character travels with the file when it is moved,
+    // turns with it, and its stride scales with it.
+    //
+    // What that means for the offset below: it is a nudge within the character's
+    // file, so a file already placed in the scene needs no offset to undo that
+    // placement. The motion's own root height still places its feet at about
+    // zero, so aiming the hips there puts the feet on the file's ground plane --
+    // provided the legs are the right length, which the scale above arranges.
     DirectX::SimpleMath::Vector3 target(m_retargetOffset.x, m_retargetOffset.y,
                                         m_retargetOffset.z);
     const DirectX::XMFLOAT3* joints = m_pipeline.Frame(m_currentFrame);
+    if (joints == nullptr && m_retargetFromPositions) {
+        // Driving from positions needs them. A frame whose feature vector
+        // exists but whose positions have not been recovered yet is a frame to
+        // skip, not a failure to unbind over.
+        return;
+    }
     if (joints != nullptr) {
         // Height always follows the motion; only travel is optional. Dropping
         // the height with the travel would leave the character sunk at the
@@ -228,7 +256,10 @@ void MotionStreamView::PoseCharacter() {
     }
 
     std::string error;
+    m_retargeter.SetSource(m_retargetFromPositions ? RetargetSource::Positions
+                                                   : RetargetSource::Rotations);
     if (!m_retargeter.ApplyFrame(*m_scene, feature, m_pipeline.Config().motionDim,
+                                 joints,
                                  m_pipeline.FrameRootAngle(m_currentFrame), target,
                                  m_retargetScale, m_scenePlacement, &error)) {
         m_retargetStatus = error;
@@ -295,9 +326,29 @@ void MotionStreamView::Update(float elapsedSeconds) {
                 break;
             }
         }
-        if (!m_pipeline.IsRunning() && !m_hasStatusError) {
-            m_status = "complete";
+    }
+
+    // Then decoding, as far as the playhead needs and no further. Before the
+    // frameCount check below rather than after, because until this runs there
+    // is no motion at all: with decodeAheadFrames set, Step denoises and
+    // decodes nothing.
+    if (m_pipeline.IsRunning()) {
+        std::string error;
+        const int playhead = static_cast<int>(m_playbackTime *
+                                              FloodDiffusionPipeline::kFrameRate);
+        if (!m_pipeline.DecodeAhead(playhead, &error)) {
+            m_status = error;
+            m_hasStatusError = true;
         }
+    }
+    if (!m_pipeline.IsRunning() && !m_hasStatusError && m_pipeline.FrameCount() > 0) {
+        m_status = "complete";
+    } else if (m_pipeline.IsRunning() && !m_hasStatusError &&
+               m_pipeline.StepsTaken() >= m_pipeline.TotalSteps()) {
+        // The sampler is done and the stream is not. What remains is waiting
+        // for the consumer rather than for the GPU, and while playback is
+        // paused it will wait indefinitely -- so "generating" would be a lie.
+        m_status = "streaming";
     }
 
     const int frameCount = m_pipeline.FrameCount();
@@ -431,9 +482,10 @@ void MotionStreamView::ShowPerformanceUi() {
     const FloodDiffusionConfig& config = m_pipeline.Config();
     ImGui::Text("%d joints, chunk %d, %d steps, cfg %.1f", config.joints,
                 config.chunkSize, config.noiseSteps, config.cfgScale);
-    ImGui::Text("sampler on %s, prompt encoder on %s%s",
+    ImGui::Text("sampler on %s, prompt encoder on %s, VAE on %s%s",
                 ToString(m_pipeline.Device()),
                 ToString(m_pipeline.TextEncoderDevice()),
+                ToString(m_pipeline.VaeDevice()),
                 m_pipeline.StaticShapes() ? ", shapes pinned" : "");
     // Worth stating next to the timings: on the GPU path these milliseconds
     // are spent on a queue of the pipeline's own, so they are not frame time.
@@ -447,6 +499,17 @@ void MotionStreamView::ShowPerformanceUi() {
     ImGui::Text("%d motion frames (%.2f s)", m_pipeline.FrameCount(),
                 static_cast<float>(m_pipeline.FrameCount()) /
                     FloodDiffusionPipeline::kFrameRate);
+    // The two halves separately, because with decoding paced to the playhead
+    // they are deliberately not in step: the sampler finishes a long way ahead
+    // and the decoder trails it by the lookahead. Seeing them together is how
+    // a stalled stream -- playback paused, so nothing to decode for -- tells
+    // itself apart from a stalled sampler.
+    if (m_options.decodeAheadFrames > 0) {
+        ImGui::Text("sampler at latent %d, decoder at %d (%d frames ahead of "
+                    "the playhead)",
+                    m_pipeline.FinalisedLatents(), m_pipeline.DecodedLatents(),
+                    m_pipeline.FrameCount() - m_currentFrame);
+    }
 }
 
 void MotionStreamView::ShowNeuralUi() {
@@ -475,6 +538,7 @@ void MotionStreamView::ShowNeuralUi() {
     int samplerDevice = m_options.device == FloodDiffusionDevice::DirectML ? 1 : 0;
     int encoderDevice =
         m_options.textEncoderDevice == FloodDiffusionDevice::DirectML ? 1 : 0;
+    int vaeDevice = m_options.vaeDevice == FloodDiffusionDevice::DirectML ? 1 : 0;
     bool devicesChanged = false;
     if (!canUseGpu) {
         ImGui::TextDisabled("no DirectML device; CPU only");
@@ -495,6 +559,20 @@ void MotionStreamView::ShowNeuralUi() {
                               "prompt. On this export the CPU is about five "
                               "times faster for it and keeps the weights out "
                               "of video memory.");
+        }
+        if (ImGui::Combo("VAE device", &vaeDevice, deviceNames, 2)) {
+            m_options.vaeDevice = vaeDevice == 1 ? FloodDiffusionDevice::DirectML
+                                                 : FloodDiffusionDevice::Cpu;
+            devicesChanged = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            // The one control here where moving work to the GPU makes the
+            // generation slower, so the number is on the tooltip rather than
+            // left to be discovered.
+            ImGui::SetTooltip("The decoder runs 59 times per generation and is "
+                              "about four times faster on the CPU (1.4 ms a "
+                              "call against 5.4), which is most of what the "
+                              "whole generation costs.");
         }
     }
     // Pinning the input dimensions is what lets the DirectML EP compile the
@@ -517,6 +595,34 @@ void MotionStreamView::ShowNeuralUi() {
             "motion differs (mean 0.11 m, max 0.52 m in testing). An export\n"
             "that masks self-attention over the padding would make it exact.\n\n"
             "No effect on the CPU provider, which does not fuse.");
+    }
+
+    // Needs both of the above, so it is offered only when they hold rather
+    // than accepted and then refused by Load.
+    const bool canKeepLatentsOnGpu =
+        m_options.device == FloodDiffusionDevice::DirectML && m_options.staticShapes;
+    ImGui::BeginDisabled(!canKeepLatentsOnGpu);
+    bool resident = m_options.gpuLatents;
+    if (ImGui::Checkbox("keep the latents on the GPU", &resident)) {
+        m_options.gpuLatents = resident;
+        devicesChanged = true;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Binds every denoiser tensor into D3D12 buffers and runs the\n"
+            "guidance combine and the Euler step as a compute shader, so the\n"
+            "latents never leave the GPU and a step sends 520 bytes.\n\n"
+            "It does NOT make a generation faster: 508.7 ms against 506.9 at\n"
+            "60 latents. Denoising drops from 318.9 to 53.8 ms because this\n"
+            "path never waits, and that time reappears in the decoder's\n"
+            "readback. The generation is bound by GPU work, not by copies.\n\n"
+            "The motion is identical. Needs DirectML and pinned shapes.");
+    }
+    if (!canKeepLatentsOnGpu && m_options.gpuLatents) {
+        // Turning off either precondition would otherwise leave an option set
+        // that the next Load refuses outright.
+        m_options.gpuLatents = false;
     }
 
     if (devicesChanged) {
@@ -702,6 +808,19 @@ void MotionStreamView::ShowNeuralUi() {
         }
         ImGui::SameLine();
         ImGui::Checkbox("hide skeleton", &m_hideSkeletonWhenRetargeting);
+
+        ImGui::Checkbox("drive from positions", &m_retargetFromPositions);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("On drives the bones from the same ric joint "
+                              "positions the skeleton overlay is drawn from: "
+                              "bone directions land 0.00 degrees from it and "
+                              "the body faces within 2.2. Off uses the feature "
+                              "vector's 6D rotation block, which "
+                              "//Engine:retarget-probe measures as 51.7 degrees "
+                              "of mean scatter away from describing the same "
+                              "pose -- but which is the only source that "
+                              "carries a limb's roll about its own axis.");
+        }
     }
 
     ImGui::SeparatorText("skeleton lines");

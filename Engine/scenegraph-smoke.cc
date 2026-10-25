@@ -983,7 +983,14 @@ void TestRetargetRotations() {
     // Independent reference: accumulate the same locals down each chain.
     std::vector<Quaternion> expected(static_cast<std::size_t>(joints),
                                      Quaternion::Identity);
-    expected[0] = Quaternion::CreateFromAxisAngle(Vector3::UnitY, rootAngle);
+    // TWICE the angle, because HumanML3D stores the root as (cos a, 0, sin a, 0)
+    // and a unit quaternion whose w is cos(a) turns by 2a. This reference used
+    // to seed cos(a/2) and so pinned the half-rotation the code used to apply;
+    // //Engine:retarget-probe measured the difference (67.0 -> 51.7 degrees of
+    // implied rest-offset scatter), which is what identified it as a bug rather
+    // than a convention. Seeding it right here is what keeps this test an
+    // independent check of the ACCUMULATION rather than of the seed.
+    expected[0] = Quaternion::CreateFromAxisAngle(Vector3::UnitY, 2.0f * rootAngle);
     float worstRotation = 0.0f;
     for (const auto& chain : retargeter.Chains()) {
         Quaternion accumulated = expected[static_cast<std::size_t>(chain.front())];
@@ -1065,6 +1072,11 @@ void TestRetargetBinding() {
         ++g_failures;
         return;
     }
+    // Everything down to the position-driven section below is about the
+    // ROTATION path, which these synthetic features are built to exercise:
+    // they carry a known 6D block and no positions at all. The shipped default
+    // is RetargetSource::Positions, so it has to be said out loud here.
+    retargeter.SetSource(NeuralModelIntegrateTestbed::RetargetSource::Rotations);
 
     fastgltf::Parser parser(fastgltf::Extensions::KHR_lights_punctual);
     auto data = fastgltf::GltfDataBuffer::FromPath(character);
@@ -1177,7 +1189,8 @@ void TestRetargetBinding() {
     std::vector<float> posed;
     std::vector<DirectX::SimpleMath::Quaternion> posedLocals;
     BuildSyntheticFeature(posed, retargeter.SourceJointCount(), posedLocals, 1.1f);
-    retargeter.ApplyFrame(graph, posed.data(), static_cast<int>(posed.size()), 1.1f,
+    retargeter.ApplyFrame(graph, posed.data(), static_cast<int>(posed.size()),
+                          nullptr, 1.1f,
                           DirectX::SimpleMath::Vector3(0.0f, 0.9f, 0.0f), 1.0f,
                           DirectX::SimpleMath::Matrix::Identity, &error);
     const NeuralModelIntegrateTestbed::BindPoseMetrics again =
@@ -1185,32 +1198,132 @@ void TestRetargetBinding() {
     Expect("the rest pose measures the same after posing",
            std::fabs(again.hipsHeight - metrics.hipsHeight) < 1e-4f);
 
-    // --- aiming at a world position ----------------------------------------
-    // The hips translation is written in parent space, so a scene placement
-    // has to be cancelled. With a placement applied, the hips must still land
-    // at the requested WORLD position -- that is what puts the feet on the
-    // grid whatever the scene placement is.
+    // --- the motion follows the character's own placement ------------------
+    // The target is in the character's FILE space, so the hips must land where
+    // that file's placement puts it -- not at the raw coordinates. This is the
+    // property that makes the motion behave like everything else in its glTF:
+    // move the file and the character goes with it.
+    //
+    // It used to assert the opposite, that the hips landed at the requested
+    // WORLD position whatever the placement was. That made the motion the one
+    // thing in the scene that did not follow its own file, and it disagreed
+    // with the bone rotations, which always composed onto the placement.
+    const auto hipsWorld = [&](const char* what,
+                               const DirectX::SimpleMath::Vector3& expected) {
+        for (const NeuralModelIntegrateTestbed::RetargetBone& bone :
+             retargeter.Bones()) {
+            if (bone.sourceJoint != 0 || !bone.destinationNode.has_value()) continue;
+            const DirectX::SimpleMath::Matrix& m =
+                graph.Nodes()[*bone.destinationNode].worldTransform;
+            const DirectX::SimpleMath::Vector3 got(m._41, m._42, m._43);
+            std::printf("  %-52s (%.3f, %.3f, %.3f)\n", what, got.x, got.y, got.z);
+            ExpectVec(what, got, expected.x, expected.y, expected.z);
+            return;
+        }
+    };
+
     const DirectX::SimpleMath::Matrix placement =
         DirectX::SimpleMath::Matrix::CreateTranslation(3.0f, -2.0f, -4.0f);
     const DirectX::SimpleMath::Vector3 wanted(0.5f, 0.9f, -0.25f);
     Expect("a frame applies with a scene placement",
            retargeter.ApplyFrame(graph, feature.data(),
-                                 static_cast<int>(feature.size()), 0.0f, wanted, 1.0f,
-                                 placement, &error));
+                                 static_cast<int>(feature.size()), nullptr, 0.0f,
+                                 wanted, 1.0f, placement, &error));
     graph.UpdateTransforms(placement);
-    for (const NeuralModelIntegrateTestbed::RetargetBone& bone : retargeter.Bones()) {
-        if (bone.sourceJoint != 0 || !bone.destinationNode.has_value()) continue;
-        const DirectX::SimpleMath::Matrix& m =
-            graph.Nodes()[*bone.destinationNode].worldTransform;
-        const DirectX::SimpleMath::Vector3 got(m._41, m._42, m._43);
-        std::printf("  %-52s (%.3f, %.3f, %.3f)\n", "hips world after placement",
-                    got.x, got.y, got.z);
-        Expect("the hips landed at the requested world position",
-               (got - wanted).Length() < 1e-3f);
+    hipsWorld("hips carried by the scene placement",
+              DirectX::SimpleMath::Vector3(3.5f, -1.1f, -4.25f));
+
+    // Now the file's OWN placement, which is what a manifest or the Scene tab
+    // sets per glTF. Translation, a quarter turn and a scale at once, because
+    // each one fails differently: a missed translation leaves the character
+    // behind, a missed rotation walks it the wrong way while its body faces the
+    // right one, and a missed scale gives a giant with a tiny stride.
+    //
+    // +X at scale 2 is (1, 0, 0) -> (2, 0, 0), a 90-degree yaw takes that onto
+    // (0, 0, -2), and the move adds (10, 0, 0) -- so (10, 1.8, -2). The 1.8 is
+    // the target's own 0.9 doubled.
+    {
+        NeuralModelIntegrateTestbed::SceneTransform assetPlacement;
+        assetPlacement.translation[0] = 10.0f;
+        assetPlacement.rotation[1] = 90.0f;
+        assetPlacement.scale = 2.0f;
+        graph.SetAssetPlacement(0, NeuralModelIntegrateTestbed::PlacementMatrix(
+                                       assetPlacement));
+
+        const DirectX::SimpleMath::Vector3 inFile(1.0f, 0.9f, 0.0f);
+        Expect("a frame applies with the file placed, turned and scaled",
+               retargeter.ApplyFrame(graph, feature.data(),
+                                     static_cast<int>(feature.size()), nullptr, 0.0f,
+                                     inFile, 1.0f,
+                                     DirectX::SimpleMath::Matrix::Identity,
+                                     &error));
+        graph.UpdateTransforms(DirectX::SimpleMath::Matrix::Identity);
+        hipsWorld("hips carried by the file's own placement",
+                  DirectX::SimpleMath::Vector3(10.0f, 1.8f, -2.0f));
+
+        // Both placements at once: the file's own, then the whole scene's
+        // outside it. The order is what ScenePlacement and SetAssetPlacement
+        // promise, and getting it backwards would scale the scene offset.
+        Expect("a frame applies with both placements",
+               retargeter.ApplyFrame(graph, feature.data(),
+                                     static_cast<int>(feature.size()), nullptr, 0.0f,
+                                     inFile, 1.0f, placement, &error));
+        graph.UpdateTransforms(placement);
+        hipsWorld("hips carried by both placements",
+                  DirectX::SimpleMath::Vector3(13.0f, -0.2f, -6.0f));
+
+        // And the ORIENTATION, which is the other half of "follows the
+        // file's transform". It already did -- a driven bone's local rotation
+        // is derived against the authored parent chain, and UpdateTransforms
+        // composes the placement on top of that -- but the translation did
+        // not, and the two disagreeing was the bug. This pins them together:
+        // the hips' world axes under a quarter-turned file must be the
+        // identity-placement axes, quarter-turned.
+        const auto hipsAxis = [&]() {
+            for (const NeuralModelIntegrateTestbed::RetargetBone& bone :
+                 retargeter.Bones()) {
+                if (bone.sourceJoint != 0 || !bone.destinationNode.has_value()) {
+                    continue;
+                }
+                DirectX::SimpleMath::Matrix world =
+                    graph.Nodes()[*bone.destinationNode].worldTransform;
+                world._41 = world._42 = world._43 = 0.0f;
+                DirectX::SimpleMath::Vector3 axis =
+                    DirectX::SimpleMath::Vector3::TransformNormal(
+                        DirectX::SimpleMath::Vector3::UnitX, world);
+                axis.Normalize();
+                return axis;
+            }
+            return DirectX::SimpleMath::Vector3::Zero;
+        };
+
+        graph.SetAssetPlacement(0, DirectX::SimpleMath::Matrix::Identity);
+        retargeter.ApplyFrame(graph, feature.data(),
+                              static_cast<int>(feature.size()), nullptr, 0.0f, inFile,
+                              1.0f, DirectX::SimpleMath::Matrix::Identity, &error);
+        graph.UpdateTransforms(DirectX::SimpleMath::Matrix::Identity);
+        const DirectX::SimpleMath::Vector3 unplacedAxis = hipsAxis();
+
+        graph.SetAssetPlacement(0, NeuralModelIntegrateTestbed::PlacementMatrix(
+                                       assetPlacement));
+        retargeter.ApplyFrame(graph, feature.data(),
+                              static_cast<int>(feature.size()), nullptr, 0.0f, inFile,
+                              1.0f, DirectX::SimpleMath::Matrix::Identity, &error);
+        graph.UpdateTransforms(DirectX::SimpleMath::Matrix::Identity);
+        const DirectX::SimpleMath::Vector3 placedAxis = hipsAxis();
+
+        // A 90-degree yaw takes (x, y, z) onto (z, y, -x), which is the same
+        // mapping TestPlacementMatrix pins by sending +X onto -Z.
+        ExpectVec("the hips' orientation follows the file's rotation", placedAxis,
+                  unplacedAxis.z, unplacedAxis.y, -unplacedAxis.x);
+
+        // Put it back, so what follows measures the character where the rest of
+        // this test expects it.
+        graph.SetAssetPlacement(0, DirectX::SimpleMath::Matrix::Identity);
     }
 
     const bool applied = retargeter.ApplyFrame(
-        graph, feature.data(), static_cast<int>(feature.size()), 0.3f,
+        graph, feature.data(), static_cast<int>(feature.size()), nullptr, 0.3f,
         DirectX::SimpleMath::Vector3(0.0f, 0.9f, 0.0f), 1.0f,
         DirectX::SimpleMath::Matrix::Identity, &error);
     Expect("a frame applies to the real character", applied);
@@ -1349,6 +1462,192 @@ void TestRetargetBinding() {
     }
     std::printf("  %-52s %d\n", "driven bones that left the bind pose", moved);
     Expect("the pose actually changed the rig", moved >= 12);
+
+    // --- the position-driven path ------------------------------------------
+    // The same property as above, from the other encoding: each driven bone
+    // must end up pointing along normalise(position[child] - position[parent]).
+    // That is this path's whole claim, and it holds BY CONSTRUCTION -- no rest
+    // alignment, no root convention, nothing of what //Engine:retarget-probe
+    // has to sweep over for the rotation block.
+    //
+    // The positions are deliberately not a plausible pose: a spiral, so every
+    // joint gets a different, non-cardinal direction and a bone wired to the
+    // wrong joint cannot pass by accident the way it could in a pose where a
+    // whole limb points one way.
+    {
+        retargeter.SetSource(NeuralModelIntegrateTestbed::RetargetSource::Positions);
+
+        const int sourceJoints = retargeter.SourceJointCount();
+        std::vector<DirectX::XMFLOAT3> positions(
+            static_cast<std::size_t>(sourceJoints));
+        for (int j = 0; j < sourceJoints; ++j) {
+            const float t = static_cast<float>(j);
+            positions[static_cast<std::size_t>(j)] = {
+                0.31f * std::cos(0.7f * t), 0.19f * t - 0.4f,
+                0.23f * std::sin(0.7f * t) + 0.05f * t};
+        }
+
+        std::vector<DirectX::SimpleMath::Vector3> directions;
+        Expect("bone directions come out of the positions",
+               retargeter.SourceBoneDirections(positions.data(), directions));
+        Expect("the root has no direction of its own",
+               directions[0].LengthSquared() < 1e-12f);
+
+        Expect("a frame applies from positions alone",
+               retargeter.ApplyFrame(graph, nullptr, 0, positions.data(), 0.0f,
+                                     DirectX::SimpleMath::Vector3(0.0f, 0.9f, 0.0f),
+                                     1.0f, DirectX::SimpleMath::Matrix::Identity,
+                                     &error));
+        graph.UpdateTransforms(DirectX::SimpleMath::Matrix::Identity);
+
+        float worstDirection = 0.0f;
+        float worstTwist = 0.0f;
+        int comparedFromPositions = 0;
+        for (const NeuralModelIntegrateTestbed::RetargetBone& bone :
+             retargeter.Bones()) {
+            if (!bone.restResolved || !bone.destinationNode.has_value() ||
+                !bone.childDestinationNode.has_value() || bone.childJoint < 0) {
+                continue;
+            }
+            const DirectX::SimpleMath::Vector3& want =
+                directions[static_cast<std::size_t>(bone.childJoint)];
+            if (want.LengthSquared() < 1e-12f) continue;
+
+            const DirectX::SimpleMath::Matrix& a =
+                graph.Nodes()[*bone.destinationNode].worldTransform;
+            const DirectX::SimpleMath::Matrix& b =
+                graph.Nodes()[*bone.childDestinationNode].worldTransform;
+            DirectX::SimpleMath::Vector3 got(b._41 - a._41, b._42 - a._42,
+                                             b._43 - a._43);
+            if (got.Length() < 1e-6f) continue;
+            got.Normalize();
+            worstDirection = std::max(
+                worstDirection, DirectX::XMConvertToDegrees(std::acos(std::max(
+                                    -1.0f, std::min(1.0f, got.Dot(want))))));
+            ++comparedFromPositions;
+
+            // And the roll, which a direction cannot carry and this path
+            // therefore must not invent. A minimal arc turns about an axis
+            // perpendicular to both directions, so it has no component along
+            // the bone: whatever twist the character was authored with is what
+            // it keeps. Checking the axis rather than the result, because a
+            // wrong-but-pointing-the-right-way rotation passes the test above.
+            const DirectX::SimpleMath::Quaternion arc =
+                NeuralModelIntegrateTestbed::MotionRetargeter::AlignDirections(
+                    bone.restDirection, want);
+            DirectX::SimpleMath::Vector3 axis(arc.x, arc.y, arc.z);
+            if (axis.Length() > 1e-6f) {
+                axis.Normalize();
+                worstTwist = std::max(worstTwist, std::fabs(axis.Dot(want)));
+            }
+        }
+        std::printf("  %-52s %d\n", "bones compared against the positions",
+                    comparedFromPositions);
+        std::printf("  %-52s %.4f deg\n",
+                    "worst direction error against the positions", worstDirection);
+        std::printf("  %-52s %.6f\n", "worst twist about the bone", worstTwist);
+        Expect("enough bones to be meaningful", comparedFromPositions >= 12);
+        Expect("every bone points along the measured direction",
+               worstDirection < 0.5f);
+        Expect("the arc adds no twist of its own", worstTwist < 1e-4f);
+
+        // --- the degree of freedom the test above cannot see ---------------
+        // Every bone pointing exactly where it was asked to does NOT mean the
+        // character is posed right. The hips bone points straight up, so a
+        // rotation about it is pure yaw -- which way the body FACES -- and
+        // aiming it with a minimal arc leaves that at the rest pose's while
+        // the legs follow the motion. //Engine:retarget-probe measured 91.5
+        // degrees of mean facing error that way, with a direction test like
+        // the one above reading 0.00. So the facing needs its own assertion.
+        //
+        // NOT the spiral, which is not a skeleton: its hip-to-hip runs nearly
+        // along its spine, so there is no sideways direction to read a twist
+        // from and the construction correctly declines to invent one. This
+        // fixture is the source skeleton's own rest shape, walked out from
+        // t2m_raw_offsets, and then turned by a known angle -- so the answer
+        // is known rather than merely self-consistent.
+        {
+            const float yaw = DirectX::XMConvertToRadians(50.0f);
+            const DirectX::SimpleMath::Matrix turn =
+                DirectX::SimpleMath::Matrix::CreateRotationY(yaw);
+            std::vector<DirectX::XMFLOAT3> rest(
+                static_cast<std::size_t>(sourceJoints));
+            std::vector<DirectX::SimpleMath::Vector3> world(
+                static_cast<std::size_t>(sourceJoints),
+                DirectX::SimpleMath::Vector3::Zero);
+            for (const auto& chain : retargeter.Chains()) {
+                for (std::size_t k = 1; k < chain.size(); ++k) {
+                    const int joint = chain[k];
+                    const int parent = chain[k - 1];
+                    if (joint >= sourceJoints || parent >= sourceJoints) continue;
+                    world[static_cast<std::size_t>(joint)] =
+                        world[static_cast<std::size_t>(parent)] +
+                        kRawOffsets[joint] * 0.4f;
+                }
+            }
+            for (int j = 0; j < sourceJoints; ++j) {
+                const DirectX::SimpleMath::Vector3 turned =
+                    DirectX::SimpleMath::Vector3::Transform(
+                        world[static_cast<std::size_t>(j)], turn);
+                rest[static_cast<std::size_t>(j)] = {turned.x, turned.y, turned.z};
+            }
+
+            Expect("the rest-shaped frame applies",
+                   retargeter.ApplyFrame(graph, nullptr, 0, rest.data(), 0.0f,
+                                         DirectX::SimpleMath::Vector3(0.0f, 0.9f,
+                                                                      0.0f),
+                                         1.0f,
+                                         DirectX::SimpleMath::Matrix::Identity,
+                                         &error));
+            graph.UpdateTransforms(DirectX::SimpleMath::Matrix::Identity);
+
+            std::optional<std::size_t> leftLeg;
+            std::optional<std::size_t> rightLeg;
+            for (const NeuralModelIntegrateTestbed::RetargetBone& bone :
+                 retargeter.Bones()) {
+                if (bone.destinationName == "mixamorig:LeftUpLeg") {
+                    leftLeg = bone.destinationNode;
+                }
+                if (bone.destinationName == "mixamorig:RightUpLeg") {
+                    rightLeg = bone.destinationNode;
+                }
+            }
+            Expect("the legs resolved", leftLeg.has_value() && rightLeg.has_value());
+            if (leftLeg.has_value() && rightLeg.has_value()) {
+                const DirectX::SimpleMath::Matrix& l =
+                    graph.Nodes()[*leftLeg].worldTransform;
+                const DirectX::SimpleMath::Matrix& r =
+                    graph.Nodes()[*rightLeg].worldTransform;
+                DirectX::SimpleMath::Vector3 character(
+                    r._41 - l._41, r._42 - l._42, r._43 - l._43);
+                DirectX::SimpleMath::Vector3 motion(
+                    rest[2].x - rest[1].x, rest[2].y - rest[1].y,
+                    rest[2].z - rest[1].z);
+                character.Normalize();
+                motion.Normalize();
+                const float facing = DirectX::XMConvertToDegrees(std::acos(
+                    std::max(-1.0f, std::min(1.0f, character.Dot(motion)))));
+                std::printf("  %-52s %.4f deg\n",
+                            "hip-to-hip facing error under a 50 deg turn", facing);
+                // The failure this catches is tens of degrees: without the
+                // twist reference the character keeps its REST facing, so a 50
+                // degree turn of the source reads back as 50 degrees of error.
+                Expect("the character faces where the motion faces", facing < 5.0f);
+            }
+        }
+
+        // Positions are not optional in this mode. Silently falling back to a
+        // rotation block that does not describe the same pose is exactly the
+        // failure this path exists to avoid, so it has to be an error rather
+        // than a fallback.
+        Expect("the position path refuses a frame with no positions",
+               !retargeter.ApplyFrame(graph, feature.data(),
+                                      static_cast<int>(feature.size()), nullptr, 0.0f,
+                                      DirectX::SimpleMath::Vector3(0.0f, 0.9f, 0.0f),
+                                      1.0f, DirectX::SimpleMath::Matrix::Identity,
+                                      &error));
+        Expect("  and says why", error.find("positions") != std::string::npos);
+    }
 }
 
 

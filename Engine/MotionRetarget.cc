@@ -62,28 +62,6 @@ Quaternion Cont6dToQuaternion(const float* c) {
     return Quaternion::CreateFromRotationMatrix(m);
 }
 
-// Shortest rotation taking unit vector `from` to unit vector `to`. Used to
-// cancel the difference between the two skeletons' rest bone directions, which
-// is what momask's hand-tuned corrections were approximating.
-Quaternion AlignVectors(const Vector3& from, const Vector3& to) {
-    const float dot = from.Dot(to);
-    if (dot > 0.999999f) {
-        return Quaternion::Identity;
-    }
-    if (dot < -0.999999f) {
-        // Opposed: a half turn about any perpendicular axis. Picking the axis
-        // from whichever component is smallest keeps the cross product well
-        // conditioned.
-        Vector3 axis = std::fabs(from.x) < 0.9f ? Vector3::UnitX : Vector3::UnitY;
-        axis = from.Cross(axis);
-        axis.Normalize();
-        return Quaternion::CreateFromAxisAngle(axis, DirectX::XM_PI);
-    }
-    Vector3 axis = from.Cross(to);
-    axis.Normalize();
-    return Quaternion::CreateFromAxisAngle(axis, std::acos(std::clamp(dot, -1.0f, 1.0f)));
-}
-
 // The node's authored local rotation, for nodes a retarget does not drive.
 Quaternion AuthoredRotation(const SceneNode& node) {
     if (node.hasTrs) {
@@ -114,16 +92,89 @@ Matrix AuthoredLocal(const SceneNode& node) {
 
 }  // namespace
 
+Quaternion MotionRetargeter::AlignDirections(const Vector3& from,
+                                            const Vector3& to) {
+    const float dot = from.Dot(to);
+    if (dot > 0.999999f) {
+        return Quaternion::Identity;
+    }
+    if (dot < -0.999999f) {
+        // Opposed: a half turn about any perpendicular axis. Picking the axis
+        // from whichever component is smallest keeps the cross product well
+        // conditioned.
+        Vector3 axis = std::fabs(from.x) < 0.9f ? Vector3::UnitX : Vector3::UnitY;
+        axis = from.Cross(axis);
+        axis.Normalize();
+        return Quaternion::CreateFromAxisAngle(axis, DirectX::XM_PI);
+    }
+    Vector3 axis = from.Cross(to);
+    axis.Normalize();
+    return Quaternion::CreateFromAxisAngle(axis, std::acos(std::clamp(dot, -1.0f, 1.0f)));
+}
+
+Quaternion MotionRetargeter::FrameRotation(const Vector3& fromPrimary,
+                                           const Vector3& fromSecondary,
+                                           const Vector3& toPrimary,
+                                           const Vector3& toSecondary) {
+    // Built as "aim, then twist" rather than as the difference of two
+    // orthonormal frames. The frame-difference form is the textbook one and it
+    // needs a matrix-to-quaternion round trip, whose row-vs-column convention
+    // is exactly the kind of thing this file has been bitten by before; this
+    // form uses only AlignDirections and CreateFromAxisAngle, whose
+    // conventions //Engine:scenegraph-smoke already pins.
+    Vector3 from = fromPrimary;
+    Vector3 to = toPrimary;
+    if (from.Length() < 1e-6f || to.Length() < 1e-6f) {
+        return Quaternion(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    from.Normalize();
+    to.Normalize();
+
+    // The secondaries only decide the roll about the primary, so each is
+    // reduced to its component across it.
+    Vector3 toSide = toSecondary - to * toSecondary.Dot(to);
+    if (toSide.Length() < 1e-4f) {
+        // Parallel to the primary, so it says nothing about the roll. A zero
+        // quaternion is the caller's signal to fall back to a minimal arc --
+        // identity would silently leave the bone unaimed.
+        return Quaternion(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    toSide.Normalize();
+
+    const Quaternion aim = AlignDirections(from, to);
+    Vector3 fromSide = Vector3::Transform(fromSecondary, aim);
+    fromSide -= to * fromSide.Dot(to);
+    if (fromSide.Length() < 1e-4f) {
+        return Quaternion(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    fromSide.Normalize();
+
+    // Signed angle about the primary, which is what makes this a twist rather
+    // than another shortest arc: the sign has to come from the axis, or a
+    // half-turn one way is indistinguishable from the other.
+    const float cosine = std::clamp(fromSide.Dot(toSide), -1.0f, 1.0f);
+    const float sine = fromSide.Cross(toSide).Dot(to);
+    const Quaternion twist =
+        Quaternion::CreateFromAxisAngle(to, std::atan2(sine, cosine));
+
+    // Aim first, then twist about the aimed direction, which leaves the
+    // primary exactly where the aim put it.
+    return Quaternion::Concatenate(twist, aim);
+}
+
 Matrix MotionRetargeter::AuthoredParentWorld(const SceneGraph& graph,
                                              std::size_t nodeIndex,
-                                             const Matrix& scenePlacement) {
+                                             const Matrix& scenePlacement,
+                                             bool includeAssetPlacement) {
     const std::vector<SceneNode>& nodes = graph.Nodes();
     // The character's own file may be placed somewhere in the merged scene, and
     // that placement is part of the chain from the hips up to the world without
     // being a node in it -- UpdateTransforms applies it just inside the scene
     // placement, so this has to as well. Identity when only one file is loaded,
     // or when nothing has moved this one.
-    const Matrix outer = graph.PlacementForNode(nodeIndex) * scenePlacement;
+    const Matrix outer =
+        includeAssetPlacement ? graph.PlacementForNode(nodeIndex) * scenePlacement
+                              : scenePlacement;
     if (nodeIndex >= nodes.size() || !nodes[nodeIndex].parent.has_value()) {
         return outer;
     }
@@ -393,10 +444,39 @@ void MotionRetargeter::ResolveRestPose(const SceneGraph& graph) {
     const std::vector<SceneNode>& nodes = graph.Nodes();
     const Matrix identity = Matrix::Identity;
 
+    // Parent of each joint, from the chains. Needed to find the joints that
+    // BRANCH off a bone's own joint, which is where the twist reference comes
+    // from.
+    std::vector<int> parentJoint(static_cast<std::size_t>(std::max(m_sourceJoints, 0)),
+                                 -1);
+    for (const std::vector<int>& chain : m_chains) {
+        for (std::size_t k = 1; k < chain.size(); ++k) {
+            if (chain[k] >= 0 && chain[k] < m_sourceJoints) {
+                parentJoint[static_cast<std::size_t>(chain[k])] = chain[k - 1];
+            }
+        }
+    }
+    // The node a source joint drives, so a twist reference can be resolved to
+    // the character's own joints as well as the motion's.
+    const auto nodeForJoint = [&](int joint) -> std::optional<std::size_t> {
+        for (const RetargetBone& other : m_bones) {
+            if (other.sourceJoint == joint) {
+                return other.destinationNode;
+            }
+        }
+        return std::nullopt;
+    };
+
     for (RetargetBone& bone : m_bones) {
         bone.restResolved = false;
+        bone.twistResolved = false;
         bone.restRotation = Quaternion::Identity;
         bone.restAlignment = Quaternion::Identity;
+        bone.restSide = Vector3::Zero;
+        bone.twistLeftJoint = -1;
+        bone.twistRightJoint = -1;
+        bone.twistLeftNode.reset();
+        bone.twistRightNode.reset();
         bone.childDestinationNode.reset();
 
         if (!bone.destinationNode.has_value() || bone.childJoint < 0 ||
@@ -414,9 +494,11 @@ void MotionRetargeter::ResolveRestPose(const SceneGraph& graph) {
         const std::size_t node = *bone.destinationNode;
         const std::size_t child = *bone.childDestinationNode;
         const Matrix nodeWorld =
-            AuthoredLocal(nodes[node]) * AuthoredParentWorld(graph, node, identity);
+            AuthoredLocal(nodes[node]) *
+            AuthoredParentWorld(graph, node, identity, false);
         const Matrix childWorld =
-            AuthoredLocal(nodes[child]) * AuthoredParentWorld(graph, child, identity);
+            AuthoredLocal(nodes[child]) *
+            AuthoredParentWorld(graph, child, identity, false);
 
         Vector3 restDirection(childWorld._41 - nodeWorld._41,
                               childWorld._42 - nodeWorld._42,
@@ -443,8 +525,57 @@ void MotionRetargeter::ResolveRestPose(const SceneGraph& graph) {
 
         bone.restRotation = rotation;
         bone.restDirection = restDirection;
-        bone.restAlignment = AlignVectors(restDirection, sourceDirection);
+        bone.restAlignment = AlignDirections(restDirection, sourceDirection);
         bone.restResolved = true;
+
+        // The twist reference: the joints that branch off this bone's own
+        // joint, other than the one it points at. Two of them is a left and a
+        // right -- the hips' two legs, the upper spine's two collars -- and
+        // one or three is not a pair this can use.
+        std::vector<int> branches;
+        for (int joint = 0; joint < m_sourceJoints; ++joint) {
+            if (joint != bone.childJoint &&
+                parentJoint[static_cast<std::size_t>(joint)] == bone.sourceJoint) {
+                branches.push_back(joint);
+            }
+        }
+        if (branches.size() != 2) {
+            continue;
+        }
+        // SMPL orders the sides left-then-right at every branch, so the lower
+        // index is the left one. Only the CONSISTENCY matters here, since the
+        // same pair is read from both skeletons, but getting it backwards
+        // would mirror the twist rather than resolve it.
+        const int leftJoint = std::min(branches[0], branches[1]);
+        const int rightJoint = std::max(branches[0], branches[1]);
+        const std::optional<std::size_t> leftNode = nodeForJoint(leftJoint);
+        const std::optional<std::size_t> rightNode = nodeForJoint(rightJoint);
+        if (!leftNode.has_value() || !rightNode.has_value()) {
+            continue;
+        }
+
+        const Matrix leftWorld = AuthoredLocal(nodes[*leftNode]) *
+                                 AuthoredParentWorld(graph, *leftNode, identity, false);
+        const Matrix rightWorld =
+            AuthoredLocal(nodes[*rightNode]) *
+            AuthoredParentWorld(graph, *rightNode, identity, false);
+        Vector3 side(rightWorld._41 - leftWorld._41, rightWorld._42 - leftWorld._42,
+                     rightWorld._43 - leftWorld._43);
+        // Orthogonalised here rather than at every frame: it is a property of
+        // the rest pose, and keeping it perpendicular to restDirection is what
+        // makes the frame a rotation.
+        side -= restDirection * side.Dot(restDirection);
+        if (side.Length() < 1e-5f) {
+            continue;
+        }
+        side.Normalize();
+
+        bone.twistLeftJoint = leftJoint;
+        bone.twistRightJoint = rightJoint;
+        bone.twistLeftNode = leftNode;
+        bone.twistRightNode = rightNode;
+        bone.restSide = side;
+        bone.twistResolved = true;
     }
 }
 
@@ -473,8 +604,21 @@ bool MotionRetargeter::SourceWorldRotations(
 
     // The root's rotation is not in the rotation block: it is the accumulated
     // yaw, the same quantity the position recovery integrates. HumanML3D stores
-    // it as (cos a, 0, sin a, 0) in (w, x, y, z), i.e. a rotation about Y.
-    const Quaternion root = Quaternion::CreateFromAxisAngle(Vector3::UnitY, rootAngle);
+    // it as (cos a, 0, sin a, 0) in (w, x, y, z) -- and a unit quaternion whose
+    // w is cos(a) turns by 2a, not by a. recover_from_rot seeds its forward
+    // kinematics with that quaternion as it stands, so this has to be the same
+    // rotation.
+    //
+    // It used to call CreateFromAxisAngle(UnitY, rootAngle), which is
+    // (cos(a/2), 0, sin(a/2), 0) -- HALF the turn, and silently right whenever
+    // the character walks in a straight line, because then a is near zero.
+    // //Engine:retarget-probe measures the difference by checking the rotation
+    // block against the ric positions of the same frame: over a take that turns
+    // 72 degrees, the implied rest offsets scatter by 67.0 degrees under the old
+    // seed and 51.7 under this one. It is the best of the 60 readings that probe
+    // sweeps, which is how the factor of two was found rather than reasoned.
+    const Quaternion root =
+        Quaternion::CreateFromAxisAngle(Vector3::UnitY, 2.0f * rootAngle);
     out[0] = root;
 
     // Everything else is a LOCAL rotation relative to its parent, so the chains
@@ -499,9 +643,47 @@ bool MotionRetargeter::SourceWorldRotations(
     return true;
 }
 
+bool MotionRetargeter::SourceBoneDirections(const DirectX::XMFLOAT3* positions,
+                                            std::vector<Vector3>& out) const {
+    if (positions == nullptr || m_sourceJoints <= 0) {
+        return false;
+    }
+    out.assign(static_cast<std::size_t>(m_sourceJoints), Vector3::Zero);
+
+    // The chains are the connectivity: consecutive entries are one bone, and
+    // the later one is the joint it ends at. Walking them rather than a
+    // parent array because that is what the configuration carries, and it is
+    // the same traversal SourceWorldRotations and //Engine:retarget-probe use,
+    // so a bone is the same bone in all three.
+    for (const std::vector<int>& chain : m_chains) {
+        for (std::size_t k = 1; k < chain.size(); ++k) {
+            const int joint = chain[k];
+            const int parent = chain[k - 1];
+            if (joint < 0 || joint >= m_sourceJoints || parent < 0 ||
+                parent >= m_sourceJoints) {
+                continue;
+            }
+            Vector3 bone(positions[joint].x - positions[parent].x,
+                         positions[joint].y - positions[parent].y,
+                         positions[joint].z - positions[parent].z);
+            // A collapsed bone has no direction. Leaving it zero is what lets
+            // ApplyFrame keep the character's authored orientation there,
+            // rather than normalising a near-zero vector into noise.
+            if (bone.Length() < 1e-6f) {
+                continue;
+            }
+            bone.Normalize();
+            out[static_cast<std::size_t>(joint)] = bone;
+        }
+    }
+    return true;
+}
+
 bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
-                                  int motionDim, float rootAngle,
-                                  const Vector3& hipsWorldTarget,
+                                  int motionDim,
+                                  const DirectX::XMFLOAT3* positions,
+                                  float rootAngle,
+                                  const Vector3& hipsTarget,
                                   float characterScale,
                                   const Matrix& scenePlacement,
                                   std::string* error) {
@@ -509,7 +691,15 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
         SetError(error, "no retarget configuration is loaded");
         return false;
     }
-    if (!SourceWorldRotations(feature, motionDim, rootAngle, m_sourceWorld)) {
+    const bool fromPositions = m_source == RetargetSource::Positions;
+    m_positions = positions;
+    if (fromPositions) {
+        if (!SourceBoneDirections(positions, m_sourceDirection)) {
+            SetError(error, "the position-driven retarget needs the frame's "
+                            "recovered joint positions");
+            return false;
+        }
+    } else if (!SourceWorldRotations(feature, motionDim, rootAngle, m_sourceWorld)) {
         SetError(error, "the feature frame does not match the retarget "
                         "configuration's joint count");
         return false;
@@ -529,6 +719,14 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
         if (bone.destinationNode.has_value() && bone.setRotation &&
             bone.restResolved && bone.childJoint >= 0 &&
             bone.childJoint < m_sourceJoints) {
+            // Driving from positions needs a direction as well: a joint the
+            // chains do not reach, or a bone that collapsed to a point in this
+            // frame, has none, and SourceBoneDirections leaves it zero.
+            if (fromPositions &&
+                m_sourceDirection[static_cast<std::size_t>(bone.childJoint)]
+                        .LengthSquared() < 1e-12f) {
+                continue;
+            }
             m_boneForNode[*bone.destinationNode] = static_cast<int>(i);
         }
     }
@@ -573,17 +771,89 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
 
         const RetargetBone& bone = m_bones[static_cast<std::size_t>(boneIndex)];
 
-        // W = R(child) * A * restRotation, in row-vector order, which reads
-        // right to left: start from the character's rest orientation for this
-        // bone, cancel the difference between the two skeletons' rest
-        // directions, then apply the source's world rotation. The source
-        // rotation comes from the CHILD joint because HumanML3D stores at a
-        // joint the rotation that orients the bone ending there.
-        const Quaternion sourceRotation =
-            m_sourceWorld[static_cast<std::size_t>(bone.childJoint)];
-        const Quaternion desiredWorld = Quaternion::Concatenate(
-            sourceRotation,
-            Quaternion::Concatenate(bone.restAlignment, bone.restRotation));
+        // The one thing the two sources disagree about: where this bone's
+        // desired WORLD rotation comes from. Everything after it -- the local
+        // rotation against the parent's final world rotation, parents before
+        // children, the override written through ApplyPoseOverrides -- is the
+        // same either way.
+        Quaternion desiredWorld;
+        if (fromPositions) {
+            const Vector3& measured =
+                m_sourceDirection[static_cast<std::size_t>(bone.childJoint)];
+
+            // The bone's direction expressed in its NODE's frame, which is
+            // what a world rotation has to act on.
+            Quaternion inverseRest = bone.restRotation;
+            inverseRest.Conjugate();
+            const Vector3 localDirection =
+                Vector3::Transform(bone.restDirection, inverseRest);
+
+            bool framed = false;
+            if (bone.twistResolved && m_positions != nullptr) {
+                // A FULL FRAME, so no twist is left free. The second direction
+                // is the line between the two joints branching off this one --
+                // hip to hip at the pelvis, shoulder to shoulder at the upper
+                // spine -- read from the motion's positions and from the
+                // character's rest pose the same way.
+                //
+                // This is what makes the character FACE where the motion
+                // faces. Aiming the hips with a minimal arc cannot: the bone
+                // points straight up, so a rotation about it is pure yaw and
+                // the arc leaves it at the rest pose's. Measured over a take
+                // that turns, that was 91.5 degrees of mean facing error with
+                // every bone direction still exact.
+                const Vector3 motionSide(
+                    m_positions[bone.twistRightJoint].x -
+                        m_positions[bone.twistLeftJoint].x,
+                    m_positions[bone.twistRightJoint].y -
+                        m_positions[bone.twistLeftJoint].y,
+                    m_positions[bone.twistRightJoint].z -
+                        m_positions[bone.twistLeftJoint].z);
+                const Quaternion frame = FrameRotation(bone.restDirection,
+                                                       bone.restSide, measured,
+                                                       motionSide);
+                framed = frame.LengthSquared() > 0.5f;
+                if (framed) {
+                    desiredWorld =
+                        Quaternion::Concatenate(frame, bone.restRotation);
+                }
+            }
+            if (!framed) {
+                // No pair to read a twist from, so the bone INHERITS its
+                // parent's and adds only the arc that aims it. Deliberately
+                // against the parent's already-resolved rotation rather than
+                // against the rest pose: an arc from rest would discard
+                // whatever twist the frame above resolved, and the spine would
+                // go back to facing the rest direction one bone below the hips
+                // that were just turned to face the motion.
+                //
+                // WHAT IS STILL FREE is the roll about the bone's own axis
+                // relative to the parent, which no position can supply. The
+                // minimal arc adds none, so the character keeps its AUTHORED
+                // roll there -- visible on the forearms, which pronate without
+                // moving the wrist, and over the spine.
+                const Quaternion inherited =
+                    Quaternion::Concatenate(parentWorld, AuthoredRotation(node));
+                const Vector3 aimed =
+                    Vector3::Transform(localDirection, inherited);
+                desiredWorld = Quaternion::Concatenate(
+                    AlignDirections(aimed, measured), inherited);
+            }
+        } else {
+            // W = R(child) * A * restRotation, in row-vector order, which
+            // reads right to left: start from the character's rest orientation
+            // for this bone, cancel the difference between the two skeletons'
+            // rest directions, then apply the source's world rotation. The
+            // source rotation comes from the CHILD joint because HumanML3D
+            // stores at a joint the rotation that orients the bone ending
+            // there.
+            const Quaternion sourceRotation =
+                m_sourceWorld[static_cast<std::size_t>(bone.childJoint)];
+            desiredWorld = Quaternion::Concatenate(
+                sourceRotation,
+                Quaternion::Concatenate(bone.restAlignment, bone.restRotation));
+        }
+        desiredWorld.Normalize();
 
         // local = inverse(parentWorld) * desiredWorld, in row-vector order.
         Quaternion inverseParent = parentWorld;
@@ -595,13 +865,16 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
         override.nodeIndex = index;
         override.rotation = local;
         if (bone.setPosition) {
-            // The target is a WORLD position, so it has to be pulled back
-            // through the parent chain -- scene placement included -- into the
-            // space this node's translation actually lives in. Writing the
-            // world position directly is what left the character offset by the
-            // scene placement.
+            // The target is in the character's own file space, so it goes OUT
+            // through that file's placement to reach world space and then back
+            // through the parent chain into the space this node's translation
+            // lives in. Both legs include the placement, so what the motion
+            // sees is the file's frame: move the file and the character goes
+            // with it, turn the file and the walk turns with it.
             const Matrix parentWorld =
                 AuthoredParentWorld(graph, index, scenePlacement);
+            const Vector3 worldTarget = Vector3::Transform(
+                hipsTarget, graph.PlacementForNode(index) * scenePlacement);
             // A degenerate chain -- a zero scale somewhere above the hips --
             // has no inverse, and transforming through it would produce
             // infinities that spread to every descendant. Leaving the authored
@@ -609,7 +882,7 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
             if (std::fabs(parentWorld.Determinant()) > 1e-12f) {
                 override.hasTranslation = true;
                 override.translation =
-                    Vector3::Transform(hipsWorldTarget, parentWorld.Invert());
+                    Vector3::Transform(worldTarget, parentWorld.Invert());
             }
 
             // Resizing the root of the joint hierarchy resizes the whole rig,
@@ -642,11 +915,16 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
         if (std::fabs(parentWorld.Determinant()) <= 1e-12f) {
             continue;
         }
+        // Same two legs as above: out through the file's placement, back
+        // through the parent chain.
+        const Vector3 worldTarget =
+            Vector3::Transform(hipsTarget, graph.PlacementForNode(*bone.destinationNode) *
+                                               scenePlacement);
         SceneGraph::PoseOverride override;
         override.nodeIndex = *bone.destinationNode;
         override.rotation = AuthoredRotation(nodes[*bone.destinationNode]);
         override.hasTranslation = true;
-        override.translation = Vector3::Transform(hipsWorldTarget, parentWorld.Invert());
+        override.translation = Vector3::Transform(worldTarget, parentWorld.Invert());
         if (characterScale > 0.0f) {
             override.hasScale = true;
             override.scale = Vector3(characterScale, characterScale, characterScale);

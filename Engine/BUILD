@@ -15,7 +15,19 @@ SAMPLE_DEFINES = [
 # header set, so every target that includes it needs those include paths and the
 # USING_DIRECTX_HEADERS define. Owning that here means a new target only has to
 # depend on :pch, instead of rediscovering pch.h's transitive needs.
-load("//:shaders.bzl", "hlsl_shader")
+load("//:shaders.bzl", "hlsl_compute", "hlsl_shader")
+
+# The sampler's guidance combine and Euler step, so the latents can stay in
+# GPU memory between denoiser calls. Its own target because it is a compute
+# shader with no VS/PS pair, and because only FloodDiffusion needs it.
+hlsl_compute(
+    name = "latent_step",
+    src = "shaders/latent_step.hlsl",
+    entries = {"CSLatentStep": "g_latent_step"},
+    library = "latent_step_bytecode",
+    out = "latent_step.h",
+    profile = "6_0",
+)
 
 # Two entry pairs: the G-buffer write and the deferred lighting resolve. Both
 # live in one .fx file so they share the PBR helpers, the light struct and the
@@ -293,6 +305,22 @@ cc_binary(
 
 # Measures which FloodDiffusion input shapes should be fixed at export time,
 # using ORT free dimension overrides so no re-export is needed to find out.
+# Checks a feature frame's `ric` positions against its 6D rotation block. The
+# skeleton overlay is drawn from the first and retargeting is driven by the
+# second, so the two disagreeing shows up as "the motion looks fine but the
+# character looks weird" -- and a mirrored rotation block is invisible in an
+# overlay, because the mirror of a skeleton is still a skeleton.
+cc_binary(
+    name = "retarget-probe",
+    srcs = ["retarget-probe.cc"],
+    defines = SAMPLE_DEFINES,
+    deps = [
+        ":FloodDiffusion",
+        ":GLTFAdapter",
+        ":pch",
+    ],
+)
+
 cc_binary(
     name = "fd-probe",
     srcs = ["fd-probe.cc"],
@@ -337,6 +365,8 @@ cc_library(
     defines = SAMPLE_DEFINES,
     deps = [
         ":OrtEnv",
+        # The guidance-and-Euler compute shader, for the GPU-resident sampler.
+        ":latent_step_bytecode",
         ":pch",
         "//third:onnxruntime",
     ],

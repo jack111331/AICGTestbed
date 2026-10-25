@@ -541,6 +541,7 @@ the lit clear.
 | `//Engine:scenegraph-smoke` | The glTF scene graph's transforms, skinning and animation sampling, plus frustum culling and the shadow cascade fit. No device needed. |
 | `//Engine:motionfeatures-smoke` | HumanML3D feature decoding and the Unigram tokenizer. No device or model needed. |
 | `//Engine:flooddiffusion-smoke` | Runs the real text-to-motion pipeline end to end on both providers and checks they agree; skips the model sections when `resources/FloodDiffusion/` is absent. |
+| `//Engine:retarget-probe` | Not an assertion but a measurement: scores every plausible reading of a feature frame's 6D rotation block against the `ric` positions of the same frame, and poses the real character to measure it against the skeleton overlay. Run from the repository root, since it reads `resources/`. |
 
 The smoke tests are cheap and each one pins a property that is easy to break
 silently, so they are worth running after any dependency change:
@@ -1943,10 +1944,50 @@ Two things to know before switching it on, both deliberate:
   chunk_size`, baked at load, so `Begin` refuses a different length and the
   panel's slider reloads the sessions.
 
-The VAE decoders are left dynamic on purpose: pinning their `batch` would take
-a decode from 1.48 ms to 0.47 ms, but it breaks the 20-tensor cache hand-off
-between `vae_decoder_first` and `vae_decoder_step` on ORT 1.24.4 (the step
-decoder reports a null input). The denoiser is where the time is.
+**The VAE decoders run on the CPU provider, and that is the pipeline's single
+biggest saving.** `vae_decoder_step` runs 59 of a generation's 60 decodes, and
+moving them off DirectML takes the decode total from 188.5 ms to 69.2 and the
+generation from 512.3 ms to 354.1 at 60 latents.
+`FloodDiffusionOptions::vaeDevice` selects it; the Performance panel reports
+which provider each of the three model groups ended up on.
+
+The reason is not that the decoder is slow on the GPU — it is that **the CPU is
+a second processor and the compute queue is not.** Every session here shares one
+queue, which is what orders a decode after the denoising step that produced its
+latent without a fence, so a DirectML decode queues behind the denoiser and the
+denoiser behind it: putting the decoders back on DirectML raises the decode from
+69 to 185 ms *and* the denoising from 281 to 327. On the CPU the decode runs
+concurrently on cores that were idle anyway. A from-source ORT 1.31 build makes
+the DirectML decode faster per call than the CPU's (0.80 ms against 1.3) and
+the generation still measured 513 ms against 348, which is the clearest
+statement of the point.
+
+Their `batch` is left dynamic, and the reason is not the one previously
+recorded here. Pinning it on `vae_decoder_first` makes the DirectML EP return a
+**null for one of its 21 outputs** (`cache_out_9`), which is what the hand-off
+failure actually was — not "a statically shaped session cannot hand its outputs
+to another". `cache_out_9` is the only one produced by a `ConstantOfShape`, so
+pinning lets constant folding turn it into a graph initializer, and the EP's
+graph fusion then deletes that initializer without noticing it is also a graph
+output — root-caused under a debugger and written up with the call stack in
+`skills/onnx-directml-ep/SKILL.md` §5.0, along with the one-config-entry
+workaround that is not worth taking. Pinning only `vae_decoder_step` works and
+buys nothing measurable.
+Binding the caches to D3D12 buffers to remove the hand-off does not help
+either: `Ort::IoBinding` on `vae_decoder_step` fails in every configuration on
+ORT 1.24.4, while the identical tensors through the ordinary `Run` API work —
+host memory included, so it is the binding and not the memory.
+`//Engine:fd-probe` section 11 keeps all of it measured.
+
+**Decoding follows the playhead, not the sampler.** The sampler finishes 11.85 s
+of motion in about 2.1 s, so decoding eagerly spends the whole decode budget
+inside that burst, on motion nobody has reached yet.
+`FloodDiffusionOptions::decodeAheadFrames` takes decoding out of `Step` and
+gives it to `DecodeAhead(consumedFrame)`, which decodes just far enough ahead
+of a consumer — one `vae_decoder_step` is four motion frames, 0.2 s at 20 fps,
+so a stream needs about five decodes a second however far ahead the sampler has
+run. `MotionStreamView` uses a 12-frame lookahead. The motion is bit-identical
+to eager decoding, because pacing defers decoding without reordering it.
 
 **The output is not joint positions.** The VAE decodes to HumanML3D's
 263-dimensional feature vector: a root trajectory as per-frame velocities plus
@@ -1964,10 +2005,71 @@ straight line, a pure yaw must not change a bone's length.
 *not* the same motion as the Python reference: that seeds numpy's PCG64 with a
 ziggurat normal, and this uses `std::mt19937`.
 
-**Not done yet.** Retargeting onto a glTF character — the skeleton is drawn on
-its own, and only a single prompt per generation is supported (the reference
-also accepts several prompts with `--text-end` handing over at given frames,
-which would widen the `segments` axis of `context`).
+**Retargeting onto a rigged character is driven by the positions, not the
+rotations.** A feature frame carries the same pose twice — `ric` joint
+positions in the root-local frame, and a block of (J-1) six-dimensional local
+joint rotations — and `Engine/MotionRetarget.cc` can drive a Mixamo glTF rig
+from either (`RetargetSource`, the **drive from positions** checkbox in the
+Neural tab). Rotations are the better input in principle, since a bone
+direction fixes only two of three degrees of freedom and so cannot carry the
+roll about the bone's own axis. They are not the better input here.
+
+`//Engine:retarget-probe` is what decided it. Forward kinematics says
+`position[j] - position[parent] = worldRotation[j] * restOffset[j]`, and
+`restOffset` is a property of the skeleton rather than of the pose — so
+pulling each measured bone direction back through the rotation that is supposed
+to have produced it must give the same vector on every frame, and the scatter
+of that over a take scores a candidate reading. The probe sweeps 60 of them:
+local-accumulated against world, both product orders, the reconstructed frame
+against its transpose, two block layouts, five root-angle conventions. One real
+bug came out of the sweep — the root was seeded with `cos(a/2)` where
+HumanML3D stores `cos(a)`, i.e. half the rotation, which is invisible while the
+character walks in a straight line — and fixing it took the best score from
+67.0 to **51.7 degrees** of mean scatter. A correct reading would score near
+zero, so the remaining 52 degrees is the block not describing the pose `ric`
+describes, and no reading can repair that.
+
+Driving from the positions instead scores **0.03 degrees** under the same
+measure, which is float noise: the direction is taken from the positions and
+the rotation is built to reach it, so there is no convention left to get wrong.
+Posed onto the real character, each bone lands **0.00 degrees** mean (0.03
+worst) from the direction the skeleton overlay draws, against **32.65** mean
+(165.50 worst) for the rotation path — which is the "the skeleton looks fine
+but the character looks weird" report, as a number.
+
+**Aiming is not posing**, and this is the part worth reading before trusting a
+direction test. A bone direction fixes two of three degrees of freedom. The
+third is the twist about the bone, and at the hips that twist is *which way the
+character faces*, because the hips bone points straight up and a rotation about
+it is pure yaw. The first version aimed every bone with a minimal arc from its
+rest direction: it scored a perfect 0.00 on directions and left the character
+facing **91.5 degrees** away from the motion on average, up to 172.9 — torso
+at its rest facing, legs following the motion, the mesh wrung around the waist.
+Nothing in a per-bone direction check can see that.
+
+A **second direction** resolves it, and the positions already carry one: the
+line between the two joints that branch off the bone's own joint. At the hips
+that is hip to hip, at the upper spine shoulder to shoulder, which are exactly
+the two places the twist is worth pinning; both are found from the chains, so
+no new configuration is needed. Those two bones get a full 3-DOF frame, and
+every other bone *inherits* its parent's resolved twist and adds only the
+minimal arc that aims it — deliberately against the parent's already-final
+rotation rather than against the rest pose, or the spine would snap back to the
+rest facing one bone below the hips that were just turned. Facing error is now
+**2.2 degrees** mean on real motion, with bone directions unchanged at 0.00.
+`//Engine:scenegraph-smoke` asserts the facing separately from the directions,
+because the direction assertion read 0.00 through the whole bug.
+
+What is still free is the roll about a limb's own axis relative to its parent,
+which no position can supply, so **the character keeps its authored roll
+there** — visible on the forearms, which pronate without moving the wrist.
+The rotation path is kept rather than deleted, because an export with a
+faithful rotation block would want it back, and it is the only source that
+carries that roll.
+
+**Not done yet.** Only a single prompt per generation is supported (the
+reference also accepts several prompts with `--text-end` handing over at given
+frames, which would widen the `segments` axis of `context`).
 
 ## Skills
 

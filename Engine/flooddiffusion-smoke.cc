@@ -253,9 +253,11 @@ void MeasureBones(const FloodDiffusionPipeline& pipeline, float* worstDrift,
 }
 
 void TestPipeline(const FloodDiffusionConfig& config, FloodDiffusionDevice device,
-                  const Devices& devices, Run* run, bool staticShapes = false) {
-    std::printf("\nloading the models on %s%s\n", ToString(device),
-                staticShapes ? ", shapes pinned" : "");
+                  const Devices& devices, Run* run, bool staticShapes = false,
+                  bool gpuLatents = false) {
+    std::printf("\nloading the models on %s%s%s\n", ToString(device),
+                staticShapes ? ", shapes pinned" : "",
+                gpuLatents ? ", latents on the GPU" : "");
 
     FloodDiffusionPipeline pipeline;
     FloodDiffusionOptions options;
@@ -263,6 +265,7 @@ void TestPipeline(const FloodDiffusionConfig& config, FloodDiffusionDevice devic
     options.seed = 1234;
     options.device = device;
     options.staticShapes = staticShapes;
+    options.gpuLatents = gpuLatents;
     // Pinned rather than left at its default, so the two runs below differ in
     // exactly one thing: where the sampler runs.
     options.textEncoderDevice = FloodDiffusionDevice::Cpu;
@@ -279,8 +282,15 @@ void TestPipeline(const FloodDiffusionConfig& config, FloodDiffusionDevice devic
     Expect("the sampler is on the requested provider", pipeline.Device() == device);
     Expect("the prompt encoder is on the CPU as asked",
            pipeline.TextEncoderDevice() == FloodDiffusionDevice::Cpu);
+    // Defaulted rather than asked for, which is the point: the decoders are
+    // about four times faster on the CPU provider and nothing in these tests
+    // sets it.
+    Expect("the VAE decoders default to the CPU",
+           pipeline.VaeDevice() == FloodDiffusionDevice::Cpu);
     Expect("static-shape mode reports itself",
            pipeline.StaticShapes() == staticShapes);
+    Expect("GPU-resident mode reports itself",
+           pipeline.GpuLatents() == gpuLatents);
     if (staticShapes) {
         ExpectInt("  pinned for the requested latent count",
                   pipeline.StaticLatentFrames(), options.latentFrames);
@@ -686,16 +696,342 @@ void TestFailures() {
 
     // DirectML needs the devices. Asking for it without them has to fail
     // loudly rather than silently fall back to the CPU.
+    //
+    // Only checked with the models staged. Load opens the files before it
+    // looks at the provider, so with nothing staged it refuses for that reason
+    // instead -- which is correct, and not what this is asserting. The
+    // difference showed up as a failure under `bazelisk run`, which runs from
+    // the runfiles directory rather than the workspace root and so finds no
+    // resources/FloodDiffusion at all.
     FloodDiffusionPipeline directml;
     FloodDiffusionOptions dmlOptions;
     dmlOptions.device = FloodDiffusionDevice::DirectML;
-    Expect("DirectML without a device is refused",
-           !directml.Load(kDirectory, dmlOptions, &error));
-    Expect("  with an error that says why",
-           error.find("DirectML") != std::string::npos);
+    if (std::filesystem::exists(kDirectory / "pipeline.txt")) {
+        Expect("DirectML without a device is refused",
+               !directml.Load(kDirectory, dmlOptions, &error));
+        Expect("  with an error that says why",
+               error.find("DirectML") != std::string::npos);
+    } else {
+        Expect("DirectML without a device is refused",
+               !directml.Load(kDirectory, dmlOptions, &error));
+        std::printf("  %-54s skipped (models not staged)\n",
+                    "  with an error that says why");
+    }
 }
 
 }  // namespace
+
+// The GPU-resident sampler against the host one, same prompt and seed, with
+// everything else pinned identically. Two questions, and they are different:
+// whether the motion still comes out right, and whether keeping the latents on
+// the device actually paid.
+//
+// It is not bit-identical and is not asserted to be. The same arithmetic runs
+// in a different order on different hardware, and 128 Euler steps compound
+// whatever that costs -- so this checks the motion is the same shape, not the
+// same bits.
+void CompareGpuLatents(const Run& host, const Run& resident) {
+    std::printf("\nhost round trip against GPU-resident latents\n");
+    if (!host.ok || !resident.ok) {
+        std::printf("  one of the runs did not complete; skipping\n");
+        return;
+    }
+    ExpectInt("the same number of frames", resident.frames, host.frames);
+    if (resident.positions.size() != host.positions.size()) {
+        Expect("the position arrays are the same size", false);
+        return;
+    }
+
+    float worst = 0.0f;
+    double total = 0.0;
+    bool finite = true;
+    for (std::size_t i = 0; i < host.positions.size(); ++i) {
+        const DirectX::XMFLOAT3& a = host.positions[i];
+        const DirectX::XMFLOAT3& b = resident.positions[i];
+        if (!std::isfinite(b.x) || !std::isfinite(b.y) || !std::isfinite(b.z)) {
+            finite = false;
+        }
+        const float dx = std::fabs(a.x - b.x);
+        const float dy = std::fabs(a.y - b.y);
+        const float dz = std::fabs(a.z - b.z);
+        const float worstHere = std::max(dx, std::max(dy, dz));
+        worst = std::max(worst, worstHere);
+        total += worstHere;
+    }
+    const double mean = total / static_cast<double>(host.positions.size());
+    Expect("every GPU-resident joint position is finite", finite);
+    std::printf("  %-54s %.5f m\n", "largest joint difference", worst);
+    std::printf("  %-54s %.5f m\n", "mean joint difference", mean);
+    // Centimetres on a figure a metre and a half tall: the same motion, not
+    // the same bits. A broken guidance combine or a transposed buffer index
+    // shows up here as tenths of a metre or as NaNs, not as this.
+    Expect("the motion is the same to within a centimetre", worst < 0.01f);
+
+    std::printf("  %-54s %.1f ms\n", "host round trip, warmed", host.milliseconds);
+    std::printf("  %-54s %.1f ms\n", "GPU-resident, warmed", resident.milliseconds);
+    if (host.milliseconds > 0.0) {
+        std::printf("  %-54s %.2fx\n", "speedup",
+                    host.milliseconds / std::max(resident.milliseconds, 1e-6));
+    }
+    // Not asserted. At eight latents the generation is 23 steps of a 20-wide
+    // buffer, where the copies are small and the fixed costs of both paths
+    // dominate; the win is at the shipped 60 latents, which this test is too
+    // short to pay for. //Engine:fd-probe measures the per-step difference
+    // directly.
+    std::printf("  (speed is not asserted: eight latents is too short to show "
+                "it -- see fd-probe)\n");
+}
+
+// Decoding paced to a consumer instead of to the sampler, against the eager
+// path it has to agree with.
+//
+// Two separate questions, and the second is the one that could have gone
+// wrong. Whether the motion is identical: it must be, because pacing defers
+// decoding without reordering it, and the decoder is strictly causal, so every
+// latent is still decoded exactly once in the same order with the same caches.
+// And whether the DECODER FOLLOWS, which is the behaviour being bought: the
+// sampler should finish a long way ahead while the decoder trails the playhead
+// by the lookahead, and the generation should not report itself over until the
+// motion exists.
+//
+// The consumer here is a simulated playhead rather than a clock, so the test
+// does not depend on how fast the machine is: it advances one motion frame per
+// tick, which is exactly what MotionStreamView does at 20 fps.
+void TestPacedDecode(const Devices& devices, const Run& eager) {
+    std::printf("\ndecoding paced to a consumer rather than to the sampler\n");
+
+    constexpr int kLookahead = 12;  // three latents, as the view uses
+    FloodDiffusionPipeline pipeline;
+    FloodDiffusionOptions options;
+    options.latentFrames = 8;
+    options.seed = 1234;
+    options.device = FloodDiffusionDevice::DirectML;
+    options.textEncoderDevice = FloodDiffusionDevice::Cpu;
+    options.staticShapes = true;
+    options.decodeAheadFrames = kLookahead;
+
+    std::string error;
+    if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
+                       devices.dml.Get())) {
+        std::printf("  %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    if (!pipeline.Begin("a person walks forward", options, &error)) {
+        std::printf("  %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+
+    // Denoise to the end WITHOUT consuming anything, which is the case eager
+    // decoding cannot express: the sampler runs out of work and the stream has
+    // produced nothing at all.
+    int guard = 0;
+    while (pipeline.StepsTaken() < pipeline.TotalSteps() && guard++ < 4000) {
+        if (!pipeline.Step(&error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+    }
+    ExpectInt("the sampler finalised every latent", pipeline.FinalisedLatents(),
+              options.latentFrames);
+    ExpectInt("and decoded none of them", pipeline.DecodedLatents(), 0);
+    Expect("the generation is not over, because there is no motion yet",
+           pipeline.IsRunning());
+    ExpectInt("no frames", pipeline.FrameCount(), 0);
+
+    // Now consume it, one motion frame per tick. The lookahead is what has to
+    // stay ahead of the playhead; the assertion is on the frame count rather
+    // than on a latent count because frames are what a consumer sees.
+    int playhead = 0;
+    int worstShortfall = 0;
+    int maxDecodedPerTick = 0;
+    guard = 0;
+    while (pipeline.IsRunning() && guard++ < 4000) {
+        const int before = pipeline.DecodedLatents();
+        if (!pipeline.DecodeAhead(playhead, &error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+        maxDecodedPerTick = std::max(maxDecodedPerTick,
+                                     pipeline.DecodedLatents() - before);
+        // What the consumer actually has in hand beyond where it is reading.
+        // Only meaningful while there is more to come.
+        if (pipeline.IsRunning()) {
+            worstShortfall = std::max(worstShortfall,
+                                      kLookahead -
+                                          (pipeline.FrameCount() - playhead));
+        }
+        if (playhead + 1 < pipeline.FrameCount()) {
+            ++playhead;
+        }
+        if (!pipeline.Step(&error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+    }
+    Expect("the generation finished once the motion was consumed",
+           pipeline.Done());
+    std::printf("  %-54s %d\n", "ticks to drain the backlog", guard);
+    std::printf("  %-54s %d\n", "most latents decoded in one tick",
+                maxDecodedPerTick);
+    // The lookahead is a target, not a guarantee -- it cannot be met before
+    // the first latent is finalised, and the run above finalised them all
+    // first. What matters is that it is never missed once the stream is
+    // flowing, which this run can show because the sampler was already done.
+    std::printf("  %-54s %d frames\n", "worst the lookahead fell short",
+                worstShortfall);
+    Expect("the lookahead was always met", worstShortfall <= 0);
+    // What filling the lookahead from nothing costs, which is the worst tick
+    // there can be. Not simply lookahead / framesStep: the FIRST latent
+    // decodes to vae_frames_first frames rather than four -- one, on this
+    // export -- so reaching twelve frames takes four latents and not three.
+    // Anything above this would mean the pacing overshot its target.
+    const FloodDiffusionConfig& decoded = pipeline.Config();
+    const int worstTick =
+        1 + (kLookahead - decoded.vaeFramesFirst + decoded.vaeFramesStep - 1) /
+                decoded.vaeFramesStep;
+    ExpectInt("the worst tick cost exactly the lookahead", maxDecodedPerTick,
+              worstTick);
+
+    if (!eager.ok) {
+        std::printf("  no eager run to compare against; skipping\n");
+        return;
+    }
+    ExpectInt("the same number of frames as eager decoding", pipeline.FrameCount(),
+              eager.frames);
+    if (pipeline.FrameCount() != eager.frames) {
+        return;
+    }
+    // Identical, not merely close: the same decoder ran on the same latents in
+    // the same order, so anything else here is a threading or cache bug rather
+    // than float noise.
+    float worst = 0.0f;
+    const int joints = pipeline.JointCount();
+    for (int frame = 0; frame < pipeline.FrameCount(); ++frame) {
+        const DirectX::XMFLOAT3* got = pipeline.Frame(frame);
+        for (int joint = 0; joint < joints; ++joint) {
+            const DirectX::XMFLOAT3& a =
+                eager.positions[static_cast<std::size_t>(frame) *
+                                    static_cast<std::size_t>(joints) +
+                                static_cast<std::size_t>(joint)];
+            const DirectX::XMFLOAT3& b = got[joint];
+            worst = std::max(worst, std::max(std::fabs(a.x - b.x),
+                                             std::max(std::fabs(a.y - b.y),
+                                                      std::fabs(a.z - b.z))));
+        }
+    }
+    std::printf("  %-54s %.5f m\n", "largest joint difference", worst);
+    Expect("pacing the decode changed nothing about the motion", worst == 0.0f);
+}
+
+// The two paths at the length the application actually generates.
+//
+// The comparison above runs eight latents, which is the right size for a
+// correctness check and the wrong one for a timing claim: the denoiser's cost
+// grows with the sequence length while the per-call overhead the GPU path
+// removes does not, so a short generation hides the difference. Sixty latents
+// is what MotionStreamView asks for by default.
+//
+// Reported, and the ratio asserted only loosely: how much this wins is a
+// property of the machine, and a tight bound here would be a test that fails
+// on a different GPU rather than a regression.
+void MeasureAtShippedLength(const Devices& devices) {
+    std::printf("\nthe two sampler paths at the shipped length (60 latents)\n");
+
+    // Denoise and decode kept apart, because the answer turns out to be about
+    // which of the two a generation actually spends its time in.
+    const auto measure = [&](bool gpuLatents, double* milliseconds, double* denoiseMs,
+                             double* decodeMs, int* frames) {
+        FloodDiffusionPipeline pipeline;
+        FloodDiffusionOptions options;
+        options.latentFrames = 60;
+        options.seed = 1234;
+        options.device = FloodDiffusionDevice::DirectML;
+        options.textEncoderDevice = FloodDiffusionDevice::Cpu;
+        options.staticShapes = true;
+        options.gpuLatents = gpuLatents;
+
+        std::string error;
+        if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
+                           devices.dml.Get())) {
+            std::printf("  %s\n", error.c_str());
+            return false;
+        }
+        // Twice: the first pass pays the EP's shape compilation, which is not
+        // what either path is being measured for.
+        for (int pass = 0; pass < 2; ++pass) {
+            if (!pipeline.Begin("a person walks forward", options, &error)) {
+                std::printf("  %s\n", error.c_str());
+                return false;
+            }
+            int guard = 0;
+            while (pipeline.IsRunning() && guard++ < 4000) {
+                if (!pipeline.Step(&error)) {
+                    std::printf("  %s\n", error.c_str());
+                    return false;
+                }
+            }
+            if (!pipeline.Done()) {
+                std::printf("  the generation did not finish\n");
+                return false;
+            }
+        }
+        *milliseconds = pipeline.GenerationMs();
+        *denoiseMs = pipeline.DenoiseTotalMs();
+        *decodeMs = pipeline.DecodeTotalMs();
+        *frames = pipeline.FrameCount();
+        return true;
+    };
+
+    double hostMs = 0.0, hostDenoise = 0.0, hostDecode = 0.0;
+    double residentMs = 0.0, residentDenoise = 0.0, residentDecode = 0.0;
+    int hostFrames = 0;
+    int residentFrames = 0;
+    if (!measure(false, &hostMs, &hostDenoise, &hostDecode, &hostFrames) ||
+        !measure(true, &residentMs, &residentDenoise, &residentDecode,
+                 &residentFrames)) {
+        ++g_failures;
+        return;
+    }
+
+    ExpectInt("both paths produced the same frame count", residentFrames, hostFrames);
+    const double seconds = hostFrames / FloodDiffusionPipeline::kFrameRate;
+    std::printf("  %-54s %.2f s\n", "motion generated", seconds);
+    std::printf("  %-54s %.1f ms\n", "host round trip", hostMs);
+    std::printf("  %-54s %.1f ms\n", "latents kept on the GPU", residentMs);
+    std::printf("  %-54s %.2fx\n", "speedup",
+                hostMs / std::max(residentMs, 1e-6));
+    // The part the option touches, and the part it does not. The second line
+    // is what localised this pipeline's cost and then showed it move: with the
+    // decoders on DirectML the decode was 188.5 ms of a 512.3 ms host
+    // generation; on the CPU provider, which is now the default, it is 69.2 of
+    // 354.1. See FloodDiffusionOptions::vaeDevice.
+    //
+    // The resident column's decode stays large for a reason that is accounting
+    // rather than cost: that path never waits during denoising, so the
+    // readback it does before a decode is where it waits for all of it.
+    std::printf("  %-54s %.1f -> %.1f ms\n", "  of which denoising", hostDenoise,
+                residentDenoise);
+    std::printf("  %-54s %.1f -> %.1f ms\n", "  of which VAE decode", hostDecode,
+                residentDecode);
+    std::printf("  %-54s %.0f%%\n", "  decode's share of the generation",
+                100.0 * hostDecode / std::max(hostMs, 1e-6));
+    Expect("the denoising half got no slower",
+           residentDenoise <= hostDenoise * 1.1);
+    std::printf("  %-54s %.1fx / %.1fx\n", "faster than playback, host / resident",
+                seconds * 1000.0 / std::max(hostMs, 1e-6),
+                seconds * 1000.0 / std::max(residentMs, 1e-6));
+
+    // Loose on purpose: the claim is "not slower", which is what makes the
+    // option worth having at all. The size of the win belongs in fd-probe,
+    // which measures one call rather than a whole generation.
+    Expect("keeping the latents on the GPU is not slower",
+           residentMs <= hostMs * 1.05);
+}
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -725,6 +1061,20 @@ int main() {
                 TestPipeline(config, FloodDiffusionDevice::DirectML, devices, &pinned,
                              true);
                 ComparePinned(gpu, pinned);
+
+                // The GPU-resident sampler, against the pinned host path it
+                // is otherwise identical to.
+                Run resident;
+                TestPipeline(config, FloodDiffusionDevice::DirectML, devices, &resident,
+                             true, true);
+                CompareGpuLatents(pinned, resident);
+
+                // Against `pinned`, not `gpu`: the paced run pins its shapes
+                // too, and the growing-prefix sampler produces different
+                // motion, so that is the only run it can be identical to.
+                TestPacedDecode(devices, pinned);
+
+                MeasureAtShippedLength(devices);
 
                 TestComputeQueue(devices);
             } else {

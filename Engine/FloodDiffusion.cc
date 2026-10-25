@@ -7,14 +7,23 @@
 #include <dml_provider_factory.h>
 #include <onnxruntime_cxx_api.h>
 
+// The guidance-and-Euler compute shader, for the GPU-resident sampler.
+#include <latent_step.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <random>
 #include <sstream>
+#include <vector>
+
+// TODO: If I want to optimize its execution speed, I need to first distill the denoiser to 1-2 steps denoiser, avoiding the 128 steps denoising, which may save about x64 time and can do it in 60 FPS
+// The second one may be inspecting what layers can be computed using bfloat16 instead of float32
 
 namespace NeuralModelIntegrateTestbed {
 
@@ -222,6 +231,446 @@ void DiffusionForcingSchedule::NoiseLevels(int step, std::vector<float>& out) co
 // FloodDiffusionPipeline
 // ---------------------------------------------------------------------------
 
+// --- the GPU-resident sampler ----------------------------------------------
+//
+// Keeps every denoiser tensor in a D3D12 buffer, binds them once with
+// Ort::IoBinding, and runs the guidance combine and the Euler step as a
+// compute shader writing the latents in place. Per step the only thing that
+// crosses the bus is the noise ramp, 520 bytes.
+//
+// There is no CPU synchronisation in the loop at all. The DirectML EP submits
+// to the same compute queue this dispatch goes on, so queue order alone
+// sequences denoise -> step -> denoise. The one place a wait is unavoidable is
+// decoding, which needs four floats of a finalised latent on the host; that
+// happens about 60 times a generation rather than 128.
+//
+// WHAT IT IS AND IS NOT WORTH is measured in FloodDiffusionOptions::
+// gpuLatents, and the short version is that it does not make a generation
+// faster: 508.7 ms against the host path's 506.9 at 60 latents. It makes the
+// DENOISING six times cheaper in the accounting (318.9 -> 53.8 ms) by never
+// waiting, and that time reappears in the decoder's readback, which does. The
+// generation is bound by GPU execution rather than by copies.
+//
+// So read the structure here as the device-resident half of a pipeline whose
+// other half -- the VAE decoder, 60 calls and most of the wall time -- is
+// still on host tensors. That is where the next measurable win is.
+struct GpuSampler {
+    // One tensor living in a D3D12 buffer. Ownership order matters on
+    // teardown: the Ort::Value points into the allocation, which points at the
+    // buffer, so they are released in that order.
+    struct Tensor {
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+        void* allocation = nullptr;
+        std::unique_ptr<Ort::Value> value;
+        std::uint64_t bytes = 0;
+    };
+
+    ID3D12Device* device = nullptr;
+    ID3D12CommandQueue* queue = nullptr;
+    const OrtDmlApi* dmlApi = nullptr;
+
+    std::unique_ptr<Ort::MemoryInfo> memoryInfo;
+    Tensor x;           // [rows, time, latentDim]  the latent state
+    Tensor t;           // [rows, time]             the noise ramp
+    Tensor context;     // [rows, 1, contextLen, textDim]
+    Tensor lens;        // [rows, 1] int64
+    Tensor textIdx;     // [rows, time] int64
+    Tensor prediction;  // [rows, time, latentDim]  the denoiser's output
+    std::unique_ptr<Ort::IoBinding> binding;
+
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    std::uint64_t fenceValue = 0;
+
+    // A RING of allocators, not one. An allocator may not be reset while the
+    // GPU is still executing commands recorded into it, and nothing in the
+    // step loop waits -- so reusing a single one reset it under the GPU's feet
+    // and produced "the GPU will not respond to more commands", which is a TDR
+    // rather than an error any API call returns. The command LIST is safe to
+    // reset as soon as it has been submitted; only the allocator has to be
+    // left alone, so one list cycling over several allocators is enough.
+    //
+    // Four, against two submissions per step: deep enough that the wait below
+    // is never reached in practice, shallow enough to be a rounding error of
+    // memory.
+    static constexpr std::uint32_t kAllocators = 4;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> commandAllocators[kAllocators];
+    std::uint64_t allocatorFence[kAllocators] = {};
+    std::uint32_t allocatorCursor = 0;
+    std::uint32_t openAllocator = 0;
+
+    // The per-step noise ramp is uploaded through a ring rather than one
+    // buffer: writing a slot the GPU has not finished copying from would
+    // corrupt the step in flight, and waiting for it every step would
+    // reintroduce exactly the stall this class exists to remove. Eight slots
+    // of 520 bytes, each remembering the fence value that retires it.
+    static constexpr std::uint32_t kRingSlots = 8;
+    Microsoft::WRL::ComPtr<ID3D12Resource> ring;
+    std::uint64_t ringSlotFence[kRingSlots] = {};
+    std::uint64_t ringSlotBytes = 0;
+    std::uint32_t ringCursor = 0;
+
+    // One buffer big enough for whichever constant input is largest, used only
+    // by Begin. Released afterwards would save 786 KB and cost a reallocation
+    // every generation, so it stays.
+    Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+
+    int rows = 1;
+    int time = 0;
+    int latentDim = 0;
+
+    ~GpuSampler() { Destroy(); }
+
+    void Destroy() {
+        // The binding references the values; the values reference the
+        // allocations. Anything else is a use-after-free inside ORT.
+        binding.reset();
+        for (Tensor* tensor : {&x, &t, &context, &lens, &textIdx, &prediction}) {
+            tensor->value.reset();
+            if (tensor->allocation != nullptr && dmlApi != nullptr) {
+                dmlApi->FreeGPUAllocation(tensor->allocation);
+                tensor->allocation = nullptr;
+            }
+            tensor->buffer.Reset();
+        }
+        memoryInfo.reset();
+    }
+
+    bool MakeBuffer(std::uint64_t bytes, D3D12_HEAP_TYPE heapType,
+                    Microsoft::WRL::ComPtr<ID3D12Resource>& out) const {
+        const auto heap = CD3DX12_HEAP_PROPERTIES(heapType);
+        // DirectML requires its tensor buffers to allow unordered access, and
+        // so does the compute shader that writes the latents.
+        const auto flags = heapType == D3D12_HEAP_TYPE_DEFAULT
+                               ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                               : D3D12_RESOURCE_FLAG_NONE;
+        const auto desc = CD3DX12_RESOURCE_DESC::Buffer(bytes, flags);
+        const D3D12_RESOURCE_STATES state =
+            heapType == D3D12_HEAP_TYPE_UPLOAD    ? D3D12_RESOURCE_STATE_GENERIC_READ
+            : heapType == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                   : D3D12_RESOURCE_STATE_COMMON;
+        return SUCCEEDED(device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&out)));
+    }
+
+    bool MakeTensor(Tensor& tensor, const std::vector<int64_t>& shape,
+                    ONNXTensorElementDataType type, std::uint64_t elementBytes) {
+        std::uint64_t elements = 1;
+        for (const int64_t dim : shape) {
+            elements *= static_cast<std::uint64_t>(dim);
+        }
+        tensor.bytes = elements * elementBytes;
+        if (!MakeBuffer(tensor.bytes, D3D12_HEAP_TYPE_DEFAULT, tensor.buffer)) {
+            return false;
+        }
+        if (dmlApi->CreateGPUAllocationFromD3DResource(tensor.buffer.Get(),
+                                                       &tensor.allocation) != nullptr) {
+            return false;
+        }
+        try {
+            // "DML" memory means the tensor's data is the allocation above
+            // rather than anything in CPU address space, which is what makes
+            // the Run copy-free.
+            tensor.value = std::make_unique<Ort::Value>(Ort::Value::CreateTensor(
+                *memoryInfo, tensor.allocation, static_cast<std::size_t>(tensor.bytes),
+                shape.data(), shape.size(), type));
+        } catch (const Ort::Exception&) {
+            return false;
+        }
+        return true;
+    }
+
+    bool Create(ID3D12Device* d3d, ID3D12CommandQueue* computeQueue,
+                const OrtDmlApi* api, Ort::Session& denoiser, int rowCount,
+                int submitted, int dim, int contextLen, int textDim,
+                std::string* error) {
+        device = d3d;
+        queue = computeQueue;
+        dmlApi = api;
+        rows = rowCount;
+        time = submitted;
+        latentDim = dim;
+
+        const auto fail = [&](const char* what) {
+            SetOrtError(error, std::string("the GPU-resident sampler: ") + what);
+            Destroy();
+            return false;
+        };
+
+        try {
+            memoryInfo = std::make_unique<Ort::MemoryInfo>("DML", OrtDeviceAllocator, 0,
+                                                           OrtMemTypeDefault);
+        } catch (const Ort::Exception& e) {
+            return fail(Shorten(e.what()).c_str());
+        }
+
+        const int64_t r = rows; // batch
+        const int64_t tm = time;
+        const int64_t ld = latentDim;
+        if (!MakeTensor(x, {r, tm, ld}, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                        sizeof(float)) ||
+            !MakeTensor(t, {r, tm}, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                        sizeof(float)) ||
+            !MakeTensor(context, {r, 1, contextLen, textDim},
+                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, sizeof(float)) ||
+            !MakeTensor(lens, {r, 1}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                        sizeof(int64_t)) ||
+            !MakeTensor(textIdx, {r, tm}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                        sizeof(int64_t)) ||
+            !MakeTensor(prediction, {r, tm, ld}, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                        sizeof(float))) {
+            return fail("could not create the device tensors");
+        }
+
+        ringSlotBytes = t.bytes;
+        if (!MakeBuffer(ringSlotBytes * kRingSlots, D3D12_HEAP_TYPE_UPLOAD, ring) ||
+            !MakeBuffer(context.bytes, D3D12_HEAP_TYPE_UPLOAD, staging) ||
+            !MakeBuffer(x.bytes, D3D12_HEAP_TYPE_READBACK, readback)) {
+            return fail("could not create the upload and readback buffers");
+        }
+
+        // Root constants and three root descriptors: three raw buffers need no
+        // descriptor heap, so this dispatch cannot disturb whatever heaps the
+        // renderer left bound on its own queue.
+        //
+        // Must stay in lockstep with shaders/latent_step.hlsl. Kept only here
+        // rather than also in the shader, unlike the graphics signatures in
+        // this project: the shader is compiled without a root signature
+        // attribute, so there is no second copy to drift from.
+        CD3DX12_ROOT_PARAMETER1 parameters[4] = {};
+        parameters[0].InitAsConstants(8, 0);
+        parameters[1].InitAsUnorderedAccessView(0);
+        parameters[2].InitAsUnorderedAccessView(1);
+        parameters[3].InitAsUnorderedAccessView(2);
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC desc;
+        desc.Init_1_1(static_cast<UINT>(std::size(parameters)), parameters, 0, nullptr,
+                      D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        Microsoft::WRL::ComPtr<ID3DBlob> serialized;
+        Microsoft::WRL::ComPtr<ID3DBlob> blobError;
+        if (FAILED(D3DX12SerializeVersionedRootSignature(
+                &desc, D3D_ROOT_SIGNATURE_VERSION_1_1, &serialized, &blobError)) ||
+            FAILED(device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                                               serialized->GetBufferSize(),
+                                               IID_PPV_ARGS(&rootSignature)))) {
+            return fail("could not create the latent-step root signature");
+        }
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = rootSignature.Get();
+        pso.CS = {g_latent_step_bytecode, sizeof(g_latent_step_bytecode)};
+        if (FAILED(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&pipeline)))) {
+            return fail("could not create the latent-step pipeline");
+        }
+        pipeline->SetName(L"FloodDiffusion latent step");
+
+        // COMPUTE, matching the queue: a command list's type has to equal its
+        // queue's, and this list only dispatches and copies buffers.
+        for (std::uint32_t i = 0; i < kAllocators; ++i) {
+            if (FAILED(device->CreateCommandAllocator(
+                    D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                    IID_PPV_ARGS(&commandAllocators[i])))) {
+                return fail("could not create the latent-step command allocators");
+            }
+        }
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                                             commandAllocators[0].Get(), nullptr,
+                                             IID_PPV_ARGS(&commandList))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+            return fail("could not create the latent-step command list");
+        }
+        commandList->Close();
+
+        try {
+            binding = std::make_unique<Ort::IoBinding>(denoiser);
+            binding->BindInput("x", *x.value);
+            binding->BindInput("t", *t.value);
+            binding->BindInput("context", *context.value);
+            binding->BindInput("context_lens", *lens.value);
+            binding->BindInput("text_idx", *textIdx.value);
+            binding->BindOutput("prediction", *prediction.value);
+        } catch (const Ort::Exception& e) {
+            return fail(Shorten(e.what()).c_str());
+        }
+        return true;
+    }
+
+
+    // Blocks until `target` has retired. Used only where a wait is genuinely
+    // required: the readback, teardown, the ring having wrapped, and the VAE
+    // decoder's motion output.
+    bool WaitFor(std::uint64_t target) {
+        if (target == 0 || fence->GetCompletedValue() >= target) {
+            return true;
+        }
+        Microsoft::WRL::Wrappers::Event event(
+            CreateEventEx(nullptr, nullptr, 0, EVENT_MODIFY_STATE | SYNCHRONIZE));
+        if (!event.IsValid() ||
+            FAILED(fence->SetEventOnCompletion(target, event.Get()))) {
+            return false;
+        }
+        WaitForSingleObject(event.Get(), INFINITE);
+        return true;
+    }
+
+    // One list, submitted and left for the queue to run. Everything in the
+    // step loop goes through this, so nothing in the loop waits.
+    bool Submit() {
+        commandList->Close();
+        ID3D12CommandList* lists[] = {commandList.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        const std::uint64_t target = ++fenceValue;
+        if (FAILED(queue->Signal(fence.Get(), target))) {
+            return false;
+        }
+        // The allocator this list recorded into is now in flight, and must not
+        // be reset before this value retires.
+        allocatorFence[openAllocator] = target;
+        return true;
+    }
+
+    bool BeginList() {
+        const std::uint32_t slot = allocatorCursor % kAllocators;
+        allocatorCursor = (allocatorCursor + 1) % kAllocators;
+        if (!WaitFor(allocatorFence[slot])) {
+            return false;
+        }
+        if (FAILED(commandAllocators[slot]->Reset()) ||
+            FAILED(commandList->Reset(commandAllocators[slot].Get(), nullptr))) {
+            return false;
+        }
+        openAllocator = slot;
+        return true;
+    }
+
+    // Copies host bytes into a DEFAULT-heap buffer through the staging buffer,
+    // and waits. Only Begin calls this: the constant inputs go up once per
+    // generation, which is the whole point of binding them.
+    bool UploadOnce(ID3D12Resource* destination, const void* source,
+                    std::uint64_t bytes) {
+        void* mapped = nullptr;
+        if (FAILED(staging->Map(0, nullptr, &mapped))) {
+            return false;
+        }
+        std::memcpy(mapped, source, static_cast<std::size_t>(bytes));
+        staging->Unmap(0, nullptr);
+        if (!BeginList()) {
+            return false;
+        }
+        commandList->CopyBufferRegion(destination, 0, staging.Get(), 0, bytes);
+        // Waited on, unlike the step loop: the caller is about to overwrite
+        // the staging buffer with the next input.
+        return Submit() && WaitFor(fenceValue);
+    }
+
+    // The noise ramp, through the ring, with no wait unless the ring has
+    // wrapped onto a slot still in flight.
+    bool UploadNoiseLevels(const float* levels, int count) {
+        const std::uint32_t slot = ringCursor % kRingSlots;
+        ringCursor = (ringCursor + 1) % kRingSlots;
+        if (!WaitFor(ringSlotFence[slot])) {
+            return false;
+        }
+
+        const std::uint64_t offset = static_cast<std::uint64_t>(slot) * ringSlotBytes;
+        void* mapped = nullptr;
+        const D3D12_RANGE range = {static_cast<SIZE_T>(offset),
+                                   static_cast<SIZE_T>(offset + ringSlotBytes)};
+        if (FAILED(ring->Map(0, &range, &mapped))) {
+            return false;
+        }
+        float* slotBase = reinterpret_cast<float*>(static_cast<std::uint8_t*>(mapped) +
+                                                   offset);
+        // Every guidance row sees the same ramp, which is what makes the two
+        // predictions comparable.
+        for (int row = 0; row < rows; ++row) {
+            std::memcpy(slotBase + static_cast<std::size_t>(row) * count, levels,
+                        static_cast<std::size_t>(count) * sizeof(float));
+        }
+        ring->Unmap(0, &range);
+
+        if (!BeginList()) {
+            return false;
+        }
+        commandList->CopyBufferRegion(t.buffer.Get(), 0, ring.Get(), offset, t.bytes);
+        if (!Submit()) {
+            return false;
+        }
+        ringSlotFence[slot] = fenceValue;
+        return true;
+    }
+
+    // The guidance combine and the Euler step, dispatched after the Run whose
+    // prediction it reads. Same queue, so no barrier between them is needed
+    // beyond the one queue order already gives.
+    bool DispatchStep(int start, int end, float cfgScale, float dt,
+                      std::uint32_t predictionType) {
+        if (end <= start) {
+            return true;
+        }
+        if (!BeginList()) {
+            return false;
+        }
+        const std::uint32_t constants[8] = {
+            static_cast<std::uint32_t>(start),
+            static_cast<std::uint32_t>(end),
+            static_cast<std::uint32_t>(latentDim),
+            static_cast<std::uint32_t>(rows),
+            static_cast<std::uint32_t>(time),
+            // Floats through the same 32-bit root constants, reinterpreted
+            // rather than converted.
+            *reinterpret_cast<const std::uint32_t*>(&cfgScale),
+            *reinterpret_cast<const std::uint32_t*>(&dt),
+            predictionType,
+        };
+        commandList->SetComputeRootSignature(rootSignature.Get());
+        commandList->SetPipelineState(pipeline.Get());
+        commandList->SetComputeRoot32BitConstants(0, 8, constants, 0);
+        commandList->SetComputeRootUnorderedAccessView(
+            1, x.buffer->GetGPUVirtualAddress());
+        commandList->SetComputeRootUnorderedAccessView(
+            2, prediction.buffer->GetGPUVirtualAddress());
+        commandList->SetComputeRootUnorderedAccessView(
+            3, t.buffer->GetGPUVirtualAddress());
+        const std::uint32_t lanes =
+            static_cast<std::uint32_t>(end - start) * static_cast<std::uint32_t>(latentDim);
+        commandList->Dispatch((lanes + 63) / 64, 1, 1);
+        return Submit();
+    }
+
+    // Four floats per latent, for the decoder. The only wait in a generation
+    // that is not teardown, and it happens per decode batch rather than per
+    // step.
+    bool ReadLatents(int firstIndex, int count, float* out) {
+        if (count <= 0) {
+            return true;
+        }
+        const std::uint64_t offset = static_cast<std::uint64_t>(firstIndex) *
+                                     static_cast<std::uint64_t>(latentDim) * sizeof(float);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(count) *
+                                    static_cast<std::uint64_t>(latentDim) * sizeof(float);
+        if (!BeginList()) {
+            return false;
+        }
+        // Row 0 only: the rows hold the same latents.
+        commandList->CopyBufferRegion(readback.Get(), 0, x.buffer.Get(), offset, bytes);
+        if (!Submit() || !WaitFor(fenceValue)) {
+            return false;
+        }
+        void* mapped = nullptr;
+        const D3D12_RANGE range = {0, static_cast<SIZE_T>(bytes)};
+        if (FAILED(readback->Map(0, &range, &mapped))) {
+            return false;
+        }
+        std::memcpy(out, mapped, static_cast<std::size_t>(bytes));
+        const D3D12_RANGE empty = {0, 0};
+        readback->Unmap(0, &empty);
+        return true;
+    }
+};
+
 struct FloodDiffusionPipeline::Impl {
     FloodDiffusionConfig config;
     FloodDiffusionDevice device = FloodDiffusionDevice::Cpu;
@@ -242,10 +691,16 @@ struct FloodDiffusionPipeline::Impl {
     std::unique_ptr<Ort::SessionOptions> vaeOptions;
     std::unique_ptr<Ort::SessionOptions> textOptions;
     FloodDiffusionDevice textEncoderDevice = FloodDiffusionDevice::Cpu;
+    FloodDiffusionDevice vaeDevice = FloodDiffusionDevice::Cpu;
 
     bool staticShapes = false;
     int staticLatentFrames = 0;
     int staticTime = 0;   // the pinned `time`: latentFrames + chunkSize
+
+    // Non-null when the sampler keeps its latents in GPU memory; see
+    // GpuSampler. Requires DirectML and pinned shapes, both checked at Load.
+    std::unique_ptr<GpuSampler> gpu;
+
 
     // Declared BEFORE the sessions on purpose: members are destroyed in
     // reverse declaration order, and the queue an execution provider submits
@@ -301,6 +756,9 @@ struct FloodDiffusionPipeline::Impl {
     // next; `decodedLatents` is how far the decoder has consumed.
     std::vector<Ort::Value> caches;
     int decodedLatents = 0;
+    // Zero decodes inside Step, as it always did; non-zero hands decoding to
+    // DecodeAhead. See FloodDiffusionOptions::decodeAheadFrames.
+    int decodeAheadFrames = 0;
 
     std::unique_ptr<StreamJointRecovery> recovery;
     std::vector<DirectX::XMFLOAT3> frames;  // frameCount * joints
@@ -315,6 +773,11 @@ struct FloodDiffusionPipeline::Impl {
     double lastDenoiseMs = 0.0;
     double lastDecodeMs = 0.0;
     double generationMs = 0.0;
+    // Summed over the generation. The pair is what localises the cost: the
+    // denoiser runs 128 times and the decoder 60, and it is the decoder that
+    // dominates.
+    double denoiseTotalMs = 0.0;
+    double decodeTotalMs = 0.0;
 
     // Scratch, reused across steps so a step does not allocate.
     std::vector<float> batchedLatents;
@@ -492,6 +955,10 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
     // a stale one would quietly keep serving prompts from the OLD provider.
     // The cached features go with it -- they are just floats, but they were
     // produced by the session being replaced.
+    // Before the sessions, because the sampler holds an Ort::IoBinding onto
+    // the denoiser: an OrtIoBinding outliving its session is a use-after-free
+    // inside ORT.
+    impl.gpu.reset();
     impl.denoiser.reset();
     impl.vaeFirst.reset();
     impl.vaeStep.reset();
@@ -540,6 +1007,7 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
         return false;
     }
     impl.textEncoderDevice = options.textEncoderDevice;
+    impl.vaeDevice = options.vaeDevice;
     impl.staticShapes = options.staticShapes;
     impl.staticLatentFrames = options.latentFrames;
     impl.staticTime = options.latentFrames + impl.config.chunkSize;
@@ -565,25 +1033,54 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
             // masks the padding out of cross-attention.
             {"ctx_len", impl.config.textLen},
         };
-        // The VAE decoders are deliberately left DYNAMIC, even though pinning
-        // their `batch` would take a decode from 1.48 ms to 0.47 ms.
+        // The cache_out_9's ConstantOfShape may come from padding operations in decoding? (see CausalConv1d in https://github.com/AlayaLab/FloodDiffusion/blob/b611d6c4e24357a90066034935ed445179723b37/models/tools/wan_vae_1d.py#L32)
+        // The VAE decoders are left DYNAMIC, and the reason has changed twice,
+        // so it is worth recording what was actually measured rather than only
+        // the conclusion. //Engine:fd-probe section 11 is the apparatus.
         //
-        // Pinning it breaks the cache hand-off between the two sessions on ORT
-        // 1.24.4: vae_decoder_first runs fine on its own, but feeding its 20
-        // cache outputs into vae_decoder_step then fails with "Unexpected input
-        // data type. Actual: (((null))) , expected: ((tensor(float)))". A
-        // statically-shaped session's outputs apparently cannot be handed
-        // straight to another statically-shaped session's inputs here. The
-        // denoiser is where the time is -- it runs 128 times a generation
-        // against the decoders' 60, and it is the one carrying 1334 nodes -- so
-        // this costs little and keeps the decoder path working.
+        // ONE. Pinning `batch` on vae_decoder_FIRST makes the DirectML EP
+        // return a NULL for one of its 20 cache outputs -- cache_out_9 -- so
+        // the next decode fails with "Unexpected input data type. Actual:
+        // (((null))) , expected: ((tensor(float)))".
+        //
+        // Root-caused under a debugger against a Debug build of ORT 1.31, and
+        // it is not a shape problem at all. cache_out_9 is the only one of the
+        // twenty produced by a ConstantOfShape; pinning `batch` makes its
+        // shape input static, so ORT's ConstantFolding evaluates it and
+        // replaces the output with a graph INITIALIZER of the same name. The
+        // DirectML EP's graph fusion then finds that initializer unused by the
+        // fused partition -- its only consumer, the Identity behind
+        // cache_out_14, was folded away too -- and deletes it with
+        // Graph::RemoveInitializedTensor, which does not check whether the
+        // name is a graph output. The output then has neither a producer nor
+        // an initializer behind it. Setting
+        // optimization.disable_specified_optimizers to ConstantFolding avoids
+        // it, and is not worth what the rest of constant folding is worth: the
+        // pinned DirectML decode is still 4.45 ms a call against the CPU's
+        // 1.36. skills/onnx-directml-ep/SKILL.md section 5.0 has the stack.
+        //
+        // TWO. So Ort::IoBinding with the caches in D3D12 buffers was built,
+        // on the theory that removing the output-to-input hand-off would
+        // remove the refusal. It does not: IoBinding on vae_decoder_step fails
+        // in every configuration -- `batch` pinned or symbolic, fusion on or
+        // off, caches in device OR host memory -- while the identical values
+        // through the ordinary Run API work in all of them. The binding is the
+        // problem, not the memory. That code was written, measured and
+        // removed.
+        //
+        // THREE. Pinning only vae_decoder_STEP does work -- no null, hand-off
+        // intact -- and buys nothing measurable: 5.42 against 5.50 ms per
+        // call, which is run-to-run noise. So there is no configuration of the
+        // pin worth a third SessionOptions set. What did move the decode was
+        // FloodDiffusionOptions::vaeDevice, about 4x, by leaving the EP that
+        // all of the above is a property of.
         vaeDims = {};
     }
 
     if (!impl.MakeOptions(impl.device, denoiserDims, impl.denoiserOptions, error)) {
         return false;
     }
-    if (!impl.MakeOptions(impl.device, vaeDims, impl.vaeOptions, error)) {
+    if (!impl.MakeOptions(impl.vaeDevice, vaeDims, impl.vaeOptions, error)) {
         return false;
     }
     if (!impl.MakeOptions(impl.textEncoderDevice, {}, impl.textOptions, error)) {
@@ -623,6 +1120,37 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
         impl.cacheInNames.push_back("cache_in_" + std::to_string(i));
         impl.cacheOutNames.push_back("cache_out_" + std::to_string(i));
     }
+    // The GPU-resident sampler, once the denoiser session exists to bind to.
+    // Both preconditions are refused rather than worked around: without
+    // DirectML there is no device tensor to make, and without pinned shapes
+    // the x buffer would have to be rebuilt every other step.
+    impl.gpu.reset();
+    if (options.gpuLatents) {
+        if (impl.device != FloodDiffusionDevice::DirectML) {
+            SetOrtError(error, "gpuLatents needs FloodDiffusionDevice::DirectML");
+            return false;
+        }
+        if (!impl.staticShapes) {
+            SetOrtError(error, "gpuLatents needs staticShapes: the device buffers are "
+                               "created once with the pinned shapes");
+            return false;
+        }
+        // guidanceRows, not impl.rows: the latter is settled by Begin from
+        // the prompt, and these buffers are created here. Both come from the
+        // exported cfg_scale, so they agree -- and the denoiser session was
+        // just created with `batch` pinned to this very value, so a mismatch
+        // would be refused by Run rather than silently batched wrongly.
+        const int contextLen = impl.config.textLen;
+        auto sampler = std::make_unique<GpuSampler>();
+        if (!sampler->Create(device, impl.computeQueue.Get(), SharedDmlApi(error),
+                             *impl.denoiser, static_cast<int>(guidanceRows),
+                             impl.staticTime, impl.config.latentDim, contextLen,
+                             impl.config.textDim, error)) {
+            return false;
+        }
+        impl.gpu = std::move(sampler);
+    }
+
     impl.vaeFirstOutputNames.assign({"motion"});
     impl.vaeStepInputNames.assign({"z"});
     impl.vaeStepOutputNames.assign({"motion"});
@@ -654,7 +1182,19 @@ FloodDiffusionDevice FloodDiffusionPipeline::TextEncoderDevice() const {
     return m_impl->textEncoderDevice;
 }
 
+FloodDiffusionDevice FloodDiffusionPipeline::VaeDevice() const {
+    return m_impl->vaeDevice;
+}
+
 bool FloodDiffusionPipeline::StaticShapes() const { return m_impl->staticShapes; }
+bool FloodDiffusionPipeline::GpuLatents() const { return m_impl->gpu != nullptr; }
+
+double FloodDiffusionPipeline::DenoiseTotalMs() const {
+    return m_impl->denoiseTotalMs;
+}
+double FloodDiffusionPipeline::DecodeTotalMs() const {
+    return m_impl->decodeTotalMs;
+}
 
 int FloodDiffusionPipeline::StaticLatentFrames() const {
     return m_impl->staticLatentFrames;
@@ -837,6 +1377,39 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
         value = normal(generator);
     }
 
+    // Everything the GPU path keeps resident goes up here, once: the context
+    // and its lengths, the all-zero text_idx, and the seeded latents
+    // duplicated across the guidance rows. After this, a step sends 520 bytes.
+    if (impl.gpu != nullptr) {
+        const std::size_t perRow = static_cast<std::size_t>(impl.staticTime) *
+                                   static_cast<std::size_t>(impl.config.latentDim);
+        impl.batchedLatents.assign(perRow * static_cast<std::size_t>(impl.rows), 0.0f);
+        for (int row = 0; row < impl.rows; ++row) {
+            // The latent buffer holds TotalLatents, which in static mode is
+            // exactly staticTime, so this is a whole-buffer copy per row.
+            std::copy(impl.latents.begin(),
+                      impl.latents.begin() + static_cast<std::ptrdiff_t>(
+                                                 std::min(perRow, impl.latents.size())),
+                      impl.batchedLatents.begin() +
+                          static_cast<std::ptrdiff_t>(perRow * row));
+        }
+        impl.batchedTextIdx.assign(static_cast<std::size_t>(impl.staticTime) *
+                                       static_cast<std::size_t>(impl.rows),
+                                   0);
+        if (!impl.gpu->UploadOnce(impl.gpu->x.buffer.Get(), impl.batchedLatents.data(),
+                                  impl.gpu->x.bytes) ||
+            !impl.gpu->UploadOnce(impl.gpu->context.buffer.Get(), impl.context.data(),
+                                  impl.gpu->context.bytes) ||
+            !impl.gpu->UploadOnce(impl.gpu->lens.buffer.Get(), impl.contextLens.data(),
+                                  impl.gpu->lens.bytes) ||
+            !impl.gpu->UploadOnce(impl.gpu->textIdx.buffer.Get(),
+                                  impl.batchedTextIdx.data(),
+                                  impl.gpu->textIdx.bytes)) {
+            SetOrtError(error, "uploading the generation's inputs to the GPU failed");
+            return false;
+        }
+    }
+
     impl.step = 0;
     impl.running = true;
     impl.caches.clear();
@@ -848,6 +1421,9 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
     impl.lastDenoiseMs = 0.0;
     impl.lastDecodeMs = 0.0;
     impl.generationMs = 0.0;
+    impl.denoiseTotalMs = 0.0;
+    impl.decodeTotalMs = 0.0;
+    impl.decodeAheadFrames = std::max(0, options.decodeAheadFrames);
     impl.recovery->SetSmoothingAlpha(options.smoothingAlpha);
     impl.recovery->Reset();
     return true;
@@ -886,6 +1462,42 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
     const int latentDim = config.latentDim;
     const std::size_t perRow = static_cast<std::size_t>(submitted) *
                                static_cast<std::size_t>(latentDim);
+
+    // The GPU-resident path. The latents are already in the x buffer from the
+    // previous step's dispatch, the context has not changed since Begin, and
+    // the prediction is written into a buffer this process owns -- so the only
+    // thing to send is the ramp, and nothing comes back.
+    if (gpu != nullptr) {
+        const auto began = std::chrono::steady_clock::now();
+        if (!gpu->UploadNoiseLevels(noiseLevels.data(), submitted)) {
+            SetOrtError(error, "uploading the noise ramp failed");
+            return false;
+        }
+
+        try {
+            denoiser->Run(Ort::RunOptions{nullptr}, *gpu->binding);
+        } catch (const Ort::Exception& e) {
+            SetOrtError(error, "denoising: " + Shorten(e.what()));
+            return false;
+        }
+        // "vel" needs neither the current latent nor the level, but the shader
+        // takes all three so the two paths cannot diverge on the other two
+        // prediction types.
+        const std::uint32_t predictionType = config.predictionType == "x0"   ? 1u
+                                             : config.predictionType == "noise" ? 2u
+                                                                                : 0u;
+        if (!gpu->DispatchStep(start, end, config.cfgScale,
+                               static_cast<float>(schedule.Dt()), predictionType)) {
+            SetOrtError(error, "dispatching the latent step failed");
+            return false;
+        }
+        // Wall time only, and deliberately not a GPU time: nothing in this
+        // path waits, so what this measures is how long the submission took.
+        // The honest end-to-end number is GenerationMs.
+        lastDenoiseMs = Milliseconds(began);
+        denoiseTotalMs += lastDenoiseMs;
+        return true;
+    }
 
     // Every guidance row sees the same latents and noise levels; only the text
     // context differs, which is what makes the two predictions comparable.
@@ -929,6 +1541,7 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
             denoiser->Run(Ort::RunOptions{nullptr}, inputNames, inputs.data(),
                           inputs.size(), outputNames, 1);
         lastDenoiseMs = Milliseconds(began);
+        denoiseTotalMs += lastDenoiseMs;
 
         const float* prediction = outputs[0].GetTensorData<float>();
         const float dt = static_cast<float>(schedule.Dt());
@@ -1049,6 +1662,20 @@ bool FloodDiffusionPipeline::Impl::DecodeOne(int latentIndex, std::string* error
 bool FloodDiffusionPipeline::Impl::DecodeUpTo(int latentLimit, std::string* error) {
     const int limit = std::min(latentLimit, schedule.GeneratedLatents());
     const auto began = std::chrono::steady_clock::now();
+
+    // On the GPU path the authoritative latents are in the x buffer, so the
+    // ones about to be decoded have to come back first. This is the only wait
+    // in a generation: it happens once per decode batch -- about 60 times --
+    // rather than once per step, and it brings back four floats per latent.
+    if (gpu != nullptr && limit > decodedLatents) {
+        const int count = limit - decodedLatents;
+        if (!gpu->ReadLatents(decodedLatents, count,
+                              latents.data() + static_cast<std::size_t>(decodedLatents) *
+                                                   static_cast<std::size_t>(config.latentDim))) {
+            SetOrtError(error, "reading the finalised latents back failed");
+            return false;
+        }
+    }
     bool decoded = false;
     while (decodedLatents < limit) {
         if (!DecodeOne(decodedLatents, error)) {
@@ -1059,6 +1686,7 @@ bool FloodDiffusionPipeline::Impl::DecodeUpTo(int latentLimit, std::string* erro
     }
     if (decoded) {
         lastDecodeMs = Milliseconds(began);
+        decodeTotalMs += lastDecodeMs;
     }
     return true;
 }
@@ -1075,34 +1703,77 @@ bool FloodDiffusionPipeline::Step(std::string* error) {
 
     const auto began = std::chrono::steady_clock::now();
 
-    if (impl.step >= impl.schedule.TotalSteps()) {
-        // Out of steps: everything that remains is as denoised as it is going
-        // to get, so decode the rest and stop.
-        if (!impl.DecodeUpTo(impl.schedule.GeneratedLatents(), error)) {
+    // Out of steps: everything that remains is as denoised as it is going to
+    // get. Eagerly, that means decode the rest and stop. Paced, the sampler is
+    // simply finished and the generation is not -- running stays true until
+    // DecodeAhead has drained the backlog, because a stream is over when the
+    // motion exists, not when the latents do.
+    if (impl.step < impl.schedule.TotalSteps()) {
+        if (!impl.Denoise(error)) {
             impl.running = false;
             return false;
         }
+        ++impl.step;
+    }
+
+    if (impl.decodeAheadFrames == 0) {
+        // A latent is final once no remaining step will touch it again.
+        // Because `start` never decreases, the next step's start is exactly
+        // that boundary.
+        const int finalised = impl.step < impl.schedule.TotalSteps()
+                                  ? impl.schedule.StartAt(impl.step)
+                                  : impl.schedule.GeneratedLatents();
+        if (!impl.DecodeUpTo(finalised, error)) {
+            impl.running = false;
+            return false;
+        }
+    }
+
+    if (impl.step >= impl.schedule.TotalSteps() &&
+        impl.decodedLatents >= impl.schedule.GeneratedLatents()) {
         impl.running = false;
-        impl.generationMs += Milliseconds(began);
+    }
+    impl.generationMs += Milliseconds(began);
+    return true;
+}
+
+bool FloodDiffusionPipeline::DecodeAhead(int consumedFrame, std::string* error) {
+    Impl& impl = *m_impl;
+    if (impl.decodeAheadFrames == 0 || !impl.schedule.IsValid()) {
         return true;
     }
-
-    if (!impl.Denoise(error)) {
-        impl.running = false;
+    if (!IsLoaded()) {
+        SetOrtError(error, "the FloodDiffusion pipeline is not loaded");
         return false;
     }
-    ++impl.step;
 
-    // A latent is final once no remaining step will touch it again. Because
-    // `start` never decreases, the next step's start is exactly that boundary.
+    // Frames wanted, rounded up to whole latents because a latent is the unit
+    // the decoder produces. The first decodes to vaeFramesFirst and the rest
+    // to vaeFramesStep, so the arithmetic is over the frames already in hand
+    // rather than over latents times four.
+    const int wanted = std::max(0, consumedFrame) + impl.decodeAheadFrames;
+    const int perLatent = impl.config.FramesPerLatent();
+    if (perLatent <= 0) {
+        SetOrtError(error, "the VAE decodes no frames per latent");
+        return false;
+    }
+
+    const auto began = std::chrono::steady_clock::now();
     const int finalised = impl.step < impl.schedule.TotalSteps()
                               ? impl.schedule.StartAt(impl.step)
                               : impl.schedule.GeneratedLatents();
-    if (!impl.DecodeUpTo(finalised, error)) {
+    int target = impl.decodedLatents;
+    for (int frames = impl.frameCount; frames < wanted && target < finalised; ++target) {
+        frames += target == 0 ? impl.config.vaeFramesFirst : perLatent;
+    }
+    if (target > impl.decodedLatents && !impl.DecodeUpTo(target, error)) {
         impl.running = false;
         return false;
     }
 
+    // The same end condition Step applies, so a generation whose sampler
+    // finished long ago still reports itself over on the tick that decodes its
+    // last latent rather than on the next Step.
     if (impl.step >= impl.schedule.TotalSteps() &&
         impl.decodedLatents >= impl.schedule.GeneratedLatents()) {
         impl.running = false;
@@ -1119,6 +1790,18 @@ int FloodDiffusionPipeline::StepsTaken() const { return m_impl->step; }
 int FloodDiffusionPipeline::TotalSteps() const { return m_impl->schedule.TotalSteps(); }
 
 int FloodDiffusionPipeline::FrameCount() const { return m_impl->frameCount; }
+int FloodDiffusionPipeline::DecodedLatents() const { return m_impl->decodedLatents; }
+
+int FloodDiffusionPipeline::FinalisedLatents() const {
+    const Impl& impl = *m_impl;
+    if (!impl.schedule.IsValid()) {
+        return 0;
+    }
+    return impl.step < impl.schedule.TotalSteps()
+               ? impl.schedule.StartAt(impl.step)
+               : impl.schedule.GeneratedLatents();
+}
+
 int FloodDiffusionPipeline::JointCount() const { return m_impl->config.joints; }
 
 const DirectX::XMFLOAT3* FloodDiffusionPipeline::Frame(int index) const {
