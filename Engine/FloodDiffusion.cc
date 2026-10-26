@@ -167,8 +167,8 @@ bool FloodDiffusionConfig::Load(const std::filesystem::path& path, std::string* 
 // ---------------------------------------------------------------------------
 
 DiffusionForcingSchedule::DiffusionForcingSchedule(int latentFrames, int chunkSize,
-                                                   int denoiseSteps)
-    : m_chunkSize(chunkSize), m_denoiseSteps(denoiseSteps) {
+                                                   int denoiseSteps, bool continuous)
+    : m_chunkSize(chunkSize), m_denoiseSteps(denoiseSteps), m_continuous(continuous) {
     if (latentFrames <= 0 || chunkSize <= 0 || denoiseSteps <= 0) {
         return;
     }
@@ -214,16 +214,37 @@ int DiffusionForcingSchedule::EndAt(int step) const {
     }
     const double t = TimeAt(step);
     const int end = static_cast<int>(static_cast<double>(m_chunkSize) * t) + 1;
-    return std::min(end, m_totalLatents);
+    // The clamp is what makes a FINITE schedule stop producing: the sequence
+    // is m_totalLatents long and the ramp cannot run past its end. A
+    // continuous one has no end to run past.
+    return m_continuous ? end : std::min(end, m_totalLatents);
 }
 
 void DiffusionForcingSchedule::NoiseLevels(int step, std::vector<float>& out) const {
-    const int end = EndAt(step);
-    out.resize(static_cast<std::size_t>(std::max(end, 0)));
-    const float t = static_cast<float>(TimeAt(step));
-    for (int i = 0; i < end; ++i) {
-        const float level = m_base[static_cast<std::size_t>(i)] - t;
-        out[static_cast<std::size_t>(i)] = std::clamp(level, 0.0f, 1.0f);
+    WindowNoiseLevels(step, 0, std::max(EndAt(step), 0), out);
+}
+
+void DiffusionForcingSchedule::WindowNoiseLevels(int step, int origin, int count,
+                                                 std::vector<float>& out) const {
+    out.resize(static_cast<std::size_t>(std::max(count, 0)));
+    if (count <= 0) {
+        return;
+    }
+    // t and origin/chunk both grow with the stream and their difference does
+    // not, so they are combined in DOUBLE and once, before anything is cast to
+    // the float32 the model wants. m_base carries the per-slot part, which is
+    // small and exact.
+    const double rebased = TimeAt(step) - static_cast<double>(origin) /
+                                              static_cast<double>(m_chunkSize);
+    const float t = static_cast<float>(rebased);
+    for (int i = 0; i < count; ++i) {
+        // m_base is sized for a finite sequence; past its end the ramp
+        // continues by the same rule, which is what a sliding window reads.
+        const float base = i < static_cast<int>(m_base.size())
+                               ? m_base[static_cast<std::size_t>(i)]
+                               : 1.0f + static_cast<float>(i) /
+                                            static_cast<float>(m_chunkSize);
+        out[static_cast<std::size_t>(i)] = std::clamp(base - t, 0.0f, 1.0f);
     }
 }
 
@@ -311,6 +332,21 @@ struct GpuSampler {
     std::uint64_t ringSlotFence[kRingSlots] = {};
     std::uint64_t ringSlotBytes = 0;
     std::uint32_t ringCursor = 0;
+
+    // The sliding window's scratch. D3D12 forbids a CopyBufferRegion whose
+    // source and destination are the same resource, so shifting the latents
+    // left cannot be done in place: they go out to this and come back at an
+    // offset. Allocated only for a continuous generation, which is the only
+    // thing that slides.
+    Microsoft::WRL::ComPtr<ID3D12Resource> slideScratch;
+    // And a ring for the fresh noise appended at the back, for the same reason
+    // the ramp has one: a slide happens every other step and must not wait on
+    // the one before it. chunk_size latents per slide, so 80 bytes a slot at
+    // the shipped shapes.
+    Microsoft::WRL::ComPtr<ID3D12Resource> slideRing;
+    std::uint64_t slideSlotBytes = 0;
+    std::uint64_t slideSlotFence[kRingSlots] = {};
+    std::uint32_t slideCursor = 0;
 
     // One buffer big enough for whichever constant input is largest, used only
     // by Begin. Released afterwards would save 786 KB and cost a reallocation
@@ -640,6 +676,98 @@ struct GpuSampler {
         return Submit();
     }
 
+    // Allocated on demand, because only a continuous generation slides.
+    bool EnsureSlideBuffers(int chunkSize) {
+        if (slideScratch != nullptr) {
+            return true;
+        }
+        slideSlotBytes = static_cast<std::uint64_t>(chunkSize) *
+                         static_cast<std::uint64_t>(latentDim) * sizeof(float);
+        return MakeBuffer(x.bytes, D3D12_HEAP_TYPE_DEFAULT, slideScratch) &&
+               MakeBuffer(slideSlotBytes * kRingSlots, D3D12_HEAP_TYPE_UPLOAD,
+                          slideRing);
+    }
+
+    // Slides the latent window left by `by` latents and writes `fresh` into
+    // the `by` slots that opens at the back. Per row, because x is
+    // [rows, time, latentDim] and a shift that ignored the row boundary would
+    // drag one guidance row's tail into the next row's head.
+    //
+    // No wait: three copies on the same queue, ordered against the denoise
+    // either side of them by queue order alone, like everything else here.
+    bool Slide(int by, const float* fresh, int chunkSize) {
+        if (by <= 0) {
+            return true;
+        }
+        if (!EnsureSlideBuffers(chunkSize)) {
+            return false;
+        }
+        const std::uint64_t rowBytes = static_cast<std::uint64_t>(time) *
+                                       static_cast<std::uint64_t>(latentDim) *
+                                       sizeof(float);
+        const std::uint64_t byBytes = static_cast<std::uint64_t>(by) *
+                                      static_cast<std::uint64_t>(latentDim) *
+                                      sizeof(float);
+        if (byBytes > slideSlotBytes || byBytes >= rowBytes) {
+            return false;
+        }
+
+        const std::uint32_t slot = slideCursor % kRingSlots;
+        slideCursor = (slideCursor + 1) % kRingSlots;
+        if (!WaitFor(slideSlotFence[slot])) {
+            return false;
+        }
+        const std::uint64_t offset = static_cast<std::uint64_t>(slot) * slideSlotBytes;
+        void* mapped = nullptr;
+        const D3D12_RANGE range = {static_cast<SIZE_T>(offset),
+                                   static_cast<SIZE_T>(offset + byBytes)};
+        if (FAILED(slideRing->Map(0, &range, &mapped))) {
+            return false;
+        }
+        std::memcpy(static_cast<std::uint8_t*>(mapped) + offset, fresh,
+                    static_cast<std::size_t>(byBytes));
+        slideRing->Unmap(0, &range);
+
+        if (!BeginList()) {
+            return false;
+        }
+        // Out whole, back per row at an offset, then the new tail. Reading the
+        // scratch while writing x is safe because they are different
+        // resources, which is the entire reason the scratch exists.
+        commandList->CopyBufferRegion(slideScratch.Get(), 0, x.buffer.Get(), 0, x.bytes);
+        // x is a copy SOURCE above and a copy DEST below, in one list, so the
+        // implicit promotion each buffer gets at first use is not enough -- the
+        // debug layer rejects the second copy with "Missing State:
+        // D3D12_RESOURCE_STATE_COPY_DEST". Both resources swap roles here, so
+        // both are transitioned. No transition back: buffers decay to COMMON
+        // when the list finishes executing, which is what lets the next
+        // dispatch promote x to UAV again.
+        const D3D12_RESOURCE_BARRIER barriers[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(x.buffer.Get(),
+                                                 D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST),
+            CD3DX12_RESOURCE_BARRIER::Transition(slideScratch.Get(),
+                                                 D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 D3D12_RESOURCE_STATE_COPY_SOURCE),
+        };
+        commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+        for (int row = 0; row < rows; ++row) {
+            const std::uint64_t base = static_cast<std::uint64_t>(row) * rowBytes;
+            commandList->CopyBufferRegion(x.buffer.Get(), base, slideScratch.Get(),
+                                          base + byBytes, rowBytes - byBytes);
+            // Every guidance row gets the SAME fresh noise, for the same
+            // reason they get the same ramp: the two predictions are only
+            // comparable if the latents they see are identical.
+            commandList->CopyBufferRegion(x.buffer.Get(), base + rowBytes - byBytes,
+                                          slideRing.Get(), offset, byBytes);
+        }
+        if (!Submit()) {
+            return false;
+        }
+        slideSlotFence[slot] = fenceValue;
+        return true;
+    }
+
     // Four floats per latent, for the decoder. The only wait in a generation
     // that is not teardown, and it happens per decode batch rather than per
     // step.
@@ -760,6 +888,21 @@ struct FloodDiffusionPipeline::Impl {
     // DecodeAhead. See FloodDiffusionOptions::decodeAheadFrames.
     int decodeAheadFrames = 0;
 
+    // --- the sliding window, for FloodDiffusionOptions::continuous ----------
+    //
+    // `shifted` is how many latents have scrolled off the front, so absolute
+    // latent j sits at window slot j - shifted. It stays 0 for a finite
+    // generation and for a continuous one until the ramp has run up, which is
+    // what makes the two identical step for step until then.
+    bool continuous = false;
+    int shifted = 0;
+    bool stopRequested = false;
+    // Fresh noise for the latents appended at the back of the window, and the
+    // generator it comes from -- held across steps so a stream does not
+    // restart the sequence, which would repeat the same noise every slide.
+    std::mt19937 noise;
+    std::vector<float> freshLatents;
+
     std::unique_ptr<StreamJointRecovery> recovery;
     std::vector<DirectX::XMFLOAT3> frames;  // frameCount * joints
     // The decoded feature vectors behind those positions, frameCount *
@@ -800,11 +943,41 @@ struct FloodDiffusionPipeline::Impl {
                      std::unique_ptr<Ort::SessionOptions>& out,
                      std::string* error);
     bool EncodeText(const std::string& text, std::string* error);
+    // Encodes `newPrompt` (and the empty prompt guidance needs) and rebuilds
+    // `context`/`contextLens` from it. Host side only; UploadContext is what
+    // puts it on the device.
+    bool ConditionOn(const std::string& newPrompt, std::string* error);
+    bool UploadContext(std::string* error);
     bool EnsureTextEncoder(std::string* error);
     bool Denoise(std::string* error);
     bool DecodeUpTo(int latentLimit, std::string* error);
     bool DecodeOne(int latentIndex, std::string* error);
     void AppendMotion(const float* motion, int frameCountInBatch);
+
+    // Slides the window forward by `by` latents: drops that many off the
+    // front and appends that many of fresh noise at the back. Only ever
+    // called with `by` latents that have already been decoded, which
+    // SlideBudget is what enforces.
+    bool SlideWindow(int by, std::string* error);
+
+    // How far the window may slide right now: enough to keep the finalised
+    // frontier `latentFrames` into the window, but never past what the decoder
+    // has consumed. Zero means the sampler has to wait for the decoder.
+    int SlideBudget() const;
+
+    // Latents no remaining step will touch again. `start` never decreases, so
+    // the current step's start is exactly that boundary -- except for a finite
+    // sampler that has run out of steps, where everything left is as denoised
+    // as it is going to get. A continuous one never reaches that case.
+    int FinalisedLatents() const {
+        if (!schedule.IsValid()) {
+            return 0;
+        }
+        if (continuous || step < schedule.TotalSteps()) {
+            return schedule.StartAt(step);
+        }
+        return schedule.GeneratedLatents();
+    }
 };
 
 bool FloodDiffusionPipeline::Impl::MakeOptions(
@@ -1077,6 +1250,17 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
         vaeDims = {};
     }
 
+    // A sliding window IS a fixed submitted length, so continuous mode and
+    // pinned shapes are the same requirement from two directions. Without the
+    // pin, `time` would grow for as long as the stream ran and the sessions
+    // would be rebuilt every other step.
+    if (options.continuous && !impl.staticShapes) {
+        SetOrtError(error, "continuous needs staticShapes: a sliding window has a "
+                           "fixed submitted length, and without pinning `time` "
+                           "would grow for as long as the stream ran");
+        return false;
+    }
+
     if (!impl.MakeOptions(impl.device, denoiserDims, impl.denoiserOptions, error)) {
         return false;
     }
@@ -1289,7 +1473,7 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
     const int denoiseSteps = options.denoiseSteps > 0 ? options.denoiseSteps
                                                       : impl.config.noiseSteps;
     DiffusionForcingSchedule schedule(options.latentFrames, impl.config.chunkSize,
-                                      denoiseSteps);
+                                      denoiseSteps, options.continuous);
     if (!schedule.IsValid()) {
         SetOrtError(error, "latentFrames must be positive");
         return false;
@@ -1307,61 +1491,8 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
         return false;
     }
 
-    impl.prompt = prompt;
-    // Kept for the UI. Done here rather than in EncodeText, which returns early
-    // for a prompt it has already cached and would leave these stale.
-    impl.promptIds = impl.tokenizer.Encode(prompt, impl.config.textLen);
-    impl.promptTokens = static_cast<int>(impl.promptIds.size());
-
-    // The conditional prompt and the unconditional (empty) one. Both are needed
-    // before anything else, because a failure here should leave the previous
-    // generation untouched rather than half-replaced.
-    if (!impl.EncodeText(prompt, error)) {
+    if (!impl.ConditionOn(prompt, error)) {
         return false;
-    }
-    const bool guided = impl.config.cfgScale != 1.0f;
-    if (guided && !impl.EncodeText(std::string(), error)) {
-        return false;
-    }
-
-    const Impl::TextFeatures& conditional = impl.textCache.at(prompt);
-    const Impl::TextFeatures* unconditional =
-        guided ? &impl.textCache.at(std::string()) : nullptr;
-
-    impl.rows = guided ? 2 : 1;
-    impl.contextLen = conditional.tokens;
-    if (unconditional != nullptr) {
-        impl.contextLen = std::max(impl.contextLen, unconditional->tokens);
-    }
-    if (impl.staticShapes) {
-        // The session pinned ctx_len to text_len, so the context has to be fed
-        // at that width. Exact rather than approximate: context_lens below
-        // still reports the real token counts, and the model masks the rest out
-        // of cross-attention. Measured difference against an unpadded run:
-        // 0.000004.
-        impl.contextLen = impl.config.textLen;
-        if (conditional.tokens > impl.contextLen ||
-            (unconditional != nullptr && unconditional->tokens > impl.contextLen)) {
-            SetOrtError(error, "the prompt encoded to more tokens than text_len");
-            return false;
-        }
-    }
-
-    // context is [rows, segments=1, contextLen, textDim], zero-padded, with
-    // context_lens telling the model how much of each row is real. Only one
-    // segment: a single prompt covers the whole sequence, so text_idx is all
-    // zeros. Several prompts over time would widen the segments axis.
-    const std::size_t stride =
-        static_cast<std::size_t>(impl.contextLen) * static_cast<std::size_t>(impl.config.textDim);
-    impl.context.assign(stride * static_cast<std::size_t>(impl.rows), 0.0f);
-    impl.contextLens.assign(static_cast<std::size_t>(impl.rows), 0);
-
-    std::copy(conditional.values.begin(), conditional.values.end(), impl.context.begin());
-    impl.contextLens[0] = conditional.tokens;
-    if (unconditional != nullptr) {
-        std::copy(unconditional->values.begin(), unconditional->values.end(),
-                  impl.context.begin() + static_cast<std::ptrdiff_t>(stride));
-        impl.contextLens[1] = unconditional->tokens;
     }
 
     // Starting noise. std::mt19937 rather than numpy's PCG64: the stream will
@@ -1371,10 +1502,14 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
     impl.latents.assign(static_cast<std::size_t>(schedule.TotalLatents()) *
                             static_cast<std::size_t>(impl.config.latentDim),
                         0.0f);
-    std::mt19937 generator(options.seed);
+    // Seeded here and then KEPT: a sliding window draws the latents it
+    // appends from the same stream, so a stream does not see this same noise
+    // again on every slide. A finite generation consumes exactly the same
+    // numbers it always did.
+    impl.noise.seed(options.seed);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     for (float& value : impl.latents) {
-        value = normal(generator);
+        value = normal(impl.noise);
     }
 
     // Everything the GPU path keeps resident goes up here, once: the context
@@ -1412,6 +1547,9 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
 
     impl.step = 0;
     impl.running = true;
+    impl.continuous = options.continuous;
+    impl.shifted = 0;
+    impl.stopRequested = false;
     impl.caches.clear();
     impl.decodedLatents = 0;
     impl.frames.clear();
@@ -1443,22 +1581,19 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
     // what is READ back, so the extra frames only cost GPU work, not meaning.
     const int submitted = staticShapes ? staticTime : end;
 
-    // The ramp over the full buffer: beyond `end` it clips to 1, i.e. pure
-    // noise, which is what the model saw for not-yet-denoised frames in
-    // training. NoiseLevels sizes itself to EndAt(step), so the tail is filled
-    // in explicitly here.
-    schedule.NoiseLevels(step, noiseLevels);
-    if (submitted > static_cast<int>(noiseLevels.size())) {
-        const float t = static_cast<float>(schedule.TimeAt(step));
-        const int wasSized = static_cast<int>(noiseLevels.size());
-        noiseLevels.resize(static_cast<std::size_t>(submitted));
-        for (int i = wasSized; i < submitted; ++i) {
-            const float level = 1.0f + static_cast<float>(i) /
-                                           static_cast<float>(config.chunkSize) - t;
-            noiseLevels[static_cast<std::size_t>(i)] = std::clamp(level, 0.0f, 1.0f);
-        }
-    }
+    // The ramp over the submitted WINDOW, indexed from the window's own start
+    // rather than from the beginning of the sequence. Past `end` it clips to
+    // 1, i.e. pure noise, which is what the model saw for not-yet-denoised
+    // frames in training; before the window it does not exist, which is what
+    // `shifted` says. For a finite generation `shifted` is 0 and this is the
+    // ramp it always had.
+    schedule.WindowNoiseLevels(step, shifted, submitted, noiseLevels);
 
+    // Everything below indexes the WINDOW, so the absolute range the schedule
+    // reports has to be rebased onto it. Identical to the absolute range until
+    // a continuous generation starts sliding.
+    const int windowStart = start - shifted;
+    const int windowEnd = end - shifted;
     const int latentDim = config.latentDim;
     const std::size_t perRow = static_cast<std::size_t>(submitted) *
                                static_cast<std::size_t>(latentDim);
@@ -1486,7 +1621,7 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
         const std::uint32_t predictionType = config.predictionType == "x0"   ? 1u
                                              : config.predictionType == "noise" ? 2u
                                                                                 : 0u;
-        if (!gpu->DispatchStep(start, end, config.cfgScale,
+        if (!gpu->DispatchStep(windowStart, windowEnd, config.cfgScale,
                                static_cast<float>(schedule.Dt()), predictionType)) {
             SetOrtError(error, "dispatching the latent step failed");
             return false;
@@ -1547,7 +1682,7 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
         const float dt = static_cast<float>(schedule.Dt());
         const float cfg = config.cfgScale;
 
-        for (int index = start; index < end; ++index) {
+        for (int index = windowStart; index < windowEnd; ++index) {
             for (int component = 0; component < latentDim; ++component) {
                 // Row-major [rows, submitted, latentDim]; `perRow` already
                 // accounts for how much was submitted, so row 1 is at perRow.
@@ -1605,8 +1740,11 @@ void FloodDiffusionPipeline::Impl::AppendMotion(const float* motion, int frameCo
 
 bool FloodDiffusionPipeline::Impl::DecodeOne(int latentIndex, std::string* error) {
     const int64_t zShape[] = {1, 1, config.latentDim};
-    const float* z = latents.data() + static_cast<std::size_t>(latentIndex) *
-                                          static_cast<std::size_t>(config.latentDim);
+    // latentIndex is absolute and `latents` is the window, so a continuous
+    // generation that has slid reads further back than the index says.
+    const float* z = latents.data() +
+                     static_cast<std::size_t>(latentIndex - shifted) *
+                         static_cast<std::size_t>(config.latentDim);
     // CreateTensor wants non-const memory even though Run only reads it.
     std::vector<float> zCopy(z, z + config.latentDim);
     Ort::MemoryInfo cpu = CpuMemoryInfo();
@@ -1660,7 +1798,10 @@ bool FloodDiffusionPipeline::Impl::DecodeOne(int latentIndex, std::string* error
 }
 
 bool FloodDiffusionPipeline::Impl::DecodeUpTo(int latentLimit, std::string* error) {
-    const int limit = std::min(latentLimit, schedule.GeneratedLatents());
+    // GeneratedLatents is the finite sequence's length and is not a bound on a
+    // continuous one, which has none.
+    const int limit = continuous ? latentLimit
+                                 : std::min(latentLimit, schedule.GeneratedLatents());
     const auto began = std::chrono::steady_clock::now();
 
     // On the GPU path the authoritative latents are in the x buffer, so the
@@ -1669,9 +1810,10 @@ bool FloodDiffusionPipeline::Impl::DecodeUpTo(int latentLimit, std::string* erro
     // rather than once per step, and it brings back four floats per latent.
     if (gpu != nullptr && limit > decodedLatents) {
         const int count = limit - decodedLatents;
-        if (!gpu->ReadLatents(decodedLatents, count,
-                              latents.data() + static_cast<std::size_t>(decodedLatents) *
-                                                   static_cast<std::size_t>(config.latentDim))) {
+        if (!gpu->ReadLatents(decodedLatents - shifted, count,
+                              latents.data() +
+                                  static_cast<std::size_t>(decodedLatents - shifted) *
+                                      static_cast<std::size_t>(config.latentDim))) {
             SetOrtError(error, "reading the finalised latents back failed");
             return false;
         }
@@ -1691,6 +1833,175 @@ bool FloodDiffusionPipeline::Impl::DecodeUpTo(int latentLimit, std::string* erro
     return true;
 }
 
+int FloodDiffusionPipeline::Impl::SlideBudget() const {
+    if (!continuous) {
+        return 0;
+    }
+    // Keep the finalised frontier exactly staticLatentFrames into the window.
+    // That is not a tuning choice: the live region is chunk_size wide, so with
+    // the frontier there the step's write range ends precisely at the window's
+    // end, and the window is full rather than overrun or short.
+    const int wanted = schedule.StartAt(step) - staticLatentFrames - shifted;
+    if (wanted <= 0) {
+        return 0;
+    }
+    // Never past the decoder. A latent dropped off the front before it has
+    // been decoded is motion that never existed, so this is the one place the
+    // sampler is allowed to be held up by its consumer.
+    return std::min(wanted, std::max(0, decodedLatents - shifted));
+}
+
+bool FloodDiffusionPipeline::Impl::SlideWindow(int by, std::string* error) {
+    if (by <= 0) {
+        return true;
+    }
+    const int latentDim = config.latentDim;
+    const std::size_t stride = static_cast<std::size_t>(latentDim);
+    const std::size_t window = latents.size() / stride;
+    if (static_cast<std::size_t>(by) >= window) {
+        SetOrtError(error, "the window cannot slide by its own width");
+        return false;
+    }
+
+    // Drawn from the generation's own generator rather than a fresh one, so a
+    // stream does not see the same noise again on every slide.
+    freshLatents.resize(static_cast<std::size_t>(by) * stride);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (float& value : freshLatents) {
+        value = normal(noise);
+    }
+
+    if (gpu != nullptr && !gpu->Slide(by, freshLatents.data(), config.chunkSize)) {
+        SetOrtError(error, "sliding the latent window on the GPU failed");
+        return false;
+    }
+    // Slid on the host either way: on the GPU path this array is where
+    // ReadLatents puts the latents the decoder reads, so its indexing has to
+    // track the window too.
+    std::memmove(latents.data(), latents.data() + static_cast<std::size_t>(by) * stride,
+                 (window - static_cast<std::size_t>(by)) * stride * sizeof(float));
+    std::copy(freshLatents.begin(), freshLatents.end(),
+              latents.begin() + static_cast<std::ptrdiff_t>(
+                                    (window - static_cast<std::size_t>(by)) * stride));
+    shifted += by;
+    return true;
+}
+
+bool FloodDiffusionPipeline::Impl::ConditionOn(const std::string& newPrompt,
+                                               std::string* error) {
+    // The conditional prompt and the unconditional (empty) one. Both are
+    // encoded before anything is replaced, because a failure here should leave
+    // the conditioning that is in force untouched rather than half-changed --
+    // which matters more for SetPrompt on a running stream than it did for
+    // Begin.
+    if (!EncodeText(newPrompt, error)) {
+        return false;
+    }
+    const bool guided = config.cfgScale != 1.0f;
+    if (guided && !EncodeText(std::string(), error)) {
+        return false;
+    }
+
+    const TextFeatures& conditional = textCache.at(newPrompt);
+    const TextFeatures* unconditional =
+        guided ? &textCache.at(std::string()) : nullptr;
+
+    const int rowCount = guided ? 2 : 1;
+    int width = conditional.tokens;
+    if (unconditional != nullptr) {
+        width = std::max(width, unconditional->tokens);
+    }
+    if (staticShapes) {
+        // The session pinned ctx_len to text_len, so the context has to be fed
+        // at that width. Exact rather than approximate: context_lens below
+        // still reports the real token counts, and the model masks the rest
+        // out of cross-attention. Measured difference against an unpadded run:
+        // 0.000004.
+        width = config.textLen;
+        if (conditional.tokens > width ||
+            (unconditional != nullptr && unconditional->tokens > width)) {
+            SetOrtError(error, "the prompt encoded to more tokens than text_len");
+            return false;
+        }
+    }
+
+    // Everything above could still fail; from here nothing can, so this is
+    // where the live conditioning is allowed to change.
+    prompt = newPrompt;
+    // Kept for the UI. Done here rather than in EncodeText, which returns
+    // early for a prompt it has already cached and would leave these stale.
+    promptIds = tokenizer.Encode(newPrompt, config.textLen);
+    promptTokens = static_cast<int>(promptIds.size());
+    rows = rowCount;
+    contextLen = width;
+
+    // context is [rows, segments=1, contextLen, textDim], zero-padded, with
+    // context_lens telling the model how much of each row is real. Only one
+    // segment: a single prompt covers the whole sequence, so text_idx is all
+    // zeros. Several prompts over time would widen the segments axis -- which
+    // is a different feature from SetPrompt, where one prompt replaces another
+    // for everything still in flight rather than taking over at a frame.
+    const std::size_t stride = static_cast<std::size_t>(contextLen) *
+                               static_cast<std::size_t>(config.textDim);
+    context.assign(stride * static_cast<std::size_t>(rows), 0.0f);
+    contextLens.assign(static_cast<std::size_t>(rows), 0);
+
+    std::copy(conditional.values.begin(), conditional.values.end(), context.begin());
+    contextLens[0] = conditional.tokens;
+    if (unconditional != nullptr) {
+        std::copy(unconditional->values.begin(), unconditional->values.end(),
+                  context.begin() + static_cast<std::ptrdiff_t>(stride));
+        contextLens[1] = unconditional->tokens;
+    }
+    return true;
+}
+
+bool FloodDiffusionPipeline::Impl::UploadContext(std::string* error) {
+    if (gpu == nullptr) {
+        return true;
+    }
+    // Only reachable with pinned shapes, where contextLen is text_len and the
+    // buffer was created at exactly that width -- so a mismatch here would
+    // mean the pin and the context had come apart, and reading the host array
+    // for the buffer's length would run off the end of it.
+    if (context.size() * sizeof(float) != gpu->context.bytes ||
+        contextLens.size() * sizeof(int64_t) != gpu->lens.bytes) {
+        SetOrtError(error, "the prompt context does not match the device buffer "
+                           "it was created for");
+        return false;
+    }
+    // Ordered after anything already submitted, because it goes on the same
+    // queue the execution provider uses -- so a Run still reading the old
+    // context cannot see this copy land halfway. UploadOnce waits, which costs
+    // a few milliseconds once per prompt rather than once per step.
+    if (!gpu->UploadOnce(gpu->context.buffer.Get(), context.data(),
+                         gpu->context.bytes) ||
+        !gpu->UploadOnce(gpu->lens.buffer.Get(), contextLens.data(),
+                         gpu->lens.bytes)) {
+        SetOrtError(error, "uploading the prompt context to the GPU failed");
+        return false;
+    }
+    return true;
+}
+
+bool FloodDiffusionPipeline::SetPrompt(const std::string& prompt, std::string* error) {
+    Impl& impl = *m_impl;
+    if (!IsLoaded()) {
+        SetOrtError(error, "the FloodDiffusion pipeline is not loaded");
+        return false;
+    }
+    // Cheap enough to call on every edit: the common case is that nothing
+    // changed, and the next-cheapest is a prompt already in the cache.
+    if (prompt == impl.prompt) {
+        return true;
+    }
+    return impl.ConditionOn(prompt, error) && impl.UploadContext(error);
+}
+
+void FloodDiffusionPipeline::Stop() { m_impl->stopRequested = true; }
+
+int FloodDiffusionPipeline::ShiftedLatents() const { return m_impl->shifted; }
+
 bool FloodDiffusionPipeline::Step(std::string* error) {
     Impl& impl = *m_impl;
     if (!impl.running) {
@@ -1708,7 +2019,36 @@ bool FloodDiffusionPipeline::Step(std::string* error) {
     // simply finished and the generation is not -- running stays true until
     // DecodeAhead has drained the backlog, because a stream is over when the
     // motion exists, not when the latents do.
-    if (impl.step < impl.schedule.TotalSteps()) {
+    // A continuous generation has no step to run out of: past the ramp it
+    // slides the window instead, and only Stop() ends the sampling.
+    const bool sampling = impl.continuous
+                              ? !impl.stopRequested
+                              : impl.step < impl.schedule.TotalSteps();
+
+    if (sampling) {
+        // Before denoising, not after: the slide is what makes room for what
+        // this step is about to write, and the arithmetic in SlideBudget only
+        // lands the write range exactly at the window's end if it happens
+        // first.
+        const int wanted =
+            impl.continuous
+                ? impl.schedule.StartAt(impl.step) - impl.staticLatentFrames - impl.shifted
+                : 0;
+        if (wanted > 0) {
+            const int budget = impl.SlideBudget();
+            if (budget < wanted) {
+                // The decoder is behind, so there is nowhere to put this
+                // step's output yet. Doing nothing and saying so is the whole
+                // of the backpressure; the caller's next DecodeAhead is what
+                // releases it.
+                impl.generationMs += Milliseconds(began);
+                return true;
+            }
+            if (!impl.SlideWindow(wanted, error)) {
+                impl.running = false;
+                return false;
+            }
+        }
         if (!impl.Denoise(error)) {
             impl.running = false;
             return false;
@@ -1720,17 +2060,17 @@ bool FloodDiffusionPipeline::Step(std::string* error) {
         // A latent is final once no remaining step will touch it again.
         // Because `start` never decreases, the next step's start is exactly
         // that boundary.
-        const int finalised = impl.step < impl.schedule.TotalSteps()
-                                  ? impl.schedule.StartAt(impl.step)
-                                  : impl.schedule.GeneratedLatents();
+        const int finalised = impl.FinalisedLatents();
         if (!impl.DecodeUpTo(finalised, error)) {
             impl.running = false;
             return false;
         }
     }
 
-    if (impl.step >= impl.schedule.TotalSteps() &&
-        impl.decodedLatents >= impl.schedule.GeneratedLatents()) {
+    // Over when the MOTION exists, not when the latents do -- the same rule in
+    // both modes. For a continuous stream the sampler's end is Stop() rather
+    // than running out of steps.
+    if (!sampling && impl.decodedLatents >= impl.FinalisedLatents()) {
         impl.running = false;
     }
     impl.generationMs += Milliseconds(began);
@@ -1759,9 +2099,7 @@ bool FloodDiffusionPipeline::DecodeAhead(int consumedFrame, std::string* error) 
     }
 
     const auto began = std::chrono::steady_clock::now();
-    const int finalised = impl.step < impl.schedule.TotalSteps()
-                              ? impl.schedule.StartAt(impl.step)
-                              : impl.schedule.GeneratedLatents();
+    const int finalised = impl.FinalisedLatents();
     int target = impl.decodedLatents;
     for (int frames = impl.frameCount; frames < wanted && target < finalised; ++target) {
         frames += target == 0 ? impl.config.vaeFramesFirst : perLatent;
@@ -1774,8 +2112,10 @@ bool FloodDiffusionPipeline::DecodeAhead(int consumedFrame, std::string* error) 
     // The same end condition Step applies, so a generation whose sampler
     // finished long ago still reports itself over on the tick that decodes its
     // last latent rather than on the next Step.
-    if (impl.step >= impl.schedule.TotalSteps() &&
-        impl.decodedLatents >= impl.schedule.GeneratedLatents()) {
+    const bool sampling = impl.continuous
+                              ? !impl.stopRequested
+                              : impl.step < impl.schedule.TotalSteps();
+    if (!sampling && impl.decodedLatents >= impl.FinalisedLatents()) {
         impl.running = false;
     }
     impl.generationMs += Milliseconds(began);
@@ -1793,13 +2133,7 @@ int FloodDiffusionPipeline::FrameCount() const { return m_impl->frameCount; }
 int FloodDiffusionPipeline::DecodedLatents() const { return m_impl->decodedLatents; }
 
 int FloodDiffusionPipeline::FinalisedLatents() const {
-    const Impl& impl = *m_impl;
-    if (!impl.schedule.IsValid()) {
-        return 0;
-    }
-    return impl.step < impl.schedule.TotalSteps()
-               ? impl.schedule.StartAt(impl.step)
-               : impl.schedule.GeneratedLatents();
+    return m_impl->FinalisedLatents();
 }
 
 int FloodDiffusionPipeline::JointCount() const { return m_impl->config.joints; }

@@ -1233,6 +1233,70 @@ void TestRetargetBinding() {
     hipsWorld("hips carried by the scene placement",
               DirectX::SimpleMath::Vector3(3.5f, -1.1f, -4.25f));
 
+    // --- whose size wins ----------------------------------------------------
+    //
+    // The motion is brought down to the character, not the character up to the
+    // motion. This used to be the other way round: the ratio was written onto
+    // the hips node as a scale, which resized the rig and the skinned mesh and
+    // silently discarded whatever size the character's file and its placement
+    // had given it -- so a character deliberately placed at 0.8 changed size
+    // the moment generated motion drove it, while glTF animation (which writes
+    // no scale) left it alone.
+    std::size_t hipsNode = graph.Nodes().size();
+    for (const NeuralModelIntegrateTestbed::RetargetBone& bone : retargeter.Bones()) {
+        if (bone.sourceJoint == 0 && bone.destinationNode.has_value()) {
+            hipsNode = *bone.destinationNode;
+            break;
+        }
+    }
+    Expect("the hips bone names a node", hipsNode < graph.Nodes().size());
+    if (hipsNode < graph.Nodes().size()) {
+        const DirectX::SimpleMath::Vector3 authoredScale =
+            graph.Nodes()[hipsNode].hasTrs
+                ? graph.Nodes()[hipsNode].baseTransform.scale
+                : DirectX::SimpleMath::Vector3(1.0f, 1.0f, 1.0f);
+
+        // A motion twice the character's size: the target halves, and nothing
+        // about the rig changes.
+        Expect("a frame applies with the motion twice the character's size",
+               retargeter.ApplyFrame(graph, feature.data(),
+                                     static_cast<int>(feature.size()), nullptr, 0.0f,
+                                     wanted, 2.0f, placement, &error));
+        graph.UpdateTransforms(placement);
+        hipsWorld("hips at half the requested height",
+                  DirectX::SimpleMath::Vector3(3.25f, -1.55f, -4.125f));
+
+        DirectX::SimpleMath::Vector3 posedScale;
+        DirectX::SimpleMath::Quaternion posedRotation;
+        DirectX::SimpleMath::Vector3 posedTranslation;
+        // Decompose is not const, so the transform is copied out first.
+        DirectX::SimpleMath::Matrix posedLocal = graph.Nodes()[hipsNode].localTransform;
+        Expect("the posed hips transform decomposes",
+               posedLocal.Decompose(posedScale, posedRotation, posedTranslation));
+        std::printf("  %-52s (%.3f, %.3f, %.3f)\n", "hips scale after retargeting",
+                    posedScale.x, posedScale.y, posedScale.z);
+        ExpectVec("the retarget left the character's own size alone", posedScale,
+                  authoredScale.x, authoredScale.y, authoredScale.z);
+
+        // And when an override DOES carry a scale, it composes with the
+        // authored one rather than replacing it -- deliberately unlike a glTF
+        // animation scale channel, because an override is a pose laid on a
+        // character something else has already sized.
+        SceneGraph::PoseOverride scaled;
+        scaled.nodeIndex = hipsNode;
+        scaled.rotation = DirectX::SimpleMath::Quaternion::Identity;
+        scaled.hasScale = true;
+        scaled.scale = DirectX::SimpleMath::Vector3(2.0f, 2.0f, 2.0f);
+        Expect("an override with a scale applies",
+               graph.ApplyPoseOverrides({scaled}));
+        posedLocal = graph.Nodes()[hipsNode].localTransform;
+        Expect("the composed hips transform decomposes",
+               posedLocal.Decompose(posedScale, posedRotation, posedTranslation));
+        ExpectVec("an override scale composes with the authored one", posedScale,
+                  authoredScale.x * 2.0f, authoredScale.y * 2.0f,
+                  authoredScale.z * 2.0f);
+    }
+
     // Now the file's OWN placement, which is what a manifest or the Scene tab
     // sets per glTF. Translation, a quarter turn and a scale at once, because
     // each one fails differently: a missed translation leaves the character

@@ -1354,7 +1354,15 @@ bool SceneGraph::ApplyPoseOverrides(const std::vector<PoseOverride>& overrides) 
             node.hasTrs ? node.baseTransform.scale
                         : DirectX::SimpleMath::Vector3(1.0f, 1.0f, 1.0f);
         if (entry.hasScale) {
-            scale = entry.scale;
+            // COMPOSED with the authored scale, not substituted for it, which
+            // is deliberately unlike a glTF animation scale channel. An
+            // override is a pose laid ON a character that the file and the
+            // scene manifest have already sized; replacing the scale threw
+            // that size away silently, so a character deliberately placed at
+            // 0.8 changed size the moment an override drove it. A caller that
+            // wants an absolute size has to divide by the authored scale
+            // itself, which it can see.
+            scale *= entry.scale;
         }
         const DirectX::SimpleMath::Vector3 translation =
             entry.hasTranslation ? entry.translation

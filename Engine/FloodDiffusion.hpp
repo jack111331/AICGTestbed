@@ -130,11 +130,21 @@ struct FloodDiffusionConfig {
 class DiffusionForcingSchedule {
 public:
     DiffusionForcingSchedule() = default;
-    DiffusionForcingSchedule(int latentFrames, int chunkSize, int denoiseSteps);
+    DiffusionForcingSchedule(int latentFrames, int chunkSize, int denoiseSteps,
+                             bool continuous = false);
 
     bool IsValid() const { return m_totalSteps > 0; }
 
+    // Steps the RAMP takes. In continuous mode the generation does not end
+    // there -- it is the point at which the window starts sliding instead, and
+    // the only thing the number is still good for is a progress bar during
+    // the ramp-up.
     int TotalSteps() const { return m_totalSteps; }
+
+    // True when the schedule never ends: past TotalSteps the window slides
+    // forward instead of the sequence growing. See
+    // FloodDiffusionOptions::continuous.
+    bool IsContinuous() const { return m_continuous; }
 
     // Latents the sampler holds, which is the generated length plus one chunk.
     // That trailing chunk is never fully denoised -- it is the lookahead the
@@ -144,14 +154,29 @@ public:
 
     double TimeAt(int step) const;
 
-    // The half-open latent range [Start, End) this step writes. End also gives
-    // how much of the sequence is handed to the denoiser.
+    // The half-open latent range [Start, End) this step writes, in ABSOLUTE
+    // latent indices. End also gives how much of the sequence is handed to the
+    // denoiser. Neither is clamped to the generated length in continuous mode,
+    // where both run on for as long as the stream does.
     int StartAt(int step) const;
     int EndAt(int step) const;
 
     // Per-latent noise level for `step`, resized to EndAt(step). Computed in
     // float32 throughout, matching the reference.
     void NoiseLevels(int step, std::vector<float>& out) const;
+
+    // The same ramp over a WINDOW rather than from the beginning: `count`
+    // levels for the absolute latents [origin, origin + count). This is what a
+    // sliding window needs, and what the finite sampler also wants once it
+    // pins `time` and submits a buffer wider than EndAt(step).
+    //
+    // Rebased on purpose. The level is 1 + index/chunk - t, and in a long
+    // stream both terms grow without bound while their difference stays in
+    // [0, 1] -- so subtracting them in float32 would throw away a digit an
+    // hour. Taking origin out of both first keeps it exact however long the
+    // stream runs.
+    void WindowNoiseLevels(int step, int origin, int count,
+                           std::vector<float>& out) const;
 
     double Dt() const { return m_dt; }
 
@@ -161,6 +186,7 @@ private:
     int m_totalLatents = 0;
     int m_generatedLatents = 0;
     int m_totalSteps = 0;
+    bool m_continuous = false;
     double m_dt = 0.0;
     std::vector<float> m_base;
 };
@@ -182,6 +208,44 @@ struct FloodDiffusionOptions {
 
     // Exponential moving average over output joint positions. 1 is off.
     float smoothingAlpha = 1.0f;
+
+    // Generate until Stop() rather than for latentFrames and then finish.
+    //
+    // This is what diffusion forcing is actually for, and the opening note
+    // above says so: latents at the front finish while the ones behind are
+    // still noisy, so there is never a clip boundary to stop at. A finite
+    // generation just declines to carry on.
+    //
+    // What changes is one thing. The live region is always exactly chunk_size
+    // latents wide -- EndAt - StartAt is chunk_size at every step -- so once
+    // the ramp has run up, the sampler is in a STEADY STATE that repeats every
+    // denoiseSteps steps, consuming chunk_size fresh noise latents and
+    // finalising chunk_size. A finite run already spends all but its first
+    // moments there. Continuous mode simply keeps it there: instead of
+    // stopping, the window slides, dropping finalised latents off the front
+    // and appending fresh noise at the back. The ramp-up is identical, step
+    // for step, to a finite generation of the same latentFrames.
+    //
+    // latentFrames becomes the WINDOW rather than the length: how much
+    // finalised context the denoiser still sees behind the live region. At the
+    // shipped 60 that is three seconds of motion, which is what a finite
+    // 60-latent run carries by its last step.
+    //
+    // NEEDS staticShapes, and Load refuses it otherwise: a sliding window is a
+    // fixed submitted length, and without pinning, `time` would grow for as
+    // long as the stream ran.
+    //
+    // BACKPRESSURE, which is the part worth knowing. A latent may only be
+    // dropped off the front once it has been DECODED, or its motion would be
+    // lost -- so when the decoder is behind, the sampler stalls rather than
+    // overwriting it. With decodeAheadFrames set the decoder follows the
+    // playhead, so the sampler ends up regulated to real time and a stream
+    // left running costs almost nothing. Step() returning true having done
+    // nothing is that stall, and is not an error.
+    //
+    // Motion accumulates for as long as the stream runs: about 1.3 KB a frame,
+    // so 26 KB a second, so 94 MB an hour. Nothing trims it yet.
+    bool continuous = false;
 
     // Motion frames to keep decoded ahead of the frame a consumer has reached.
     // Non-zero takes decoding OUT of Step and makes it the caller's, through
@@ -475,6 +539,38 @@ public:
     // much motion came of it. False only on a real failure.
     bool DecodeAhead(int consumedFrame, std::string* error = nullptr);
 
+    // Re-conditions a generation that is already running on a new prompt.
+    //
+    // Nothing else moves. The latents keep their noise levels, the schedule
+    // keeps its step, the window keeps its position and the motion already
+    // decoded is already decoded. Only `context` changes, so the live chunk
+    // and the noise behind it are denoised toward the new prompt from wherever
+    // they had got to -- which is why the motion TRANSITIONS into it rather
+    // than cutting. It takes about a window to arrive, because that is how
+    // long the latents conditioned on the old prompt take to finish and slide
+    // out.
+    //
+    // This is the other thing diffusion forcing makes possible and a clip
+    // sampler cannot do at all: there is no boundary to restart at. Begin
+    // would reseed the latents and throw the motion away.
+    //
+    // Costs one text-encoder run, about 9 ms on the CPU provider, and the
+    // result is cached per prompt -- so returning to a prompt already used is
+    // free, and calling it with the prompt already in force does nothing. The
+    // encode is synchronous, so a caller doing it per keystroke would pay for
+    // every keystroke; the UI applies it when an edit finishes.
+    //
+    // False only on a real failure, and then the conditioning in force is
+    // unchanged rather than half-replaced.
+    bool SetPrompt(const std::string& prompt, std::string* error = nullptr);
+
+    // Ends a continuous generation. The sampler stops at once; the generation
+    // does not, because decoding what it already finalised is what turns it
+    // into motion -- so IsRunning() stays true until the decoder has drained,
+    // exactly as it does when a finite sampler runs out of steps. Harmless on
+    // a finite generation, and harmless called twice.
+    void Stop();
+
     bool IsRunning() const;
     bool Done() const;
     int StepsTaken() const;
@@ -491,6 +587,13 @@ public:
     // a fixed distance behind the sampler.
     int DecodedLatents() const;
     int FinalisedLatents() const;
+
+    // Latents that have scrolled off the front of the window, which is zero
+    // until a continuous generation starts sliding. Absolute latent `j` lives
+    // at window slot `j - ShiftedLatents()`; it is exposed because it is the
+    // one number that says a stream is in its steady state rather than still
+    // ramping up.
+    int ShiftedLatents() const;
 
     // Null when `index` is out of range. Valid until the next Step or Begin.
     const DirectX::XMFLOAT3* Frame(int index) const;

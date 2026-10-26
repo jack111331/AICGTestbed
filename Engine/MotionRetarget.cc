@@ -684,7 +684,7 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
                                   const DirectX::XMFLOAT3* positions,
                                   float rootAngle,
                                   const Vector3& hipsTarget,
-                                  float characterScale,
+                                  float motionScale,
                                   const Matrix& scenePlacement,
                                   std::string* error) {
     if (!IsLoaded()) {
@@ -706,6 +706,15 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
     }
 
     const std::vector<SceneNode>& nodes = graph.Nodes();
+
+    // The motion brought down to the character's proportions. A source
+    // skeleton with 0.9 m hips driving a character with 0.774 m hips has a
+    // ratio of 1.16, so its root height and its stride both come in 16 per
+    // cent smaller -- which is what keeps the feet on the floor without
+    // resizing the rig. Guarded because a ratio of zero would mean the
+    // character measured as having no height at all.
+    const Vector3 scaledTarget =
+        motionScale > 1e-6f ? hipsTarget / motionScale : hipsTarget;
 
     // Which bone, if any, drives each node. Built per call because Bind can
     // run again against a different character.
@@ -874,7 +883,7 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
             const Matrix parentWorld =
                 AuthoredParentWorld(graph, index, scenePlacement);
             const Vector3 worldTarget = Vector3::Transform(
-                hipsTarget, graph.PlacementForNode(index) * scenePlacement);
+                scaledTarget, graph.PlacementForNode(index) * scenePlacement);
             // A degenerate chain -- a zero scale somewhere above the hips --
             // has no inverse, and transforming through it would produce
             // infinities that spread to every descendant. Leaving the authored
@@ -885,15 +894,9 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
                     Vector3::Transform(worldTarget, parentWorld.Invert());
             }
 
-            // Resizing the root of the joint hierarchy resizes the whole rig,
-            // and the skinned mesh with it. Rotation-only retargeting cannot
-            // change proportions, so this is the only way to match the source
-            // skeleton's size.
-            if (characterScale > 0.0f) {
-                override.hasScale = true;
-                override.scale = Vector3(characterScale, characterScale,
-                                         characterScale);
-            }
+            // No scale is written, deliberately. The rig keeps the size its
+            // file authored and its placement gives it; the motion was brought
+            // down to it instead -- see motionScale in the header.
         }
         m_overrides.push_back(override);
 
@@ -916,19 +919,16 @@ bool MotionRetargeter::ApplyFrame(SceneGraph& graph, const float* feature,
             continue;
         }
         // Same two legs as above: out through the file's placement, back
-        // through the parent chain.
+        // through the parent chain, and the same scaled target.
         const Vector3 worldTarget =
-            Vector3::Transform(hipsTarget, graph.PlacementForNode(*bone.destinationNode) *
-                                               scenePlacement);
+            Vector3::Transform(scaledTarget,
+                               graph.PlacementForNode(*bone.destinationNode) *
+                                   scenePlacement);
         SceneGraph::PoseOverride override;
         override.nodeIndex = *bone.destinationNode;
         override.rotation = AuthoredRotation(nodes[*bone.destinationNode]);
         override.hasTranslation = true;
         override.translation = Vector3::Transform(worldTarget, parentWorld.Invert());
-        if (characterScale > 0.0f) {
-            override.hasScale = true;
-            override.scale = Vector3(characterScale, characterScale, characterScale);
-        }
         m_overrides.push_back(override);
     }
 

@@ -347,10 +347,25 @@ public:
     // comes from the graph, keyed on the node being placed, so a character and
     // the set it stands in can be moved independently.
     //
-    // `characterScale` is applied to the hips node, resizing the entire joint
-    // hierarchy and so the skinned mesh with it. Rotation-only retargeting
-    // cannot change a character's proportions, so this is what makes a
-    // character match the source skeleton's size.
+    // `motionScale` is how much BIGGER the motion's skeleton is than the
+    // character's -- its hip height over the character's -- and the hips
+    // target is DIVIDED by it. So the motion is adapted to the character
+    // rather than the character to the motion: the rig keeps the size its
+    // file authored, and the root height and travel come in at the
+    // character's proportions instead of the source skeleton's.
+    //
+    // It used to be the other way round: this was written onto the hips node
+    // as a scale, resizing the whole joint hierarchy and the skinned mesh with
+    // it. That silently overrode whatever size the character was authored or
+    // placed at -- a character deliberately placed at 0.8 came out at the
+    // motion's size times 0.8 rather than its own size times 0.8, so it
+    // changed size the moment generated motion drove it while glTF animation
+    // (which writes no scale) left it alone. One is a bug and the other is
+    // not, and which is which is a question about whose size wins; the
+    // character's does.
+    //
+    // 1 means the two are the same size and nothing is divided, which is what
+    // every caller that does not measure should pass.
     //
     // `positions` is the same frame's recovered joint positions, which
     // RetargetSource::Positions drives from; null is accepted and is an error
@@ -364,7 +379,7 @@ public:
                     const DirectX::XMFLOAT3* positions,
                     float rootAngle,
                     const DirectX::SimpleMath::Vector3& hipsTarget,
-                    float characterScale,
+                    float motionScale,
                     const DirectX::SimpleMath::Matrix& scenePlacement,
                     std::string* error);
 

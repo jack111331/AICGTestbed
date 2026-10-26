@@ -1979,6 +1979,54 @@ ORT 1.24.4, while the identical tensors through the ordinary `Run` API work —
 host memory included, so it is the binding and not the memory.
 `//Engine:fd-probe` section 11 keeps all of it measured.
 
+**The stream runs until Stop.** `FloodDiffusionOptions::continuous` is what
+diffusion forcing is actually for, and it needs almost no new machinery,
+because the sampler is already in a steady state: the live region is exactly
+`chunk_size` latents wide at every step (`EndAt - StartAt` is constant), so
+once the ramp has run up, each `denoiseSteps` steps consume `chunk_size` fresh
+noise latents and finalise `chunk_size`. A finite run spends all but its first
+moments there and then simply declines to carry on. Continuous mode keeps it
+there: the window slides, dropping finalised latents off the front and
+appending fresh noise at the back. `latentFrames` becomes the window — how much
+finalised context the denoiser still sees — and the ramp-up is identical, step
+for step, to a finite generation of the same length, which
+`//Engine:flooddiffusion-smoke` asserts bit-for-bit.
+
+It needs `staticShapes`, because a sliding window *is* a fixed submitted length.
+The GPU-resident path slides with buffer copies through a scratch resource
+rather than a `memmove`: D3D12 forbids a `CopyBufferRegion` within one
+resource, and `x` goes source-then-dest in one command list, so it also needs
+an explicit barrier between the two — the debug layer rejects it otherwise with
+`Missing State: D3D12_RESOURCE_STATE_COPY_DEST`.
+
+The part worth knowing is the **backpressure**. A latent may only be dropped
+once it has been decoded, or its motion would be lost, so when the decoder is
+behind the sampler stalls — `Step` returns true having done nothing, which is
+not an error. Together with the paced decode below that regulates the whole
+thing to real time, so a stream left running costs about what playback costs.
+`Stop()` stops the sampler and not the generation: what it already finalised
+still has to become motion, so `IsRunning()` stays true until the decoder has
+drained. Motion accumulates for as long as the stream runs, about 94 MB an
+hour, and nothing trims it yet.
+
+**The prompt can change mid-stream.** `SetPrompt` re-conditions a generation
+that is already running: it encodes the new prompt and replaces `context`, and
+nothing else moves — the latents keep their noise levels, the schedule keeps
+its step, the window keeps its position, and the motion already decoded stays
+exactly as it was. The live chunk and the noise behind it are then denoised
+toward the new prompt from wherever they had got to, so the motion
+*transitions* into it over about a window rather than cutting. That is the
+other thing diffusion forcing buys and a clip sampler cannot do at all: there
+is no boundary to restart at, and `Begin` would reseed the latents and discard
+the motion. `//Engine:flooddiffusion-smoke` asserts both halves against a
+control stream that never switches — the frames decoded before the switch are
+bit-identical, and the frames after it differ.
+
+The panel applies it when the prompt field's edit finishes, on Enter or on
+clicking away, not per keystroke: encoding is a synchronous text-encoder run of
+about 9 ms, and the half-typed prompts on the way would each pay for one. It is
+cached per prompt, so returning to one already used is free.
+
 **Decoding follows the playhead, not the sampler.** The sampler finishes 11.85 s
 of motion in about 2.1 s, so decoding eagerly spends the whole decode budget
 inside that burst, on motion nobody has reached yet.
@@ -2036,6 +2084,34 @@ Posed onto the real character, each bone lands **0.00 degrees** mean (0.03
 worst) from the direction the skeleton overlay draws, against **32.65** mean
 (165.50 worst) for the rotation path — which is the "the skeleton looks fine
 but the character looks weird" report, as a number.
+
+**The character's size wins, and the motion is brought down to it.** A
+HumanML3D skeleton is not the size of any particular glTF character — this
+one's hips measure 0.774 m against the source's ~0.9 — and rotation-only
+retargeting cannot change proportions, so something has to give. It used to be
+the character: the ratio of hip heights was written onto the hips node as a
+*scale*, resizing the whole joint hierarchy and the skinned mesh with it. That
+is wrong in a way that only shows up once a character has a size of its own.
+It silently discarded whatever the file and the scene manifest had given it, so
+a character deliberately placed at `"scale": 0.8` came out at 0.8 of the
+*motion's* size rather than 0.8 of its own — about 16% larger — and only when
+generated motion drove it, because glTF animation writes no scale channel here
+and left the authored size alone.
+
+Now `ApplyFrame` takes `motionScale` — how much bigger the motion is than the
+character — and **divides the hips target by it**. The rig keeps the size its
+file and its placement give it; the root height and the stride arrive at the
+character's proportions, which is what keeps the feet on the floor without
+resizing anything. `//Engine:scenegraph-smoke` asserts the hips land at half
+the requested height at a ratio of 2, and that the hips node's scale is
+untouched.
+
+`SceneGraph::ApplyPoseOverrides` was fixed with it: an override carrying a
+scale now **composes** with the authored one instead of replacing it. That is
+deliberately unlike a glTF animation scale channel, and the reason is the same
+— an override is a pose laid on a character that the file and the manifest have
+already sized, so replacing its scale throws that away. A caller wanting an
+absolute size divides by the authored scale itself, which it can see.
 
 **Aiming is not posing**, and this is the part worth reading before trusting a
 direction test. A bone direction fixes two of three degrees of freedom. The

@@ -1386,8 +1386,8 @@ void Sample::NewAudioDevice()
 // Properties
 void Sample::GetDefaultSize(int& width, int& height) const
 {
-    width = 1280;
-    height = 720;
+    width = 1920;
+    height = 1080;
 }
 #pragma endregion
 

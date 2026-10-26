@@ -58,6 +58,14 @@ bool MotionStreamView::Load(const std::filesystem::path& directory,
     // caller's job rather than Step's.
     m_options.decodeAheadFrames = 12;
 
+    // And the stream runs until Stop rather than for a fixed length, which is
+    // what diffusion forcing is for: the window slides instead of the sequence
+    // ending, so there is no clip boundary. With the decode paced to the
+    // playhead above, the two together regulate the whole thing to real time
+    // -- the sampler cannot slide a latent out before the decoder has had it,
+    // so a stream left running costs about what playback costs.
+    m_options.continuous = true;
+
     if (!std::filesystem::exists(directory / "pipeline.txt")) {
         m_status = "not staged; run tools/prepare_flooddiffusion.py";
         m_hasStatusError = false;
@@ -187,17 +195,23 @@ bool MotionStreamView::FitToMotion(std::string* summary) {
         return false;
     }
 
+    // How much bigger the MOTION is than the character, which is what
+    // ApplyFrame divides its hips target by. It does not resize the character:
+    // the rig keeps the size its file authored and its placement gives it, so
+    // a character placed at 0.8 stays at 0.8 of its own size rather than 0.8
+    // of the source skeleton's.
     m_retargetScale = motionHips / m_characterMetrics.hipsHeight;
 
     // The character's feet come out at the ground plane on their own once the
-    // legs are the right length: the motion's own root height already puts its
-    // feet near zero, and the hips are aimed at that height in world space. So
-    // the offset is cleared rather than used to paper over a scale error.
+    // root height is expressed at the character's proportions: the motion's
+    // own root height already puts its feet near zero, and dividing by the
+    // ratio above keeps that true at the character's size. So the offset is
+    // cleared rather than used to paper over a scale error.
     m_retargetOffset = {0.0f, 0.0f, 0.0f};
 
     char text[192];
     std::snprintf(text, sizeof(text),
-                  "character hips %.3f m, motion hips %.3f m -> scale %.3f",
+                  "character hips %.3f m, motion hips %.3f m -> motion / %.3f",
                   m_characterMetrics.hipsHeight, motionHips, m_retargetScale);
     m_fitSummary = text;
     if (summary != nullptr) {
@@ -234,9 +248,17 @@ void MotionStreamView::PoseCharacter() {
     // file, so a file already placed in the scene needs no offset to undo that
     // placement. The motion's own root height still places its feet at about
     // zero, so aiming the hips there puts the feet on the file's ground plane --
-    // provided the legs are the right length, which the scale above arranges.
-    DirectX::SimpleMath::Vector3 target(m_retargetOffset.x, m_retargetOffset.y,
-                                        m_retargetOffset.z);
+    // provided the height is expressed at the character's proportions, which is
+    // what m_retargetScale arranges.
+    //
+    // ApplyFrame divides the whole target by that ratio, so the offset is
+    // PRE-MULTIPLIED by it to come out the other side unchanged. Without this
+    // a nudge of 0.1 m would land as 0.086 m against a 1.16 ratio, which is
+    // not what a nudge in the character's own file space should mean.
+    const float motionScale = m_retargetScale > 1e-6f ? m_retargetScale : 1.0f;
+    DirectX::SimpleMath::Vector3 target(m_retargetOffset.x * motionScale,
+                                        m_retargetOffset.y * motionScale,
+                                        m_retargetOffset.z * motionScale);
     const DirectX::XMFLOAT3* joints = m_pipeline.Frame(m_currentFrame);
     if (joints == nullptr && m_retargetFromPositions) {
         // Driving from positions needs them. A frame whose feature vector
@@ -510,6 +532,12 @@ void MotionStreamView::ShowPerformanceUi() {
                     m_pipeline.FinalisedLatents(), m_pipeline.DecodedLatents(),
                     m_pipeline.FrameCount() - m_currentFrame);
     }
+    // Non-zero means the stream is in its steady state rather than still
+    // ramping up, and the gap to the decoder is the backpressure working.
+    if (m_pipeline.ShiftedLatents() > 0) {
+        ImGui::Text("streaming: %d latents slid out of the window",
+                    m_pipeline.ShiftedLatents());
+    }
 }
 
 void MotionStreamView::ShowNeuralUi() {
@@ -597,6 +625,32 @@ void MotionStreamView::ShowNeuralUi() {
             "No effect on the CPU provider, which does not fuse.");
     }
 
+    // Also needs pinned shapes, for the same reason: a sliding window is a
+    // fixed submitted length.
+    ImGui::BeginDisabled(!m_options.staticShapes);
+    bool streaming = m_options.continuous;
+    if (ImGui::Checkbox("stream until Stop", &streaming)) {
+        m_options.continuous = streaming;
+        devicesChanged = true;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Generate until Stop instead of for a fixed length. The live\n"
+            "region is always one chunk wide, so past the ramp the sampler is\n"
+            "in a steady state -- it slides the window forward, dropping\n"
+            "finalised latents off the front and appending fresh noise at the\n"
+            "back, rather than stopping. The ramp-up is identical to a finite\n"
+            "generation of the same length.\n\n"
+            "A latent is only dropped once it has been decoded, so the\n"
+            "sampler waits for the playhead and the stream regulates itself\n"
+            "to real time. Needs pinned shapes.");
+    }
+    if (!m_options.staticShapes && m_options.continuous) {
+        m_options.continuous = false;
+        devicesChanged = true;
+    }
+
     // Needs both of the above, so it is offered only when they hold rather
     // than accepted and then refused by Load.
     const bool canKeepLatentsOnGpu =
@@ -633,8 +687,34 @@ void MotionStreamView::ShowNeuralUi() {
     }
 
     ImGui::InputText("prompt", m_prompt, sizeof(m_prompt));
+    // Applied to the generation in flight the moment the edit finishes --
+    // Enter, or clicking away -- rather than waiting for the next Generate.
+    // Not per keystroke: encoding is a synchronous text-encoder run of about
+    // 9 ms, and the half-typed prompts on the way would each pay for one and
+    // condition the model on nonsense. SetPrompt is a no-op when the text has
+    // not actually changed, so this costs nothing when the field is merely
+    // visited.
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_pipeline.IsRunning()) {
+        std::string error;
+        if (!m_pipeline.SetPrompt(m_prompt, &error)) {
+            m_status = error;
+            m_hasStatusError = true;
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Changing this while a stream is running re-conditions "
+                          "it in place: the latents keep their noise levels, so "
+                          "the motion transitions into the new prompt over about "
+                          "a window rather than cutting.");
+    }
     const int requestedFrames = m_options.latentFrames;
-    ImGui::SliderInt("latent frames", &m_options.latentFrames, 2, 240);
+    ImGui::SliderInt(m_options.continuous ? "window (latents)" : "latent frames",
+                     &m_options.latentFrames, 2, 240);
+    if (ImGui::IsItemHovered() && m_options.continuous) {
+        ImGui::SetTooltip("Streaming, so this is not the length -- it is how "
+                          "much finalised motion the denoiser still sees "
+                          "behind the live chunk. The stream runs until Stop.");
+    }
     // With shapes pinned the sequence length is compiled into the session, so
     // moving this slider has to rebuild it rather than just change the next
     // generation.
@@ -645,10 +725,12 @@ void MotionStreamView::ShowNeuralUi() {
         }
     }
     ImGui::SameLine();
-    ImGui::Text("%.1f s", static_cast<float>(
-                              config.vaeFramesFirst +
-                              config.FramesPerLatent() * (m_options.latentFrames - 1)) /
-                              FloodDiffusionPipeline::kFrameRate);
+    ImGui::Text("%.1f s%s", static_cast<float>(
+                                config.vaeFramesFirst +
+                                config.FramesPerLatent() *
+                                    (m_options.latentFrames - 1)) /
+                                FloodDiffusionPipeline::kFrameRate,
+                m_options.continuous ? " of context" : "");
 
     int seed = static_cast<int>(m_options.seed);
     if (ImGui::InputInt("seed", &seed)) {
@@ -675,9 +757,11 @@ void MotionStreamView::ShowNeuralUi() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Stop") && m_pipeline.IsRunning()) {
-        // Nothing to cancel mid-step: a step is synchronous. Pausing playback
-        // and leaving the sampler to finish is the honest behaviour here.
-        m_playing = false;
+        // Stops the SAMPLER. Playback keeps going, because what has already
+        // been finalised still has motion to give and cutting it off would
+        // throw away frames the stream has paid for; the pipeline reports
+        // itself finished once the decoder has drained.
+        m_pipeline.Stop();
     }
 
     if (m_hasStatusError) {
@@ -793,12 +877,19 @@ void MotionStreamView::ShowNeuralUi() {
             ImGui::TextUnformatted(m_fitSummary.c_str());
         }
 
-        ImGui::SliderFloat("retarget scale", &m_retargetScale, 0.1f, 10.0f,
+        ImGui::SliderFloat("motion / character", &m_retargetScale, 0.1f, 10.0f,
                            "%.3f", ImGuiSliderFlags_Logarithmic);
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Resizes the whole rig. Set by the fit above from "
-                              "the ratio of hip heights, since rotation-only "
-                              "retargeting cannot change proportions.");
+            ImGui::SetTooltip("How much bigger the motion's skeleton is than "
+                              "this character. The root height and travel are "
+                              "DIVIDED by it, so the motion is brought down to "
+                              "the character.\n\n"
+                              "It does not resize the character: the rig keeps "
+                              "the size its file and its scene placement give "
+                              "it. Raise it to make the character take smaller "
+                              "steps and stand lower, lower it for the "
+                              "opposite. The fit above sets it from the ratio "
+                              "of hip heights.");
         }
         ImGui::DragFloat3("retarget offset", &m_retargetOffset.x, 0.01f);
         ImGui::Checkbox("root motion", &m_retargetRootMotion);

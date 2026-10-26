@@ -928,6 +928,345 @@ void TestPacedDecode(const Devices& devices, const Run& eager) {
     Expect("pacing the decode changed nothing about the motion", worst == 0.0f);
 }
 
+// Generating until Stop rather than for a fixed length.
+//
+// Four questions, and the first is the one that would be easy to get wrong:
+// whether the ramp-up is still the finite sampler's. It has to be, because
+// continuous mode changes nothing until the window starts sliding, and the
+// window does not slide until the finalised frontier has passed latentFrames
+// -- which at eight latents happens AFTER the finite run has run out of steps.
+// So every latent the finite ramp finalised must decode to exactly the same
+// motion.
+//
+// The one latent that is allowed to differ is the last the finite run emits.
+// Out of steps, a finite sampler declares everything remaining final at
+// whatever noise level it has reached; a continuous one keeps denoising it.
+// The comparison below stops at that boundary rather than fudging a tolerance,
+// and takes the boundary from the schedule rather than hardcoding it.
+void TestContinuous(const FloodDiffusionConfig& config, const Devices& devices,
+                    const Run& finite, bool gpuLatents = false) {
+    std::printf("\ngenerating until Stop%s\n",
+                gpuLatents ? ", latents on the GPU" : "");
+
+    FloodDiffusionPipeline pipeline;
+    FloodDiffusionOptions options;
+    options.latentFrames = 8;
+    options.seed = 1234;
+    options.device = FloodDiffusionDevice::DirectML;
+    options.textEncoderDevice = FloodDiffusionDevice::Cpu;
+    options.staticShapes = true;
+    options.continuous = true;
+    // The GPU path slides the latents with buffer copies through a scratch
+    // resource rather than a memmove, which is the half of this worth testing
+    // twice.
+    options.gpuLatents = gpuLatents;
+
+    std::string error;
+    if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
+                       devices.dml.Get())) {
+        std::printf("  %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    if (!pipeline.Begin("a person walks forward", options, &error)) {
+        std::printf("  %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+
+    // Four times the finite run's step count, which is comfortably past the
+    // first slide without being a long test.
+    const DiffusionForcingSchedule ramp(options.latentFrames, config.chunkSize,
+                                        config.noiseSteps);
+    const int rampSteps = ramp.TotalSteps();
+    for (int i = 0; i < rampSteps * 4; ++i) {
+        if (!pipeline.Step(&error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+    }
+
+    Expect("it is still running long past the finite step count",
+           pipeline.IsRunning());
+    std::printf("  %-54s %d\n", "steps taken", pipeline.StepsTaken());
+    std::printf("  %-54s %d\n", "latents slid out of the window",
+                pipeline.ShiftedLatents());
+    std::printf("  %-54s %d\n", "motion frames", pipeline.FrameCount());
+    Expect("the window has started sliding", pipeline.ShiftedLatents() > 0);
+    Expect("it produced more motion than the finite run",
+           pipeline.FrameCount() > finite.frames);
+    // The sampler and the decoder stay a window apart rather than drifting:
+    // the decoder cannot fall behind, because the slide waits for it.
+    Expect("the decoder kept up with the slide",
+           pipeline.DecodedLatents() >= pipeline.ShiftedLatents());
+
+    // The latents the finite ramp actually finalised, and the motion they
+    // decode to: one frame for the first latent and vae_frames_step for each
+    // after it.
+    const int rampFinalised = ramp.StartAt(rampSteps);
+    const int comparable = config.vaeFramesFirst +
+                           (rampFinalised - 1) * config.vaeFramesStep;
+    std::printf("  %-54s %d of %d\n", "frames comparable with the finite run",
+                comparable, finite.frames);
+    if (!finite.ok || comparable <= 0 ||
+        comparable > std::min(finite.frames, pipeline.FrameCount())) {
+        Expect("there is a comparable prefix", false);
+        return;
+    }
+    float worst = 0.0f;
+    const int joints = pipeline.JointCount();
+    for (int frame = 0; frame < comparable; ++frame) {
+        const DirectX::XMFLOAT3* got = pipeline.Frame(frame);
+        for (int joint = 0; joint < joints; ++joint) {
+            const DirectX::XMFLOAT3& a =
+                finite.positions[static_cast<std::size_t>(frame) *
+                                     static_cast<std::size_t>(joints) +
+                                 static_cast<std::size_t>(joint)];
+            const DirectX::XMFLOAT3& b = got[joint];
+            worst = std::max(worst, std::max(std::fabs(a.x - b.x),
+                                             std::max(std::fabs(a.y - b.y),
+                                                      std::fabs(a.z - b.z))));
+        }
+    }
+    std::printf("  %-54s %.5f m\n", "largest joint difference over that prefix",
+                worst);
+    // Exact on the host path, because it is the same arithmetic in the same
+    // order and anything else would be a sliding-window bug. The GPU-resident
+    // run is compared against a HOST finite run, so it inherits the tolerance
+    // CompareGpuLatents uses for the same crossing: centimetres, which catches
+    // a transposed index without failing on float noise.
+    if (gpuLatents) {
+        Expect("the ramp-up matches the finite sampler to within a centimetre",
+               worst < 0.01f);
+    } else {
+        Expect("the ramp-up is the finite sampler's, unchanged", worst == 0.0f);
+    }
+
+    // Still finite in one respect: the joints have to stay real. A sliding
+    // window that reused a stale latent or slid the wrong way shows up as NaN
+    // long before it shows up as a wrong pose.
+    bool finitePositions = true;
+    for (int frame = 0; frame < pipeline.FrameCount(); ++frame) {
+        const DirectX::XMFLOAT3* f = pipeline.Frame(frame);
+        for (int joint = 0; joint < joints; ++joint) {
+            if (!std::isfinite(f[joint].x) || !std::isfinite(f[joint].y) ||
+                !std::isfinite(f[joint].z)) {
+                finitePositions = false;
+            }
+        }
+    }
+    Expect("every joint of every frame is finite", finitePositions);
+
+    // Stop stops the sampler, not the generation: what it already finalised
+    // still has to become motion.
+    const int framesAtStop = pipeline.FrameCount();
+    pipeline.Stop();
+    int guard = 0;
+    while (pipeline.IsRunning() && guard++ < 400) {
+        if (!pipeline.Step(&error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+    }
+    Expect("Stop ended it", pipeline.Done());
+    Expect("and the decoder drained first",
+           pipeline.FrameCount() >= framesAtStop);
+    std::printf("  %-54s %d\n", "steps to drain after Stop", guard);
+    Expect("draining took a bounded number of steps", guard < 400);
+}
+
+// Changing the prompt on a running stream.
+//
+// Two assertions and they pull in opposite directions, which is what makes
+// this worth testing at all. The motion already decoded must be UNCHANGED --
+// otherwise the prompt change restarted something it had no business
+// restarting -- and the motion after it must DIFFER, or the new conditioning
+// never reached the model.
+//
+// The control is the same stream with the same seed that never changes prompt.
+// It consumes noise identically, because the slides are decided by the
+// schedule rather than by the motion, so the two runs are comparable
+// step-for-step and any difference after the switch is the prompt and nothing
+// else.
+void TestPromptSwitch(const FloodDiffusionConfig& config, const Devices& devices) {
+    std::printf("\nchanging the prompt on a running stream\n");
+
+    const DiffusionForcingSchedule ramp(8, config.chunkSize, config.noiseSteps);
+    const int half = ramp.TotalSteps() * 2;
+
+    const auto run = [&](bool switchPrompt, std::vector<DirectX::XMFLOAT3>* positions,
+                         int* frames) {
+        FloodDiffusionPipeline pipeline;
+        FloodDiffusionOptions options;
+        options.latentFrames = 8;
+        options.seed = 1234;
+        options.device = FloodDiffusionDevice::DirectML;
+        options.textEncoderDevice = FloodDiffusionDevice::Cpu;
+        options.staticShapes = true;
+        options.continuous = true;
+
+        std::string error;
+        if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
+                           devices.dml.Get()) ||
+            !pipeline.Begin("a person walks forward", options, &error)) {
+            std::printf("  %s\n", error.c_str());
+            return false;
+        }
+        for (int i = 0; i < half; ++i) {
+            if (!pipeline.Step(&error)) {
+                std::printf("  %s\n", error.c_str());
+                return false;
+            }
+        }
+        if (switchPrompt) {
+            if (!pipeline.SetPrompt("a person sits down on a chair", &error)) {
+                std::printf("  %s\n", error.c_str());
+                return false;
+            }
+            // The prompt the pipeline reports is the one in force, which is
+            // what a UI reads back.
+            Expect("the pipeline reports the new prompt",
+                   pipeline.Prompt() == "a person sits down on a chair");
+            Expect("and it is still running", pipeline.IsRunning());
+        }
+        for (int i = 0; i < half; ++i) {
+            if (!pipeline.Step(&error)) {
+                std::printf("  %s\n", error.c_str());
+                return false;
+            }
+        }
+        *frames = pipeline.FrameCount();
+        positions->clear();
+        const int joints = pipeline.JointCount();
+        for (int frame = 0; frame < *frames; ++frame) {
+            const DirectX::XMFLOAT3* f = pipeline.Frame(frame);
+            positions->insert(positions->end(), f, f + joints);
+        }
+        return true;
+    };
+
+    std::vector<DirectX::XMFLOAT3> control, switched;
+    int controlFrames = 0, switchedFrames = 0;
+    if (!run(false, &control, &controlFrames) ||
+        !run(true, &switched, &switchedFrames)) {
+        ++g_failures;
+        return;
+    }
+
+    ExpectInt("both streams produced the same frame count", switchedFrames,
+              controlFrames);
+    if (switchedFrames != controlFrames || control.size() != switched.size()) {
+        return;
+    }
+
+    // Where the switch landed, in frames. Everything strictly before it was
+    // decoded under the old prompt in both runs and must be identical.
+    const int joints = config.joints;
+    const int decodedAtSwitch = ramp.StartAt(half);
+    const int framesBefore = std::min(
+        config.vaeFramesFirst + std::max(decodedAtSwitch - 1, 0) * config.vaeFramesStep,
+        controlFrames);
+
+    float worstBefore = 0.0f;
+    float worstAfter = 0.0f;
+    for (int frame = 0; frame < controlFrames; ++frame) {
+        float worstHere = 0.0f;
+        for (int joint = 0; joint < joints; ++joint) {
+            const std::size_t at = static_cast<std::size_t>(frame) *
+                                       static_cast<std::size_t>(joints) +
+                                   static_cast<std::size_t>(joint);
+            const DirectX::XMFLOAT3& a = control[at];
+            const DirectX::XMFLOAT3& b = switched[at];
+            worstHere = std::max(worstHere,
+                                 std::max(std::fabs(a.x - b.x),
+                                          std::max(std::fabs(a.y - b.y),
+                                                   std::fabs(a.z - b.z))));
+        }
+        if (frame < framesBefore) {
+            worstBefore = std::max(worstBefore, worstHere);
+        } else {
+            worstAfter = std::max(worstAfter, worstHere);
+        }
+    }
+
+    std::printf("  %-54s %d of %d\n", "frames decoded before the switch",
+                framesBefore, controlFrames);
+    std::printf("  %-54s %.5f m\n", "largest difference before it", worstBefore);
+    std::printf("  %-54s %.5f m\n", "largest difference after it", worstAfter);
+    Expect("the motion already decoded did not move", worstBefore == 0.0f);
+    // Millimetres would be float noise; a centimetre of divergence is the
+    // model actually being conditioned on something else. In practice this
+    // comes out far larger, because the two prompts ask for different motion.
+    Expect("the motion after it changed", worstAfter > 0.01f);
+}
+
+// The backpressure a stream needs, on its own: a consumer that never consumes
+// must stall the sampler rather than let it slide a latent out of the window
+// before it has been decoded, which would be motion that never existed.
+void TestContinuousBackpressure(const Devices& devices) {
+    std::printf("\nbackpressure: a stream whose consumer never reads\n");
+
+    FloodDiffusionPipeline pipeline;
+    FloodDiffusionOptions options;
+    options.latentFrames = 8;
+    options.seed = 1234;
+    options.device = FloodDiffusionDevice::DirectML;
+    options.textEncoderDevice = FloodDiffusionDevice::Cpu;
+    options.staticShapes = true;
+    options.continuous = true;
+    // Decoding is the caller's, and this caller never calls DecodeAhead.
+    options.decodeAheadFrames = 12;
+
+    std::string error;
+    if (!pipeline.Load(kDirectory, options, &error, devices.device.Get(),
+                       devices.dml.Get()) ||
+        !pipeline.Begin("a person walks forward", options, &error)) {
+        std::printf("  %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+
+    for (int i = 0; i < 200; ++i) {
+        if (!pipeline.Step(&error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+    }
+    const int stalledAt = pipeline.StepsTaken();
+    for (int i = 0; i < 50; ++i) {
+        if (!pipeline.Step(&error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+    }
+    std::printf("  %-54s %d\n", "steps taken before stalling", stalledAt);
+    std::printf("  %-54s %d\n", "latents slid out", pipeline.ShiftedLatents());
+    // Step keeps returning true and keeps doing nothing, which is the stall.
+    ExpectInt("the sampler stopped advancing", pipeline.StepsTaken(), stalledAt);
+    Expect("nothing was decoded, so nothing slid past the decoder",
+           pipeline.ShiftedLatents() <= pipeline.DecodedLatents());
+    Expect("and it is still running, not failed", pipeline.IsRunning());
+
+    // Consume, and it picks up again exactly where it stalled.
+    int playhead = 0;
+    for (int i = 0; i < 200; ++i) {
+        if (!pipeline.DecodeAhead(playhead, &error) || !pipeline.Step(&error)) {
+            std::printf("  %s\n", error.c_str());
+            ++g_failures;
+            return;
+        }
+        if (playhead + 1 < pipeline.FrameCount()) {
+            ++playhead;
+        }
+    }
+    std::printf("  %-54s %d\n", "steps taken once it was read", pipeline.StepsTaken());
+    Expect("consuming released the sampler", pipeline.StepsTaken() > stalledAt);
+}
+
 // The two paths at the length the application actually generates.
 //
 // The comparison above runs eight latents, which is the right size for a
@@ -1073,6 +1412,14 @@ int main() {
                 // too, and the growing-prefix sampler produces different
                 // motion, so that is the only run it can be identical to.
                 TestPacedDecode(devices, pinned);
+
+                // Against `pinned` for the same reason: the continuous
+                // sampler pins its shapes too, so that is the run its
+                // ramp-up has to match.
+                TestContinuous(config, devices, pinned);
+                TestContinuous(config, devices, pinned, true);
+                TestContinuousBackpressure(devices);
+                TestPromptSwitch(config, devices);
 
                 MeasureAtShippedLength(devices);
 
