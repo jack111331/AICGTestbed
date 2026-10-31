@@ -1,7 +1,8 @@
 # Shadows and baked lightmaps
 
 Cascaded shadow maps, the cached static half, and baking the sun's visibility
-into the surface. Back to the [README](../README.md).
+into the surface — the two shadow stages of the frame the models run in. Back
+to the [README](../README.md); the write-up is [AI-Integrated Renderer](https://jack111331.github.io/BlogPage/ai_render_engine/).
 
 ## Cascaded shadow maps
 

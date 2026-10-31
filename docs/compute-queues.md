@@ -1,7 +1,9 @@
 # Compute queues for model work
 
-Why `ModelManager` and `FloodDiffusionPipeline` each own a compute queue, and
-what their fences are and are not for. Back to the [README](../README.md).
+How a model runs on D3D12 here without stalling graphics work: why
+`ModelManager` and `FloodDiffusionPipeline` each own a dedicated compute queue,
+and what their fences are and are not for. Back to the
+[README](../README.md); the write-up is [AI-Integrated Renderer](https://jack111331.github.io/BlogPage/ai_render_engine/).
 
 ## The model work runs on its own compute queue
 

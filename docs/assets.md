@@ -25,7 +25,8 @@ conversion. Back to the [README](../README.md).
 
 ## Staging the Bistro
 
-The Amazon Lumberyard Bistro is the large scene this renderer is tuned against.
+The Amazon Lumberyard Bistro is the large scene this renderer is tuned against,
+and the one every measurement here and in the write-up is taken on.
 It is not in the repository and cannot be: 3.5 GB, and it is not ours to
 redistribute.
 

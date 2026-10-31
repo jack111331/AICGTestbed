@@ -1,8 +1,10 @@
 # Text to motion
 
-The FloodDiffusion streaming pipeline, its execution providers and measured
-cost, latency and backpressure, the HumanML3D features, and retargeting onto a
-rigged character. Back to the [README](../README.md).
+The one model integrated so far, and the first step toward characters that
+react to what is around them: the FloodDiffusion streaming pipeline, its
+execution providers and measured cost, latency and backpressure, the HumanML3D
+features, and retargeting onto a rigged character. Back to the
+[README](../README.md); the write-up is [AI-Integrated Renderer](https://jack111331.github.io/BlogPage/ai_render_engine/).
 
 `//Engine:FloodDiffusion` streams
 [FloodDiffusion](https://github.com/ShandaAI/FloodDiffusion) text-to-motion and
@@ -95,6 +97,13 @@ So pinned DirectML is the fastest configuration available, 16× the dynamic GPU
 path and 1.5× the CPU, and the cold penalty falls 7.5× because there is only
 one shape left to compile. In the running application a denoising step went
 from 91.5 ms to 14.66 ms.
+
+Per denoising call the write-up puts the same change at **42.45 ms mean and
+98.43 ms worst dynamic against 5.54 ms and 6.42 ms pinned**, at 10 sampling
+steps on an RTX 5080 — 7.7× on the mean and 15.3× on the worst. The worst case
+is the number that decides whether a step fits inside a frame, which is why
+pinning is what made streaming generation affordable at all rather than merely
+faster.
 
 Two things to know before switching it on, both deliberate:
 

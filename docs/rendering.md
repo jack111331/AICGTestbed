@@ -1,8 +1,8 @@
 # Rendering
 
-Deferred shading on a render graph: the G-buffer, pass compilation, frustum
-culling, descriptor management and the BRDF. Back to the
-[README](../README.md).
+The graph the AI nodes sit in. Deferred shading: the G-buffer, pass
+compilation, frustum culling, descriptor management and the BRDF. Back to the
+[README](../README.md); the write-up is [AI-Integrated Renderer](https://jack111331.github.io/BlogPage/ai_render_engine/).
 
 ## Why deferred
 
@@ -68,6 +68,22 @@ frame into one command list. The frame is currently:
 | `Tonemap` | scene colour | back buffer |
 | `ScreenOverlay` | — | back buffer |
 | `ImGui` | — | back buffer |
+
+**Where the model work meets this list.** The motion pipeline is not a pass in
+it, and the ordering is worth being precise about: `Update` advances the sampler
+and `PoseCharacter` writes the retargeted pose as overrides on the scene graph,
+then `Render` calls `UpdateSceneTransforms` and only then `BuildFrameGraph`. So
+a model's output reaches the frame one step before the graph exists, as node
+transforms, and `GBuffer` draws a posed character without knowing a model
+produced it. The inference itself is off the graphics queue entirely.
+
+A pass that *consumed* a model's buffer on the GPU is the other shape this
+supports: `RecordModelDispatch` records into the frame's own command list, which
+is what being ordered *with* the frame is for, and `OrderAfterModelWork` is the
+GPU-side wait for work already submitted to the manager's own queue. Nothing
+here needs the second shape yet, which is the only reason the per-frame
+`EnqueueModel` in `Render` is correct without a fence — see [Compute
+queues](compute-queues.md).
 
 Everything above `Tonemap` writes **linear radiance** into an
 `R16G16B16A16_FLOAT` scene colour target; everything below it is in display

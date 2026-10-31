@@ -1,8 +1,24 @@
 # AICGTestbed
 
-A Direct3D 12 testbed for integrating neural models into a glTF scene pipeline.
+A real-time Direct3D 12 engine that runs heterogeneous AI model inference inside its render graph.
+The write-up is [AI-Integrated
+Renderer](https://jack111331.github.io/BlogPage/ai_render_engine/); this file is
+how to build and measure what it describes.
 
 ## Summary
+
+The aim is a pipeline in which an AI model is **a first-class part of the frame**
+rather than a step beside it: an AI node sits in the render graph with the
+rasterisation passes, consuming what earlier passes produced and feeding what
+comes after. One model is integrated so far — text-guided streaming motion
+generation, the first step toward characters that react to text prompt
+— and the recorded cost of running it next to a renderer is as much the point
+as the result.
+
+| | |
+|---|---|
+| **Real-world character reactions** | *in progress.* A generative motion model drives a skinned character, re-conditioned as the prompt changes. |
+| **Super resolution**, **particle effects**, **next-frame physics and fluid prediction**, **learned rigid and soft body physics**, **neural materials** | *planned.* |
 
 The renderer scaffold is Microsoft's
 [`DirectXTKSimpleSamplePC12`](https://github.com/microsoft/Xbox-ATG-Samples/tree/main/PCSamples/IntroGraphics/DirectXTKSimpleSamplePC12)
@@ -13,15 +29,15 @@ Bazel rather than MSBuild.
 Windows x64 only — every dependency is either a Windows SDK component, a D3D12
 API, or a vcpkg `x64-windows` package.
 
-What is in it:
+What is in it, models first:
 
 | | |
 |---|---|
+| **Streaming text to motion** | FloodDiffusion's four ONNX models with the diffusion-forcing sampler on the host, exported to ONNX and run through ONNX Runtime's DirectML execution provider, decoded paced to the playhead and retargeted onto a rigged character. [Text to motion](docs/text-to-motion.md) |
+| **Models on D3D12** | A name-keyed `ModelManager` over DirectML and ONNX Runtime, each on a dedicated compute queue so inference does not stall graphics work. [Compute queues](docs/compute-queues.md) |
 | **Deferred shading on a render graph** | Four G-buffer targets plus depth, passes declaring their reads and writes so the barriers are derived rather than hand-written, and a tonemap split that keeps linear radiance on one side of it. [Rendering](docs/rendering.md) |
 | **glTF scenes, merged** | Several files in one scene graph from a JSON manifest, with per-file placement, visibility and animation playback, skins, punctual lights and per-pixel specular-glossiness conversion. [Scenes](docs/scenes.md), [Assets](docs/assets.md) |
 | **Shadows** | Four cascades in one 4096² atlas with the static half cached across frames, plus an offline-unwrapped lightmap that bakes the sun's visibility into the surface. [Shadows](docs/shadows.md) |
-| **Neural model work** | A name-keyed `ModelManager` over DirectML and ONNX Runtime, each on its own compute queue. [Compute queues](docs/compute-queues.md) |
-| **Streaming text to motion** | FloodDiffusion's four ONNX models with the diffusion-forcing sampler on the host, decoded paced to the playhead and retargeted onto a rigged character. [Text to motion](docs/text-to-motion.md) |
 | **Tooling** | One ImGui window of four tabs, thirteen debug views that replace the frame, and a smoke test per property that is easy to break silently. [The panel](docs/ui.md) |
 
 ### Documentation
@@ -274,8 +290,25 @@ per-frame copies altogether. The cascade cache's 82% is CPU recording time, and
 it is bought with 64 MB a frame of GPU copy traffic that has not been narrowed
 yet.
 
-**Text to motion**, at the shipped 60 latents with the VAE decoders on the CPU
-provider. [Detail](docs/text-to-motion.md).
+**What the integration costs the frame.** These are the write-up's figures, on
+a single RTX 5080 at 1920x1080 over the Bistro with vsync off, after 30 seconds
+of streaming generation — an interactive run, which is the one thing the smoke
+tests cannot produce:
+
+| | without stream motion | with it |
+|---|---|---|
+| mean frame time | 2.45 ms | 2.87 ms |
+| worst frame time | 3.40 ms | 6.01 ms |
+
+So the mean carries the generation for **0.42 ms**, and the worst case is where
+it shows: 2.61 ms added to a frame, which is one denoising step landing inside
+it. New-prompt latency there is about **1.5 s** at both 10 and 50 sampling
+steps, and that it no longer varies with the step count is the sampler lead cap
+in force — 35 frames of backlog against a 20 fps playhead, as below.
+
+**What a call costs**, at the shipped 60 latents with the VAE decoders on the
+CPU provider. Measured by the smoke test rather than in a running frame, so
+these are not the two numbers above broken down. [Detail](docs/text-to-motion.md).
 
 | | calls | mean | max | total |
 |---|---|---|---|---|
@@ -296,8 +329,12 @@ Pinned DirectML is the fastest configuration available — 16x the dynamic GPU
 path — and it is **off by default**, because pinning `time` changes the sampler
 rather than only its speed. The dynamic path's 966 ms is per-dispatch overhead,
 not compute: 1226 of the graph's 1334 nodes are dispatched individually, and
-pinning the shapes collapses the graph to one fused dispatch. Model weights are
-1226.7 MB, of which 1.1 GB is the text encoder, which is why it loads on demand.
+pinning the shapes collapses the graph to one fused dispatch. Per denoising
+call at 10 steps, the write-up puts that at **42.45 ms mean and 98.43 ms worst
+dynamic, against 5.54 ms and 6.42 ms pinned** — 7.7x on the mean and 15.3x on
+the worst, which is the figure that decides whether a step fits in a frame.
+Model weights are 1226.7 MB, of which 1.1 GB is the text encoder, which is why
+it loads on demand.
 
 **Reaction latency** to a prompt change mid-stream is governed by the decoder's
 backlog rather than by the model: uncapped it reached 127 frames, about 6.4
@@ -357,6 +394,16 @@ Three measurement traps, each of which cost real time:
   uncapped `AICGTestbed` from an earlier launch was still rendering in the
   background.
 
+**Profile a model before integrating it, not after.** What decided every number
+above is how often a model is invoked, how large it is, and how large its inputs
+and outputs are — the write-up's
+[Insights](https://jack111331.github.io/BlogPage/ai_render_engine/) put it as
+pinning every input shape, then spending fewer steps at lower precision, and it
+is worth reading before wiring a second model in. The two standing difficulties
+are that inference speed is not what a generative model is developed against,
+and that the environment it was trained in is not the one it runs in here, so
+the ONNX conversion is a cost of its own rather than a formality.
+
 ### Shader debugging in RenderDoc
 
 Shaders are compiled with debug information embedded in the shader container, so
@@ -404,3 +451,13 @@ kind of work, in the Claude Code skill format (`SKILL.md` with frontmatter).
   and queue with a renderer.
 
 Known problems are listed in [Rough edges](docs/rough-edges.md).
+
+## References
+
+| | |
+|---|---|
+| Model | [FloodDiffusion](https://github.com/ShandaAI/FloodDiffusion) — the text-to-motion model, its export script and its distilled 10-step weights |
+| Character | [Mixamo](https://www.mixamo.com/) — the rigged character the motion is retargeted onto |
+| Scene | [niagara_bistro](https://github.com/zeux/niagara) — the glTF conversion of the Amazon Lumberyard Bistro used for the demos and every measurement here |
+| Renderer scaffold | [`DirectXTKSimpleSamplePC12`](https://github.com/microsoft/Xbox-ATG-Samples/tree/main/PCSamples/IntroGraphics/DirectXTKSimpleSamplePC12) |
+| Write-up | [AI-Integrated Renderer](https://jack111331.github.io/BlogPage/ai_render_engine/) |
