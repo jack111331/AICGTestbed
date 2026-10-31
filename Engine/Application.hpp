@@ -260,6 +260,12 @@ private:
     // A ring buffer of recent frame times, in milliseconds, for the plot in the
     // Performance tab. Four seconds at 60 Hz, which is long enough to see a
     // periodic hitch and short enough that the plot is still readable.
+    // Held so the overlay is not enumerating adapters every frame: GetAdapter
+    // walks the factory, which is fine once and silly sixty times a second.
+    Microsoft::WRL::ComPtr<IDXGIAdapter3>                                   m_vramAdapter;
+    bool                                                                    m_vramAdapterTried = false;
+    bool                                                                    m_frameReportDone = false;
+
     static constexpr int                                                    kFrameTimeHistory = 240;
     float                                                                   m_frameTimes[kFrameTimeHistory] = {};
     int                                                                     m_frameTimeCursor = 0;
@@ -284,8 +290,13 @@ private:
     // usable in a two-metre scene and hopeless in a hundred-and-sixty-metre
     // one -- so FrameSceneWithCamera sizes these to the scene rather than
     // leaving the user to discover why dragging appears to do nothing.
-    float                                                                   m_cameraMoveSpeed = 1.0f;
-    float                                                                   m_cameraRotateSpeed = 1.0f;
+    // World units and radians PER PIXEL of mouse drag -- not per pixel-second.
+    // See the camera drag in Update: a MODE_RELATIVE mouse already reports a
+    // per-frame displacement, so the frame delta is not applied again. These
+    // are the values they had divided by a 60 Hz frame, which keeps the feel
+    // identical to the capped build they were tuned on.
+    float                                                                   m_cameraMoveSpeed = 1.0f / 60.0f;
+    float                                                                   m_cameraRotateSpeed = 1.0f / 60.0f;
 
     NeuralModelIntegrateTestbed::Render::RenderGraph m_frameGraph;
     NeuralModelIntegrateTestbed::DeferredRenderer m_deferred;

@@ -151,10 +151,26 @@ private:
 
     // --- generation pacing --------------------------------------------------
 
-    // Denoising steps per rendered frame. One keeps the added cost inside a
-    // frame while still outrunning playback; more finishes sooner at the cost
-    // of a longer frame.
-    int m_stepsPerFrame = 1;
+    // Denoising steps per SECOND, not per frame.
+    //
+    // It used to be per frame, which was the same thing while the frame rate
+    // was pinned to a 60 Hz display and stopped being so the moment vsync came
+    // off: at 300 FPS the sampler ran five times faster and at 20 FPS it could
+    // not keep playback fed. The budget is a rate, and Update converts it with
+    // the measured frame delta, so generation advances at the same speed
+    // whatever the frame rate is.
+    //
+    // 60 is what one step per frame used to mean at 60 FPS, so the default
+    // behaves as it always did on that display. The rate that matches real
+    // time is noise_steps per second of motion -- 10 at the shipped shapes,
+    // since ten steps finalise one chunk and a chunk is one second at 20 fps
+    // -- so the default generates about six times faster than playback.
+    float m_stepsPerSecond = 60.0f;
+
+    // Whole steps only, so the fraction left over by a short frame is carried
+    // into the next one rather than lost. Without it a rate below the frame
+    // rate would truncate to zero steps every frame and never advance at all.
+    float m_stepBudget = 0.0f;
 
     // --- playback -----------------------------------------------------------
 

@@ -66,6 +66,14 @@ bool MotionStreamView::Load(const std::filesystem::path& directory,
     // so a stream left running costs about what playback costs.
     m_options.continuous = true;
 
+    // And the sampler is held a second and a half in front of the decoder.
+    // Without this it runs ahead until the window stops it -- 60 latents of
+    // already-decided motion, about twelve seconds -- and a prompt change
+    // cannot be seen until all of it has played. Measured, the worst reaction
+    // goes from 127 frames to 35, and it stops depending on the sampling step
+    // count, which is the part that made it feel arbitrary.
+    m_options.samplerLeadFrames = 30;
+
     if (!std::filesystem::exists(directory / "pipeline.txt")) {
         m_status = "not staged; run tools/prepare_flooddiffusion.py";
         m_hasStatusError = false;
@@ -305,6 +313,15 @@ bool MotionStreamView::Reload(std::string* error) {
         }
         return false;
     }
+    // Seeded from the export rather than left at the zero that means "take the
+    // export's default", so the sampling-steps control below shows the real
+    // number the next generation will use instead of a 0 nobody can read.
+    // Only when it has never been set, or reloading would discard the user's
+    // choice every time a provider changed.
+    if (m_options.denoiseSteps <= 0) {
+        m_options.denoiseSteps = m_pipeline.Config().noiseSteps;
+    }
+
     m_status = "loaded; press Generate";
     m_hasStatusError = false;
     return true;
@@ -339,15 +356,33 @@ void MotionStreamView::Update(float elapsedSeconds) {
 
     // Generation first, so a frame decoded this tick can be displayed this
     // tick rather than on the next one.
+    //
+    // The budget is a RATE converted by the measured frame delta, so the
+    // sampler advances at the same speed whatever the frame rate is -- the
+    // whole point of m_stepsPerSecond. The leftover fraction is carried, which
+    // is what lets a rate below the frame rate advance at all.
     if (m_pipeline.IsRunning()) {
+        m_stepBudget += elapsedSeconds * std::max(m_stepsPerSecond, 0.0f);
+        // A ceiling on the catch-up after a hitch. StepTimer already clamps
+        // its delta, so this only bites when the rate itself is enormous; what
+        // it prevents is one frame spending unbounded time denoising and
+        // making the next hitch worse.
+        constexpr float kMaxStepsPerFrame = 16.0f;
+        m_stepBudget = std::min(m_stepBudget, kMaxStepsPerFrame);
+
         std::string error;
-        for (int step = 0; step < m_stepsPerFrame && m_pipeline.IsRunning(); ++step) {
+        while (m_stepBudget >= 1.0f && m_pipeline.IsRunning()) {
+            m_stepBudget -= 1.0f;
             if (!m_pipeline.Step(&error)) {
                 m_status = error;
                 m_hasStatusError = true;
                 break;
             }
         }
+    } else {
+        // So a generation does not begin with a budget banked from however
+        // long the view sat idle.
+        m_stepBudget = 0.0f;
     }
 
     // Then decoding, as far as the playhead needs and no further. Before the
@@ -518,6 +553,113 @@ void MotionStreamView::ShowPerformanceUi() {
     ImGui::Text("denoise %.2f ms, decode %.2f ms, total %.0f ms",
                 m_pipeline.LastDenoiseMs(), m_pipeline.LastDecodeMs(),
                 m_pipeline.GenerationMs());
+    // Per call rather than summed, because the maximum is what a frame budget
+    // has to survive and the mean cannot tell you about it. One slow call is
+    // what drops a frame; a mean that fits comfortably says nothing.
+    const FloodDiffusionPipeline::PhaseTiming denoise = m_pipeline.DenoiseTiming();
+    const FloodDiffusionPipeline::PhaseTiming decode = m_pipeline.DecodeTiming();
+    if (denoise.calls > 0 || decode.calls > 0) {
+        ImGui::Text("denoiser  x%-4d mean %.2f ms  max %.2f ms", denoise.calls,
+                    denoise.meanMs, denoise.maxMs);
+        if (m_pipeline.GpuLatents()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(submission)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("With the latents on the GPU a denoiser Run "
+                                  "records and returns, so this row measures "
+                                  "submission rather than execution. The row "
+                                  "below is the work itself.");
+            }
+            // The timestamp-query figure, which is the only one of these that
+            // is the actual GPU work on this path. Shown immediately under the
+            // submission row so the two cannot be read apart: on this machine
+            // submission understates execution about fourfold.
+            const FloodDiffusionPipeline::PhaseTiming gpu =
+                m_pipeline.DenoiseGpuTiming();
+            if (gpu.calls > 0) {
+                ImGui::Text("  on GPU  x%-4d mean %.2f ms  max %.2f ms", gpu.calls,
+                            gpu.meanMs, gpu.maxMs);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "GPU execution, from D3D12 timestamp queries bracketing "
+                        "the provider's work on the shared compute queue.\n\n"
+                        "Compare it with the host path's denoiser rather than "
+                        "with the submission row above: the difference between "
+                        "those two is the copies this path removes, and it is "
+                        "small. This path is faster at not waiting, not at "
+                        "denoising.\n\n"
+                        "A few calls can be missing: a slot is read only once "
+                        "its fence has retired, and nothing waits for one.");
+                }
+            } else {
+                ImGui::TextDisabled("  on GPU  timestamp queries unavailable");
+            }
+        }
+        ImGui::Text("decoder   x%-4d mean %.2f ms  max %.2f ms", decode.calls,
+                    decode.meanMs, decode.maxMs);
+        ImGui::Text("first frame after %.0f ms", m_pipeline.FirstFrameMs());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Start-up latency: what a viewer waits through "
+                              "before anything moves. The ramp has to climb "
+                              "far enough to finalise the first latent, so "
+                              "this is denoising however cheap the decode is.");
+        }
+        // Only after a prompt change has actually produced a pose, since
+        // before that there is nothing to report and a zero would read as an
+        // instant reaction rather than as no reaction yet.
+        if (m_pipeline.PromptLatencyMs() > 0.0) {
+            ImGui::Text("new prompt reached the motion in %.0f ms",
+                        m_pipeline.PromptLatencyMs());
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("From the prompt change to the first pose "
+                                  "that could carry it. Latents already "
+                                  "finalised never will, so this waits only "
+                                  "for the ones still in flight -- which is "
+                                  "why it beats the start-up latency above.");
+            }
+        }
+    }
+    // GPU work issued, which answers a different question from time spent:
+    // whether the EP is compiling the graph or dispatching it operator by
+    // operator. One dispatch per Run means it compiled.
+    const FloodDiffusionPipeline::GpuWorkCounts work = m_pipeline.GpuWork();
+    if (work.ortRuns > 0) {
+        ImGui::Text("GPU work: %d EP dispatches over %d Runs%s", work.epDispatches,
+                    work.ortRuns,
+                    m_pipeline.StaticShapes() ? "" : "  (shapes NOT pinned)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "One fused DirectML dispatch per Run once shapes are pinned, "
+                "which is the graph compiler working. Unpinned it is 1226 per "
+                "Run -- the same graph dispatched operator by operator.\n\n"
+                "The decoders are on the CPU provider by default, so they "
+                "issue no GPU dispatches at all and this counts the "
+                "denoiser's.\n\n"
+                "Counted from the Run calls; the per-Run figure comes from ORT "
+                "profiling at these shapes, since the provider's dispatches "
+                "are inside its own command lists.");
+        }
+        if (work.computeDispatches > 0 || work.submissions > 0) {
+            ImGui::Text("  plus ours: %d shader dispatches, %d submissions",
+                        work.computeDispatches, work.submissions);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("The latent-step compute shader and the "
+                                  "command lists this pipeline submits to its "
+                                  "own queue. Only with the latents on the "
+                                  "GPU.");
+            }
+        }
+    }
+    if (m_pipeline.ModelBytes() > 0) {
+        ImGui::Text("model weights %.0f MB%s",
+                    static_cast<double>(m_pipeline.ModelBytes()) / (1024.0 * 1024.0),
+                    m_pipeline.TextEncoderLoaded() ? "" : " (encoder not loaded yet)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("The .onnx files opened so far. The prompt "
+                              "encoder is 1.1 GB of this and is loaded on "
+                              "first use, which is why it is called out.");
+        }
+    }
     ImGui::Text("%d motion frames (%.2f s)", m_pipeline.FrameCount(),
                 static_cast<float>(m_pipeline.FrameCount()) /
                     FloodDiffusionPipeline::kFrameRate);
@@ -537,6 +679,19 @@ void MotionStreamView::ShowPerformanceUi() {
     if (m_pipeline.ShiftedLatents() > 0) {
         ImGui::Text("streaming: %d latents slid out of the window",
                     m_pipeline.ShiftedLatents());
+    }
+    // The lead the cap governs, which is also the stale-prompt backlog: a
+    // prompt change has to wait for exactly this much motion to play out.
+    if (m_options.samplerLeadFrames > 0 && m_pipeline.IsRunning()) {
+        const int lead = m_pipeline.FinalisedLatents() - m_pipeline.DecodedLatents();
+        ImGui::Text("sampler %d latents ahead of the decoder (%.1f s of motion)",
+                    lead,
+                    static_cast<float>(lead * m_pipeline.Config().FramesPerLatent()) /
+                        FloodDiffusionPipeline::kFrameRate);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Also the stale-prompt backlog: a prompt change "
+                              "waits for this much motion to play out first.");
+        }
     }
 }
 
@@ -708,6 +863,22 @@ void MotionStreamView::ShowNeuralUi() {
                           "a window rather than cutting.");
     }
     const int requestedFrames = m_options.latentFrames;
+    ImGui::SliderInt("sampler lead (frames)", &m_options.samplerLeadFrames, 0, 120);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "How far the sampler may finalise ahead of the decoder before it "
+            "waits. 0 is unbounded.\n\n"
+            "This is what makes a prompt change feel prompt. Latents already "
+            "finalised carry the prompt that was in force when they were "
+            "denoised, and the decoder cannot skip them, so a change is "
+            "invisible until they have played. Uncapped the sampler runs "
+            "ahead until the window stops it -- about twelve seconds of "
+            "motion at the shipped window.\n\n"
+            "Costs nothing: the sampler already runs about six times faster "
+            "than playback, so holding it here loses no motion. Lower it for "
+            "a quicker reaction, raise it for more slack against a stutter.");
+    }
+
     ImGui::SliderInt(m_options.continuous ? "window (latents)" : "latent frames",
                      &m_options.latentFrames, 2, 240);
     if (ImGui::IsItemHovered() && m_options.continuous) {
@@ -731,6 +902,32 @@ void MotionStreamView::ShowNeuralUi() {
                                     (m_options.latentFrames - 1)) /
                                 FloodDiffusionPipeline::kFrameRate,
                 m_options.continuous ? " of context" : "");
+
+    // Sampling steps per chunk: how many denoising steps each latent gets
+    // before it is finalised. Read by Begin rather than Load, so unlike the
+    // window above it needs no session rebuild -- it takes effect on the next
+    // Generate, which is said on the control rather than left to be
+    // discovered.
+    ImGui::SliderInt("sampling steps", &m_options.denoiseSteps, 1, 50);
+    if (ImGui::IsItemHovered()) {
+        const int exported = config.noiseSteps;
+        ImGui::SetTooltip(
+            "Denoising steps each chunk of latents gets before it is final.\n"
+            "Generation cost is close to linear in this: the schedule runs\n"
+            "roughly latentFrames / chunk_size x this many steps.\n\n"
+            "This export is DISTILLED for %d, which is what it was trained to\n"
+            "reach -- fewer will degrade the motion and many more mostly buys\n"
+            "time rather than quality. It does not have to divide chunk_size\n"
+            "(%d); a value below it simply finalises several latents per step.\n\n"
+            "Takes effect on the next Generate: the schedule is built there, "
+            "and changing the noise ramp under latents already in flight would "
+            "make them jump.",
+            exported, config.chunkSize);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("export default")) {
+        m_options.denoiseSteps = config.noiseSteps;
+    }
 
     int seed = static_cast<int>(m_options.seed);
     if (ImGui::InputInt("seed", &seed)) {
@@ -788,11 +985,29 @@ void MotionStreamView::ShowNeuralUi() {
                     m_pipeline.TokenisedPrompt().c_str());
     }
 
-    ImGui::SliderInt("steps / frame", &m_stepsPerFrame, 1, 8);
+    ImGui::SliderFloat("steps / second", &m_stepsPerSecond, 1.0f, 480.0f, "%.0f",
+                       ImGuiSliderFlags_Logarithmic);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Denoising steps per rendered frame. Each costs 2-8 ms "
-                          "on the CPU and yields about 1.9 motion frames, so one "
-                          "step already generates faster than playback.");
+        // The rate that keeps up with playback exactly: noise_steps finalise
+        // one chunk, and a chunk is chunkSize * framesPerLatent motion frames,
+        // which at kFrameRate is that many seconds of motion. Derived rather
+        // than written down, so it stays right if the export changes.
+        const float secondsPerChunk =
+            static_cast<float>(config.chunkSize * config.FramesPerLatent()) /
+            FloodDiffusionPipeline::kFrameRate;
+        const float realTime = secondsPerChunk > 0.0f
+                                   ? static_cast<float>(config.noiseSteps) /
+                                         secondsPerChunk
+                                   : 0.0f;
+        ImGui::SetTooltip("Denoising steps per SECOND, converted with the "
+                          "measured frame delta -- so generation runs at this "
+                          "speed whatever the frame rate is.\n\n"
+                          "%.0f steps/s matches playback exactly; this is "
+                          "%.1fx real time. Each step costs 2-8 ms, so the "
+                          "rate is also what it costs per second of frame "
+                          "time.",
+                          realTime,
+                          realTime > 0.0f ? m_stepsPerSecond / realTime : 0.0f);
     }
 
     ImGui::Checkbox("playing", &m_playing);

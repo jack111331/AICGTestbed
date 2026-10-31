@@ -4,7 +4,7 @@
 # Usage:
 #
 #     python tools/make_specgloss_fixture.py resources/specgloss-test/specgloss-test.gltf
-#     PTFLIO_SCENE=resources/specgloss-test/specgloss-test.gltf bazel-bin/Engine/hello-world.exe
+#     PTFLIO_SCENE=resources/specgloss-test/specgloss-test.gltf bazel-bin/Engine/AICGTestbed.exe
 #
 # Deliberately FACTOR-ONLY, no textures: the renderer's 1x1 white fallback makes
 # the sampled diffuse exactly (1,1,1), so Mat_BaseColorFactor and

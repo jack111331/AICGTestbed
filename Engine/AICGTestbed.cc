@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------
-// Main.cpp
+// AICGTestbed.cc
 //
 // Entry point for Windows desktop application.
 //

@@ -15,7 +15,7 @@ import struct
 # Written where the app's PTFLIO_SCENE override can pick it up:
 #
 #     python tools/make_alpha_fixture.py
-#     PTFLIO_SCENE=resources/alpha-test/alpha-test.gltf bazel-bin/Engine/hello-world.exe
+#     PTFLIO_SCENE=resources/alpha-test/alpha-test.gltf bazel-bin/Engine/AICGTestbed.exe
 #
 # Six quads appear in a row. Reading left to right they must look like:
 # visible, visible, MISSING, visible, visible, MISSING. The two missing ones

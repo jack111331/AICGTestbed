@@ -38,6 +38,20 @@ namespace DX
         void RegisterDeviceNotify(IDeviceNotify* deviceNotify) { m_deviceNotify = deviceNotify; }
         void Prepare(D3D12_RESOURCE_STATES beforeState = D3D12_RESOURCE_STATE_PRESENT);
         void Present(D3D12_RESOURCE_STATES beforeState = D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        // Whether Present blocks until the next vertical blank. OFF by
+        // default, so the frame rate is whatever the machine can manage rather
+        // than the display's refresh -- which is what the profiling overlay and
+        // the frame-time graph are for.
+        //
+        // Only honoured when the swapchain was created tearing-capable
+        // (c_AllowTearing, which CreateDeviceResources clears if the adapter
+        // cannot do it), because presenting with an interval of 0 on a
+        // swapchain without that flag is what tears visibly rather than
+        // legally. Turning it back on is always allowed.
+        void SetVSync(bool enabled) noexcept { m_vsync = enabled; }
+        bool VSync() const noexcept { return m_vsync; }
+        bool CanDisableVSync() const noexcept { return (m_options & c_AllowTearing) != 0; }
         void WaitForGpu() noexcept;
 
         // Device Accessors.
@@ -138,6 +152,7 @@ namespace DX
 
         // DeviceResources options (see flags above)
         unsigned int                                        m_options;
+        bool                                                m_vsync;
 
         // The IDeviceNotify can be held directly as it owns the DeviceResources.
         IDeviceNotify*                                      m_deviceNotify;

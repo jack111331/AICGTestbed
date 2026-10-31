@@ -594,20 +594,31 @@ int main() {
         const wchar_t* prefix;
         const char* label;
         std::vector<Override> overrides;
+        int64_t time;
+        int64_t ctx;
     } profiles[] = {
-        {L"fd_dynamic", "dynamic", {}},
+        {L"fd_dynamic", "dynamic", {}, kTime, kRealContext},
         // The minimum an export would have to fix, from section 2.
-        {L"fd_bt", "batch+time", {{"batch", kBatch}, {"time", kTime}}},
+        {L"fd_bt", "batch+time", {{"batch", kBatch}, {"time", kTime}},
+         kTime, kRealContext},
         {L"fd_static", "all four", {{"batch", kBatch}, {"segments", kSegments},
-                                    {"ctx_len", kRealContext}, {"time", kTime}}},
+                                    {"ctx_len", kRealContext}, {"time", kTime}},
+         kTime, kRealContext},
+        // The APPLICATION's own shapes, which is what a dispatch count for the
+        // running engine has to be measured at: 60 latents plus a chunk, and
+        // the context padded to text_len. The probe's smaller shapes fuse too,
+        // but a count quoted for the app should come from the app's numbers.
+        {L"fd_app", "app shapes", {{"batch", kBatch}, {"segments", kSegments},
+                                   {"ctx_len", kTextLen}, {"time", 65}},
+         65, kTextLen},
     };
     for (const auto& profile : profiles) {
         Ort::SessionOptions options = MakeOptions(true, profile.overrides);
         options.EnableProfiling(profile.prefix);
         try {
             Ort::Session session(env, path, options);
-            RunDenoiser(session, kTime, kRealContext, kRealContext);
-            RunDenoiser(session, kTime, kRealContext, kRealContext);
+            RunDenoiser(session, profile.time, profile.ctx, profile.ctx);
+            RunDenoiser(session, profile.time, profile.ctx, profile.ctx);
             const std::string file = session.EndProfilingAllocated(
                 Ort::AllocatorWithDefaultOptions()).get();
             std::printf("   %-11s profile -> %s\n", profile.label, file.c_str());

@@ -290,6 +290,13 @@ struct GpuSampler {
     ID3D12CommandQueue* queue = nullptr;
     const OrtDmlApi* dmlApi = nullptr;
 
+    // What this class issues to the queue, counted rather than reasoned about.
+    // `dispatches` is the latent-step compute shader; the execution
+    // provider's own dispatches are not ours to count and come from an ORT
+    // profile instead (one fused node per Run once shapes are pinned).
+    int computeDispatches = 0;
+    int submissions = 0;
+
     std::unique_ptr<Ort::MemoryInfo> memoryInfo;
     Tensor x;           // [rows, time, latentDim]  the latent state
     Tensor t;           // [rows, time]             the noise ramp
@@ -347,6 +354,33 @@ struct GpuSampler {
     std::uint64_t slideSlotBytes = 0;
     std::uint64_t slideSlotFence[kRingSlots] = {};
     std::uint32_t slideCursor = 0;
+
+    // --- GPU execution timing ----------------------------------------------
+    //
+    // What a submission measurement cannot tell you. On this path a denoiser
+    // Run records and returns, so timing it on the CPU measures how long it
+    // took to ASK -- which is why every denoise figure from here has carried a
+    // caveat. Timestamps answer the real question.
+    //
+    // The execution provider records onto its OWN command lists, so there is
+    // nothing of ours to put a query inside. What makes this work anyway is
+    // that the queue is in-order and the EP submits to the same one: a
+    // timestamp written by the list BEFORE the Run and another by the list
+    // AFTER it bracket the EP's work, whatever lists it used in between. The
+    // two markers ride along on the noise upload and the latent-step dispatch
+    // rather than needing submissions of their own -- which matters, because
+    // extra submissions would inflate the very submission number this is being
+    // compared against.
+    //
+    // A ring, and nothing ever waits for it: a slot is read only once its
+    // fence has retired, so a step reads the result of a step several back.
+    // The last few slots of a generation are drained by the caller.
+    static constexpr std::uint32_t kTimerSlots = 8;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestampHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> timestampReadback;
+    std::uint64_t timestampFrequency = 0;
+    std::uint64_t timerFence[kTimerSlots] = {};
+    bool timerPending[kTimerSlots] = {};
 
     // One buffer big enough for whichever constant input is largest, used only
     // by Begin. Released afterwards would save 786 KB and cost a reallocation
@@ -468,6 +502,26 @@ struct GpuSampler {
             return fail("could not create the upload and readback buffers");
         }
 
+        // Two timestamps per slot, and a readback big enough for all of them.
+        // Not fatal if any of it fails: the timings are a diagnostic, so the
+        // sampler carries on without them rather than refusing to run.
+        D3D12_QUERY_HEAP_DESC queryDesc = {};
+        queryDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        queryDesc.Count = kTimerSlots * 2;
+        if (SUCCEEDED(device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&timestampHeap))) &&
+            MakeBuffer(sizeof(std::uint64_t) * kTimerSlots * 2,
+                       D3D12_HEAP_TYPE_READBACK, timestampReadback)) {
+            // Ticks per second for THIS queue. A compute queue always supports
+            // timestamps; only copy queues need a capability check.
+            if (FAILED(queue->GetTimestampFrequency(&timestampFrequency))) {
+                timestampFrequency = 0;
+            }
+        }
+        if (timestampFrequency == 0) {
+            timestampHeap.Reset();
+            timestampReadback.Reset();
+        }
+
         // Root constants and three root descriptors: three raw buffers need no
         // descriptor heap, so this dispatch cannot disturb whatever heaps the
         // renderer left bound on its own queue.
@@ -557,6 +611,7 @@ struct GpuSampler {
         commandList->Close();
         ID3D12CommandList* lists[] = {commandList.Get()};
         queue->ExecuteCommandLists(1, lists);
+        ++submissions;
         const std::uint64_t target = ++fenceValue;
         if (FAILED(queue->Signal(fence.Get(), target))) {
             return false;
@@ -603,7 +658,7 @@ struct GpuSampler {
 
     // The noise ramp, through the ring, with no wait unless the ring has
     // wrapped onto a slot still in flight.
-    bool UploadNoiseLevels(const float* levels, int count) {
+    bool UploadNoiseLevels(const float* levels, int count, int timerSlot) {
         const std::uint32_t slot = ringCursor % kRingSlots;
         ringCursor = (ringCursor + 1) % kRingSlots;
         if (!WaitFor(ringSlotFence[slot])) {
@@ -631,6 +686,13 @@ struct GpuSampler {
             return false;
         }
         commandList->CopyBufferRegion(t.buffer.Get(), 0, ring.Get(), offset, t.bytes);
+        // The opening bracket, riding along rather than paying for a
+        // submission of its own. Everything the queue runs between here and
+        // the closing bracket in DispatchStep is the execution provider's.
+        if (timerSlot >= 0 && timestampHeap != nullptr) {
+            commandList->EndQuery(timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                  static_cast<UINT>(timerSlot) * 2);
+        }
         if (!Submit()) {
             return false;
         }
@@ -642,12 +704,22 @@ struct GpuSampler {
     // prediction it reads. Same queue, so no barrier between them is needed
     // beyond the one queue order already gives.
     bool DispatchStep(int start, int end, float cfgScale, float dt,
-                      std::uint32_t predictionType) {
+                      std::uint32_t predictionType, int timerSlot) {
         if (end <= start) {
             return true;
         }
         if (!BeginList()) {
             return false;
+        }
+        // The closing bracket, before this list's own work so the interval
+        // holds only the provider's.
+        if (timerSlot >= 0 && timestampHeap != nullptr) {
+            commandList->EndQuery(timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                  static_cast<UINT>(timerSlot) * 2 + 1);
+            commandList->ResolveQueryData(
+                timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                static_cast<UINT>(timerSlot) * 2, 2, timestampReadback.Get(),
+                static_cast<UINT64>(timerSlot) * 2 * sizeof(std::uint64_t));
         }
         const std::uint32_t constants[8] = {
             static_cast<std::uint32_t>(start),
@@ -673,7 +745,49 @@ struct GpuSampler {
         const std::uint32_t lanes =
             static_cast<std::uint32_t>(end - start) * static_cast<std::uint32_t>(latentDim);
         commandList->Dispatch((lanes + 63) / 64, 1, 1);
-        return Submit();
+        ++computeDispatches;
+        if (!Submit()) {
+            return false;
+        }
+        if (timerSlot >= 0 && timestampHeap != nullptr) {
+            timerFence[timerSlot] = fenceValue;
+            timerPending[timerSlot] = true;
+        }
+        return true;
+    }
+
+    // Milliseconds of GPU execution for a slot, if the GPU has got that far.
+    // False means "not yet", never "failed" -- the caller tries again later
+    // rather than waiting, which is what keeps this path free of stalls.
+    bool TryReadTimer(int slot, double* ms) {
+        if (slot < 0 || !timerPending[slot] || timestampReadback == nullptr) {
+            return false;
+        }
+        if (fence->GetCompletedValue() < timerFence[slot]) {
+            return false;
+        }
+        const std::uint64_t base =
+            static_cast<std::uint64_t>(slot) * 2 * sizeof(std::uint64_t);
+        void* mapped = nullptr;
+        const D3D12_RANGE range = {
+            static_cast<SIZE_T>(base),
+            static_cast<SIZE_T>(base + 2 * sizeof(std::uint64_t))};
+        if (FAILED(timestampReadback->Map(0, &range, &mapped))) {
+            return false;
+        }
+        const std::uint64_t* stamps = reinterpret_cast<const std::uint64_t*>(
+            static_cast<std::uint8_t*>(mapped) + base);
+        const std::uint64_t first = stamps[0];
+        const std::uint64_t second = stamps[1];
+        const D3D12_RANGE empty = {0, 0};
+        timestampReadback->Unmap(0, &empty);
+        timerPending[slot] = false;
+        if (second <= first || timestampFrequency == 0) {
+            return false;
+        }
+        *ms = static_cast<double>(second - first) * 1000.0 /
+              static_cast<double>(timestampFrequency);
+        return true;
     }
 
     // Allocated on demand, because only a continuous generation slides.
@@ -887,6 +1001,8 @@ struct FloodDiffusionPipeline::Impl {
     // Zero decodes inside Step, as it always did; non-zero hands decoding to
     // DecodeAhead. See FloodDiffusionOptions::decodeAheadFrames.
     int decodeAheadFrames = 0;
+    // See FloodDiffusionOptions::samplerLeadFrames. Zero is unbounded.
+    int samplerLeadFrames = 0;
 
     // --- the sliding window, for FloodDiffusionOptions::continuous ----------
     //
@@ -922,6 +1038,39 @@ struct FloodDiffusionPipeline::Impl {
     double denoiseTotalMs = 0.0;
     double decodeTotalMs = 0.0;
 
+    // Per-call, for the mean and the maximum. The decode pair is kept
+    // separately from decodeTotalMs on purpose: that one times whole
+    // DecodeUpTo batches and so includes the latent readback the GPU path
+    // waits on, while these time the Run itself.
+    int denoiseCalls = 0;
+    double denoiseMaxMs = 0.0;
+    // GPU EXECUTION, from timestamp queries, and so only on the gpuLatents
+    // path. Separate from the figures above because they measure a different
+    // thing there: those time the submission, these time the work.
+    int denoiseGpuCalls = 0;
+    double denoiseGpuTotalMs = 0.0;
+    double denoiseGpuMaxMs = 0.0;
+    int decodeCalls = 0;
+    double decodeCallTotalMs = 0.0;
+    double decodeMaxMs = 0.0;
+
+    // Begin's clock, and the wall time at which motion first existed.
+    std::chrono::steady_clock::time_point genBegan{};
+    double firstFrameMs = 0.0;
+
+    // The last SetPrompt, and the first latent that could carry it. A latent
+    // already finalised when the prompt changed cannot: it will never be
+    // denoised again. So the first NEW pose is the first frame decoded from a
+    // latent at or past the frontier at that moment, and the wait for it is
+    // what a prompt change feels like.
+    std::chrono::steady_clock::time_point promptChangedAt{};
+    int promptChangeLatent = -1;
+    double promptLatencyMs = 0.0;
+
+    // Total bytes of the .onnx files this pipeline opened, for the question of
+    // what the models cost against the renderer.
+    std::uint64_t modelBytes = 0;
+
     // Scratch, reused across steps so a step does not allocate.
     std::vector<float> batchedLatents;
     std::vector<float> batchedTimes;
@@ -950,6 +1099,23 @@ struct FloodDiffusionPipeline::Impl {
     bool UploadContext(std::string* error);
     bool EnsureTextEncoder(std::string* error);
     bool Denoise(std::string* error);
+
+    // Drains whatever timestamp slots the GPU has finished with into the
+    // execution stats. Cheap and non-blocking: a slot that is not ready is
+    // left for next time.
+    void HarvestGpuTimers() {
+        if (gpu == nullptr) {
+            return;
+        }
+        for (int slot = 0; slot < static_cast<int>(GpuSampler::kTimerSlots); ++slot) {
+            double ms = 0.0;
+            if (gpu->TryReadTimer(slot, &ms)) {
+                ++denoiseGpuCalls;
+                denoiseGpuTotalMs += ms;
+                denoiseGpuMaxMs = std::max(denoiseGpuMaxMs, ms);
+            }
+        }
+    }
     bool DecodeUpTo(int latentLimit, std::string* error);
     bool DecodeOne(int latentIndex, std::string* error);
     void AppendMotion(const float* motion, int frameCountInBatch);
@@ -959,6 +1125,24 @@ struct FloodDiffusionPipeline::Impl {
     // called with `by` latents that have already been decoded, which
     // SlideBudget is what enforces.
     bool SlideWindow(int by, std::string* error);
+
+    // True when the sampler has finalised as much as the lead allows and must
+    // wait for the decoder. Expressed in latents, because that is the unit
+    // both halves count in; the option is in frames because that is the unit a
+    // person thinks in.
+    bool SamplerAtLeadLimit() const {
+        if (samplerLeadFrames <= 0) {
+            return false;
+        }
+        const int perLatent = config.FramesPerLatent();
+        if (perLatent <= 0) {
+            return false;
+        }
+        // Rounded up, so a cap smaller than one latent still permits one --
+        // a cap that permitted none would never produce anything.
+        const int allowed = std::max(1, (samplerLeadFrames + perLatent - 1) / perLatent);
+        return FinalisedLatents() - decodedLatents >= allowed;
+    }
 
     // How far the window may slide right now: enough to keep the finalised
     // frontier `latentFrames` into the window, but never past what the decoder
@@ -1080,6 +1264,9 @@ bool FloodDiffusionPipeline::OrderAfterWork(ID3D12CommandQueue* queue,
 }
 
 bool FloodDiffusionPipeline::WaitForWork(std::string* error) {
+    // Draining is exactly when the last timestamp slots become readable, so
+    // this is where a generation's final steps get counted.
+    m_impl->HarvestGpuTimers();
     Impl& impl = *m_impl;
     if (impl.computeQueue == nullptr || impl.fence == nullptr) {
         return true;
@@ -1138,6 +1325,7 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
     impl.textEncoder.reset();
     impl.textCache.clear();
     impl.caches.clear();
+    impl.modelBytes = 0;
     impl.running = false;
     impl.step = 0;
     impl.decodedLatents = 0;
@@ -1286,6 +1474,15 @@ bool FloodDiffusionPipeline::Load(const std::filesystem::path& directory,
             SetOrtError(error, std::string("loading ") + name + ": " + Shorten(e.what()));
             return false;
         }
+        // Weights on disk, which is the floor on what the models cost in
+        // memory. Not the same as what they occupy once loaded -- the EP
+        // preprocesses and may pad -- so it is reported as a file size and
+        // called one.
+        std::error_code ignored;
+        const std::uintmax_t bytes = std::filesystem::file_size(path, ignored);
+        if (!ignored) {
+            impl.modelBytes += bytes;
+        }
         return true;
     };
 
@@ -1376,6 +1573,73 @@ bool FloodDiffusionPipeline::GpuLatents() const { return m_impl->gpu != nullptr;
 double FloodDiffusionPipeline::DenoiseTotalMs() const {
     return m_impl->denoiseTotalMs;
 }
+FloodDiffusionPipeline::PhaseTiming FloodDiffusionPipeline::DenoiseTiming() const {
+    const Impl& impl = *m_impl;
+    PhaseTiming out;
+    out.calls = impl.denoiseCalls;
+    out.totalMs = impl.denoiseTotalMs;
+    out.meanMs = impl.denoiseCalls > 0
+                     ? impl.denoiseTotalMs / static_cast<double>(impl.denoiseCalls)
+                     : 0.0;
+    out.maxMs = impl.denoiseMaxMs;
+    return out;
+}
+
+FloodDiffusionPipeline::PhaseTiming FloodDiffusionPipeline::DecodeTiming() const {
+    const Impl& impl = *m_impl;
+    PhaseTiming out;
+    out.calls = impl.decodeCalls;
+    out.totalMs = impl.decodeCallTotalMs;
+    out.meanMs = impl.decodeCalls > 0
+                     ? impl.decodeCallTotalMs / static_cast<double>(impl.decodeCalls)
+                     : 0.0;
+    out.maxMs = impl.decodeMaxMs;
+    return out;
+}
+
+double FloodDiffusionPipeline::FirstFrameMs() const { return m_impl->firstFrameMs; }
+
+FloodDiffusionPipeline::PhaseTiming FloodDiffusionPipeline::DenoiseGpuTiming() const {
+    const Impl& impl = *m_impl;
+    PhaseTiming out;
+    out.calls = impl.denoiseGpuCalls;
+    out.totalMs = impl.denoiseGpuTotalMs;
+    out.meanMs = impl.denoiseGpuCalls > 0
+                     ? impl.denoiseGpuTotalMs / static_cast<double>(impl.denoiseGpuCalls)
+                     : 0.0;
+    out.maxMs = impl.denoiseGpuMaxMs;
+    return out;
+}
+
+FloodDiffusionPipeline::GpuWorkCounts FloodDiffusionPipeline::GpuWork() const {
+    const Impl& impl = *m_impl;
+    GpuWorkCounts out;
+    out.ortRuns = impl.denoiseCalls + impl.decodeCalls;
+    // One fused dispatch per Run on DirectML with shapes pinned; a Run on the
+    // CPU provider costs the GPU nothing, which is why the decoders moving
+    // there took the decode out of this count entirely. Without pinning the
+    // denoiser would be 1226 per Run instead of 1, and saying so is the point
+    // of reporting it.
+    const int perDirectMlRun = impl.staticShapes ? 1 : 1226;
+    if (impl.device == FloodDiffusionDevice::DirectML) {
+        out.epDispatches += impl.denoiseCalls * perDirectMlRun;
+    }
+    if (impl.vaeDevice == FloodDiffusionDevice::DirectML) {
+        out.epDispatches += impl.decodeCalls * perDirectMlRun;
+    }
+    if (impl.gpu != nullptr) {
+        out.computeDispatches = impl.gpu->computeDispatches;
+        out.submissions = impl.gpu->submissions;
+    }
+    return out;
+}
+
+double FloodDiffusionPipeline::PromptLatencyMs() const {
+    return m_impl->promptLatencyMs;
+}
+
+std::uint64_t FloodDiffusionPipeline::ModelBytes() const { return m_impl->modelBytes; }
+
 double FloodDiffusionPipeline::DecodeTotalMs() const {
     return m_impl->decodeTotalMs;
 }
@@ -1406,6 +1670,14 @@ bool FloodDiffusionPipeline::Impl::EnsureTextEncoder(std::string* error) {
     } catch (const Ort::Exception& e) {
         SetOrtError(error, "loading text_encoder.onnx: " + Shorten(e.what()));
         return false;
+    }
+    // Counted now rather than at Load, because this one is loaded on demand --
+    // and it is 1.1 GB, so whether it has been loaded is most of the answer to
+    // what these models cost.
+    std::error_code ignored;
+    const std::uintmax_t bytes = std::filesystem::file_size(path, ignored);
+    if (!ignored) {
+        modelBytes += bytes;
     }
     return true;
 }
@@ -1516,6 +1788,12 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
     // and its lengths, the all-zero text_idx, and the seeded latents
     // duplicated across the guidance rows. After this, a step sends 520 bytes.
     if (impl.gpu != nullptr) {
+        // Per generation, like every other statistic here. Reset before the
+        // uploads below rather than with the counters further down, so this
+        // generation's own setup submissions are counted in it.
+        impl.gpu->computeDispatches = 0;
+        impl.gpu->submissions = 0;
+
         const std::size_t perRow = static_cast<std::size_t>(impl.staticTime) *
                                    static_cast<std::size_t>(impl.config.latentDim);
         impl.batchedLatents.assign(perRow * static_cast<std::size_t>(impl.rows), 0.0f);
@@ -1561,7 +1839,20 @@ bool FloodDiffusionPipeline::Begin(const std::string& prompt,
     impl.generationMs = 0.0;
     impl.denoiseTotalMs = 0.0;
     impl.decodeTotalMs = 0.0;
+    impl.denoiseCalls = 0;
+    impl.denoiseMaxMs = 0.0;
+    impl.denoiseGpuCalls = 0;
+    impl.denoiseGpuTotalMs = 0.0;
+    impl.denoiseGpuMaxMs = 0.0;
+    impl.decodeCalls = 0;
+    impl.decodeCallTotalMs = 0.0;
+    impl.decodeMaxMs = 0.0;
+    impl.firstFrameMs = 0.0;
+    impl.genBegan = std::chrono::steady_clock::now();
+    impl.promptChangeLatent = -1;
+    impl.promptLatencyMs = 0.0;
     impl.decodeAheadFrames = std::max(0, options.decodeAheadFrames);
+    impl.samplerLeadFrames = std::max(0, options.samplerLeadFrames);
     impl.recovery->SetSmoothingAlpha(options.smoothingAlpha);
     impl.recovery->Reset();
     return true;
@@ -1603,8 +1894,14 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
     // the prediction is written into a buffer this process owns -- so the only
     // thing to send is the ramp, and nothing comes back.
     if (gpu != nullptr) {
+        // One slot per step, round robin. Harvested before being reused, so a
+        // slot's result is read several steps after it was written and nothing
+        // ever waits on the GPU to produce it.
+        const int timerSlot = step % static_cast<int>(GpuSampler::kTimerSlots);
+        HarvestGpuTimers();
+
         const auto began = std::chrono::steady_clock::now();
-        if (!gpu->UploadNoiseLevels(noiseLevels.data(), submitted)) {
+        if (!gpu->UploadNoiseLevels(noiseLevels.data(), submitted, timerSlot)) {
             SetOrtError(error, "uploading the noise ramp failed");
             return false;
         }
@@ -1622,7 +1919,8 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
                                              : config.predictionType == "noise" ? 2u
                                                                                 : 0u;
         if (!gpu->DispatchStep(windowStart, windowEnd, config.cfgScale,
-                               static_cast<float>(schedule.Dt()), predictionType)) {
+                               static_cast<float>(schedule.Dt()), predictionType,
+                               timerSlot)) {
             SetOrtError(error, "dispatching the latent step failed");
             return false;
         }
@@ -1631,6 +1929,8 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
         // The honest end-to-end number is GenerationMs.
         lastDenoiseMs = Milliseconds(began);
         denoiseTotalMs += lastDenoiseMs;
+        ++denoiseCalls;
+        denoiseMaxMs = std::max(denoiseMaxMs, lastDenoiseMs);
         return true;
     }
 
@@ -1677,6 +1977,8 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
                           inputs.size(), outputNames, 1);
         lastDenoiseMs = Milliseconds(began);
         denoiseTotalMs += lastDenoiseMs;
+        ++denoiseCalls;
+        denoiseMaxMs = std::max(denoiseMaxMs, lastDenoiseMs);
 
         const float* prediction = outputs[0].GetTensorData<float>();
         const float dt = static_cast<float>(schedule.Dt());
@@ -1716,6 +2018,12 @@ bool FloodDiffusionPipeline::Impl::Denoise(std::string* error) {
 }
 
 void FloodDiffusionPipeline::Impl::AppendMotion(const float* motion, int frameCountInBatch) {
+    // The instant the stream first has something to show, which is the latency
+    // a viewer waits through. Recorded before the copying below rather than
+    // after, because the frames exist as soon as the decoder produced them.
+    if (frameCount == 0 && frameCountInBatch > 0) {
+        firstFrameMs = Milliseconds(genBegan);
+    }
     const int joints = config.joints;
     const int motionDim = config.motionDim;
     frames.resize(static_cast<std::size_t>(frameCount + frameCountInBatch) *
@@ -1739,6 +2047,21 @@ void FloodDiffusionPipeline::Impl::AppendMotion(const float* motion, int frameCo
 }
 
 bool FloodDiffusionPipeline::Impl::DecodeOne(int latentIndex, std::string* error) {
+    // Scoped so every return path records the call, including the ones that
+    // fail -- a decode that threw still cost its time, and a maximum that
+    // quietly excluded the slow failures would be the wrong number.
+    struct Timed {
+        Impl& impl;
+        std::chrono::steady_clock::time_point began =
+            std::chrono::steady_clock::now();
+        ~Timed() {
+            const double ms = Milliseconds(began);
+            ++impl.decodeCalls;
+            impl.decodeCallTotalMs += ms;
+            impl.decodeMaxMs = std::max(impl.decodeMaxMs, ms);
+        }
+    } timed{*this};
+
     const int64_t zShape[] = {1, 1, config.latentDim};
     // latentIndex is absolute and `latents` is the window, so a continuous
     // generation that has slid reads further back than the index says.
@@ -1788,6 +2111,14 @@ bool FloodDiffusionPipeline::Impl::DecodeOne(int latentIndex, std::string* error
         caches.clear();
         for (std::size_t i = 1; i < outputs.size(); ++i) {
             caches.push_back(std::move(outputs[i]));
+        }
+
+        // The first pose that could carry the new prompt has just been
+        // decoded. Measured here rather than in AppendMotion because only
+        // this function knows which latent the frames came from.
+        if (promptChangeLatent >= 0 && latentIndex >= promptChangeLatent) {
+            promptLatencyMs = Milliseconds(promptChangedAt);
+            promptChangeLatent = -1;
         }
     } catch (const Ort::Exception& e) {
         SetOrtError(error, "decoding latent " + std::to_string(latentIndex) + ": " +
@@ -1995,7 +2326,17 @@ bool FloodDiffusionPipeline::SetPrompt(const std::string& prompt, std::string* e
     if (prompt == impl.prompt) {
         return true;
     }
-    return impl.ConditionOn(prompt, error) && impl.UploadContext(error);
+    if (!impl.ConditionOn(prompt, error) || !impl.UploadContext(error)) {
+        return false;
+    }
+    // Armed only for a RUNNING generation: with nothing in flight there is no
+    // pose on the way and the next Begin would reset this anyway.
+    if (impl.running) {
+        impl.promptChangedAt = std::chrono::steady_clock::now();
+        impl.promptChangeLatent = impl.FinalisedLatents();
+        impl.promptLatencyMs = 0.0;
+    }
+    return true;
 }
 
 void FloodDiffusionPipeline::Stop() { m_impl->stopRequested = true; }
@@ -2019,13 +2360,20 @@ bool FloodDiffusionPipeline::Step(std::string* error) {
     // simply finished and the generation is not -- running stays true until
     // DecodeAhead has drained the backlog, because a stream is over when the
     // motion exists, not when the latents do.
+    impl.HarvestGpuTimers();
     // A continuous generation has no step to run out of: past the ramp it
     // slides the window instead, and only Stop() ends the sampling.
     const bool sampling = impl.continuous
                               ? !impl.stopRequested
                               : impl.step < impl.schedule.TotalSteps();
 
-    if (sampling) {
+    // The lead cap, checked before anything else the sampler would do. A
+    // stall here falls THROUGH to the decode below rather than returning, so
+    // the half that releases it still runs -- decoding eagerly that is the
+    // only thing that could, and returning early would deadlock.
+    const bool atLeadLimit = sampling && impl.SamplerAtLeadLimit();
+
+    if (sampling && !atLeadLimit) {
         // Before denoising, not after: the slide is what makes room for what
         // this step is about to write, and the arithmetic in SlideBudget only
         // lands the write range exactly at the window's end if it happens

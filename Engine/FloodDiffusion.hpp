@@ -247,6 +247,47 @@ struct FloodDiffusionOptions {
     // so 26 KB a second, so 94 MB an hour. Nothing trims it yet.
     bool continuous = false;
 
+    // Motion frames the SAMPLER may finalise ahead of what the decoder has
+    // produced, before it stalls and waits. Zero is unbounded, which is what
+    // it always did.
+    //
+    // This is the knob that makes a prompt change responsive, and it exists
+    // because nothing else bounds the sampler usefully. Latents finalised but
+    // not yet decoded all carry whatever prompt was in force when they were
+    // denoised, and the decoder is strictly causal, so a prompt change is
+    // invisible until every one of them has been decoded and played. Left
+    // alone the sampler runs ahead until the WINDOW stops it -- at the shipped
+    // latentFrames of 60 that is 60 latents of stale prompt, about twelve
+    // seconds of motion, and a LOWER sampling-step count makes it worse
+    // because the sampler reaches that state sooner.
+    //
+    // Capping the lead bounds that wait directly: the reaction cannot be worse
+    // than this many frames plus the step or two it takes to finalise one more
+    // latent, whatever the step count is. Measured at a 30-latent window,
+    // changing the prompt early, frames to react:
+    //
+    //   sampling steps     uncapped     capped at 30 frames
+    //              3          127               35
+    //             10          127               35
+    //             20            5                5
+    //
+    // The two low counts come out IDENTICAL once capped, which is the result
+    // worth having: the reaction stopped being a function of the step count.
+    // Twenty is quicker still because it never reaches the cap on its own --
+    // this is a ceiling, not a floor.
+    //
+    // It costs nothing in throughput. The sampler is already far ahead of real
+    // time -- about six times at the default rate -- so holding it a second or
+    // two in front of the decoder loses no motion, it only stops it banking
+    // work nobody has asked to see yet. The stall shows up as Step returning
+    // true having done nothing, exactly like the window backpressure it sits
+    // in front of.
+    //
+    // Only bites with decodeAheadFrames set. Decoding eagerly, Step decodes to
+    // the frontier before returning, so the lead is zero and this never
+    // triggers.
+    int samplerLeadFrames = 0;
+
     // Motion frames to keep decoded ahead of the frame a consumer has reached.
     // Non-zero takes decoding OUT of Step and makes it the caller's, through
     // DecodeAhead; zero decodes every finalised latent inside Step, which is
@@ -632,6 +673,155 @@ public:
     // FloodDiffusionOptions::vaeDevice and ::gpuLatents.
     double DenoiseTotalMs() const;
     double DecodeTotalMs() const;
+
+    // The same two halves per CALL rather than summed, because the mean and
+    // the maximum answer different questions and usually disagree. The mean
+    // says where a generation's time goes; the maximum says what a frame
+    // budget has to survive, and one bad call is what drops a frame.
+    //
+    // `calls` counts denoiser Runs and vae_decoder Runs respectively -- 128
+    // and 60 at the shipped 60 latents -- so mean is total/calls exactly.
+    //
+    // ONE CAVEAT, and it is the one that makes these numbers lie if ignored:
+    // on the gpuLatents path a denoiser Run records and returns, so the
+    // denoise figures measure SUBMISSION and not execution. The decode
+    // figures are honest on both paths because a decode has to produce motion
+    // on the host. GenerationMs is the number that is true either way.
+    //
+    // Measured on an RTX 5080 at the shipped 60 latents, host latents,
+    // decoders on the CPU, repeatable to a few per cent:
+    //
+    //   denoiser     128 calls   mean 2.29 ms   max 3.26 ms   total 294 ms
+    //   VAE decoder   60 calls   mean 1.43 ms   max 2.11 ms   total  86 ms
+    //
+    // The maxima are about 1.4x the means, so neither half has a tail worth
+    // worrying about -- which is the useful finding, because it means the
+    // per-frame cost of generating is predictable and a step can be budgeted
+    // for. On the gpuLatents path the decoder is the same 1.4-1.5 ms while
+    // the denoiser's submission falls to 0.54 ms mean, and the difference
+    // between DecodeTotalMs and DecodeTiming().totalMs there is about 200 ms
+    // of latent readback waiting for denoising the GPU is actually doing.
+    struct PhaseTiming {
+        int calls = 0;
+        double totalMs = 0.0;
+        double meanMs = 0.0;
+        double maxMs = 0.0;
+    };
+    PhaseTiming DenoiseTiming() const;
+    PhaseTiming DecodeTiming() const;
+
+    // The denoiser's GPU EXECUTION time, from D3D12 timestamp queries, which
+    // is the number the caveat above says DenoiseTiming cannot give on the
+    // gpuLatents path. Empty (`calls` 0) on the host path and whenever the
+    // query heap could not be created, because there it would measure nothing
+    // the CPU figures do not already measure honestly.
+    //
+    // The execution provider records onto its own command lists, so there is
+    // nothing of ours to put a query inside. It works because the queue is
+    // in-order and the EP submits to the same one: a timestamp written by the
+    // list before the Run and another by the list after it bracket the EP's
+    // work whatever lists it used in between. Both markers ride along on
+    // submissions the sampler was making anyway, so measuring does not inflate
+    // the submission figure it is being compared against.
+    //
+    // `calls` can be a few short of DenoiseTiming().calls, and that is not a
+    // fault: a slot is read only once its fence has retired, so the last
+    // handful of a generation are harvested by Step or WaitForWork rather than
+    // immediately. Nothing ever blocks waiting for one.
+    //
+    // What it found, at the shipped 60 latents on an RTX 5080, repeatable to
+    // a couple of per cent:
+    //
+    //   denoiser, submission       0.48 ms mean   2.59 ms max    62 ms total
+    //   denoiser, GPU execution    2.05 ms mean   2.92 ms max   262 ms total
+    //
+    // So submission understated the work by about 4x, which is the size of the
+    // error every earlier reading of this path carried.
+    //
+    // And it reconciles two numbers that never agreed before. The HOST path's
+    // CPU-side denoiser is 2.22 ms a call, measured honestly because reading
+    // the prediction back forces it to wait; GPU execution is 2.05 ms. The
+    // 0.17 ms between them is the host↔device copies the device path removes --
+    // real, and nothing like the 4x the submission figure implied. The device
+    // path was never faster at denoising; it was faster at not waiting.
+    PhaseTiming DenoiseGpuTiming() const;
+
+    // GPU work the PIPELINE issues, counted exactly. `ortRuns` is denoiser
+    // plus decoder Run calls; `epDispatches` is what those cost the GPU, which
+    // is one fused DirectML dispatch per DirectML Run once shapes are pinned
+    // and zero for a Run on the CPU provider; `computeDispatches` and
+    // `submissions` are the sampler's own, and are zero without gpuLatents.
+    //
+    // The EP figure is the one number here that is not counted but derived,
+    // because the provider's dispatches are inside its own command lists. It
+    // comes from ORT profiling at this pipeline's exact shapes -- see
+    // //Engine:fd-probe section 8, which writes a profile whose kernel entries
+    // can be counted per provider. Measured there: 1334 nodes per Run with
+    // shapes dynamic (1226 DirectML dispatches plus 108 left on the CPU), and
+    // exactly 1 fused dispatch with them pinned.
+    struct GpuWorkCounts {
+        int ortRuns = 0;
+        int epDispatches = 0;
+        int computeDispatches = 0;
+        int submissions = 0;
+    };
+    GpuWorkCounts GpuWork() const;
+
+    // Wall time from Begin to the first motion frame existing: the stream's
+    // start-up latency, which is what a viewer actually waits through before
+    // anything moves. It is NOT a fraction of the generation -- the ramp has
+    // to climb far enough to finalise the first latent before there is
+    // anything to decode, so this is dominated by denoising however cheap the
+    // decode gets. Zero until that frame exists.
+    double FirstFrameMs() const;
+
+    // Wall time from the last SetPrompt to the first pose that could carry it
+    // -- what a prompt change actually feels like, and the number a "reaction"
+    // claim rests on.
+    //
+    // "Could carry it" is doing real work in that sentence. A latent already
+    // finalised when the prompt changed will never be denoised again, so it
+    // cannot reflect the new prompt however long you wait; the first new pose
+    // is the first frame decoded from a latent at or past the frontier at the
+    // moment of the change. Measuring to the next frame of ANY kind would
+    // report a few milliseconds and mean nothing.
+    //
+    // Zero until a prompt change has produced such a frame, and reset by
+    // Begin. It is not the same as FirstFrameMs: that one waits for the ramp
+    // to climb from nothing, this one only waits for latents already in
+    // flight to finish.
+    //
+    // WHAT DOMINATES IT IS THE UNDECODED BACKLOG, not the sampling step count,
+    // and the two pull opposite ways. Decoding eagerly there is no backlog and
+    // the wait is just the frontier advancing one latent -- steps/chunk_size
+    // steps, so 1, 2 and 4 steps at 3, 10 and 20 sampling steps. With decoding
+    // PACED to a playhead the sampler runs ahead and leaves finalised latents
+    // the decoder has not reached; every one carries the OLD prompt and the
+    // decoder is strictly causal, so they all have to be decoded and played
+    // first. Measured at a 30-latent window, changing the prompt early:
+    //
+    //   sampling steps   backlog   frames to react
+    //              3        31          127
+    //             10        10           43
+    //             20         1            5
+    //
+    // So a LOWER step count reacts SLOWER once paced, because it finishes its
+    // ramp sooner and has run further ahead. In the application a frame is a
+    // rendered frame against a real-time playhead, so 127 of them is about 6.4
+    // seconds -- which is what a prompt change actually feels like there, and
+    // nothing like the millisecond figures the eager path reports.
+    //
+    // The backlog saturates at the window, so the window is the ceiling on
+    // this: latentFrames 60 is 60 latents of old prompt, about 12 seconds.
+    // Bounding the sampler's lead over the DECODER rather than only over the
+    // window is what would fix it, and nothing does that yet.
+    double PromptLatencyMs() const;
+
+    // Total bytes of the .onnx files opened, which is the floor on what these
+    // models cost against the renderer's own memory. The text encoder is only
+    // counted once it has been loaded, since it is loaded on demand and is by
+    // far the largest of the four.
+    std::uint64_t ModelBytes() const;
 
     // Ids the prompt tokenised to, and the text they decode back to. For the
     // UI, and for checking a prompt was understood rather than silently turned

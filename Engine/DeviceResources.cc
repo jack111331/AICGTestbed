@@ -81,6 +81,7 @@ DeviceResources::DeviceResources(
         m_outputSize{0, 0, 1, 1},
         m_colorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709),
         m_options(flags),
+        m_vsync(false),
         m_deviceNotify(nullptr)
 {
     if (backBufferCount < 2 || backBufferCount > MAX_BACK_BUFFER_COUNT)
@@ -572,7 +573,7 @@ void DeviceResources::Present(D3D12_RESOURCE_STATES beforeState)
     m_commandQueue->ExecuteCommandLists(1, CommandListCast(m_commandList.GetAddressOf()));
 
     HRESULT hr;
-    if (m_options & c_AllowTearing)
+    if (!m_vsync && (m_options & c_AllowTearing))
     {
         // Recommended to always use tearing if supported when using a sync interval of 0.
         // Note this will fail if in true 'fullscreen' mode.

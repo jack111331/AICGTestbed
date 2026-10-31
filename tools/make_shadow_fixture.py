@@ -4,7 +4,7 @@
 # Usage:
 #
 #     python tools/make_shadow_fixture.py resources/shadow-test/shadow-test.gltf
-#     PTFLIO_SCENE=resources/shadow-test/shadow-test.gltf bazel-bin/Engine/hello-world.exe
+#     PTFLIO_SCENE=resources/shadow-test/shadow-test.gltf bazel-bin/Engine/AICGTestbed.exe
 #
 # Then put the camera at (0, 10, 0) looking at the origin with up (0, 0, -1) --
 # straight down at the floor. The occluder sits in the middle of the frame and

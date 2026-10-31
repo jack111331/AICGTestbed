@@ -21,7 +21,7 @@ WIDTH, HEIGHT = 256, 128
 #
 #     python tools/make_env_fixture.py resources/alpha-test/env-test.hdr
 #     PTFLIO_SCENE=resources/alpha-test/alpha-test.gltf \
-#         PTFLIO_SKYBOX=resources/alpha-test/env-test.hdr bazel-bin/Engine/hello-world.exe
+#         PTFLIO_SKYBOX=resources/alpha-test/env-test.hdr bazel-bin/Engine/AICGTestbed.exe
 #
 # Point the camera down -Z and the middle of the screen must be GREEN, the
 # right RED, the left BLUE, behind you YELLOW. Anything else means the

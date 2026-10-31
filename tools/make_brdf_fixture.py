@@ -16,7 +16,7 @@ import sys
 # Usage:
 #
 #     python tools/make_brdf_fixture.py resources/brdf-test/brdf-test.gltf
-#     PTFLIO_SCENE=resources/brdf-test/brdf-test.gltf bazel-bin/Engine/hello-world.exe
+#     PTFLIO_SCENE=resources/brdf-test/brdf-test.gltf bazel-bin/Engine/AICGTestbed.exe
 #
 # Then put the camera at (0, 0, 3) looking at the origin -- the Camera panel
 # takes those directly -- and the four quads must read, left to right, the

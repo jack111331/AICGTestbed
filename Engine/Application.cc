@@ -39,7 +39,18 @@ using Microsoft::WRL::ComPtr;
 
 Sample::Sample() noexcept(false)
 {
-    m_deviceResources = std::make_shared<DX::DeviceResources>();
+    // c_AllowTearing is what lets Present run without waiting for the vertical
+    // blank, so the frame rate is the machine's rather than the display's.
+    // CreateDeviceResources clears the flag if the adapter cannot tear, and
+    // Present falls back to blocking, so asking for it is safe on anything.
+    // The vsync checkbox in the profiling overlay turns the wait back on.
+    //
+    // Everything time-based reads DX::StepTimer::GetElapsedSeconds, which is a
+    // real measured delta (m_isFixedTimeStep is false), so an uncapped frame
+    // rate changes how often things are updated and not how fast they move.
+    m_deviceResources = std::make_shared<DX::DeviceResources>(
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_D32_FLOAT, 2,
+        D3D_FEATURE_LEVEL_11_0, DX::DeviceResources::c_AllowTearing);
     m_deviceResources->RegisterDeviceNotify(this);
 }
 
@@ -658,9 +669,16 @@ void Sample::Update(DX::StepTimer const& timer)
         // Scaled by the speed multipliers, which FrameSceneWithCamera sizes to
         // the scene: MoveForward takes WORLD UNITS, so an unscaled drag that
         // crosses a two-metre scene in a moment barely stirs a street.
-        const float elapsed = static_cast<float>(timer.GetElapsedSeconds());
-        const float move = elapsed * m_cameraMoveSpeed;
-        const float rotate = elapsed * m_cameraRotateSpeed;
+        //
+        // NOT scaled by the frame delta, deliberately. A MODE_RELATIVE mouse
+        // reports a per-frame DISPLACEMENT, so multiplying it by the frame
+        // time counted the frame twice: the same physical drag moved the
+        // camera less the faster the frame rate was. That was invisible while
+        // vsync pinned the rate at 60 and obvious the moment it came off.
+        // These speeds are per PIXEL of drag, which is what makes the camera
+        // feel the same at any frame rate.
+        const float move = m_cameraMoveSpeed;
+        const float rotate = m_cameraRotateSpeed;
         if (m_mouseTracker.leftButton == Mouse::ButtonStateTracker::HELD) {
             m_camera->RotateAroundYAxis(-mouse.x * rotate);
             m_camera->RotatePitch(-mouse.y * rotate);
@@ -987,9 +1005,11 @@ bool Sample::MeasureScene()
     // in a two-metre fixture and a hundred-and-sixty-metre street alike.
     m_deferred.SetSceneScale(radius);
 
-    // Roughly "cross the scene in a second of dragging". Rotation is in radians
-    // and has nothing to do with scene size, so it is left alone.
-    m_cameraMoveSpeed = radius * 0.05f;
+    // Roughly "cross the scene in sixty pixels of dragging", which is what
+    // "cross it in a second" used to mean at 60 FPS before the speed became
+    // per pixel rather than per pixel-second. Rotation is in radians and has
+    // nothing to do with scene size, so it is left alone.
+    m_cameraMoveSpeed = radius * 0.05f / 60.0f;
     return true;
 }
 
@@ -1163,8 +1183,13 @@ void Sample::ShowCameraUI()
 
     ImGui::Separator();
 
-    ImGui::DragFloat("Move speed", &m_cameraMoveSpeed, step, 0.0001f, 10000.0f, "%.4f");
-    ImGui::DragFloat("Rotate speed", &m_cameraRotateSpeed, 0.01f, 0.0001f, 100.0f, "%.4f");
+    // Finer steps and tighter floors than before: these are now per pixel of
+    // drag rather than per pixel-second, so their useful values are about
+    // sixty times smaller.
+    ImGui::DragFloat("Move speed / px", &m_cameraMoveSpeed, step / 60.0f, 0.000001f,
+                     1000.0f, "%.6f");
+    ImGui::DragFloat("Rotate speed / px", &m_cameraRotateSpeed, 0.0002f, 0.000001f,
+                     10.0f, "%.6f");
     ImGui::TextUnformatted("drag: left orbit, right dolly, middle pan");
 
     ImGui::Separator();
@@ -1216,6 +1241,96 @@ void Sample::ShowFrameTimingUI()
     // oldest-to-newest and the newest sample is at the right edge.
     ImGui::PlotLines("##frametimes", m_frameTimes, kFrameTimeHistory,
                      m_frameTimeCursor, overlay, 0.0f, ceiling, ImVec2(0.0f, 60.0f));
+
+    // Percentiles, not just the worst sample. The worst is one frame out of
+    // 240 and says nothing about how often it happens; p95 and p99 separate an
+    // occasional spike from a cost that is actually being paid every frame,
+    // which is the difference between "fine" and "stuttering".
+    //
+    // Sorted copy rather than a running estimate: 240 floats is nothing, and
+    // an exact percentile is easier to trust than an approximate one.
+    {
+        float sorted[kFrameTimeHistory];
+        std::copy(std::begin(m_frameTimes), std::end(m_frameTimes), std::begin(sorted));
+        std::sort(std::begin(sorted), std::end(sorted));
+        int filled = 0;
+        for (const float sample : sorted)
+        {
+            if (sample > 0.0f) ++filled;
+        }
+        if (filled > 0)
+        {
+            // The filled samples sit at the END after sorting, since the empty
+            // ones are zero.
+            const float* live = std::end(sorted) - filled;
+            const auto at = [live, filled](double q) {
+                int index = static_cast<int>(q * (filled - 1) + 0.5);
+                return live[std::clamp(index, 0, filled - 1)];
+            };
+            ImGui::Text("p50 %.2f  p95 %.2f  p99 %.2f ms  over %d frames",
+                        at(0.50), at(0.95), at(0.99), filled);
+        }
+    }
+
+    // What the models cost against the renderer, which is the other half of
+    // every "is this affordable" question in this project. Local segment only:
+    // that is the video memory the GPU actually renders out of.
+    if (!m_vramAdapterTried)
+    {
+        m_vramAdapterTried = true;
+        // By LUID through the public factory, because GetAdapter is private
+        // and the device knows which adapter it was created on anyway -- which
+        // is more precise than enumerating and hoping adapter 0 is the one.
+        IDXGIFactory4* factory = m_deviceResources->GetDXGIFactory();
+        ID3D12Device* device = m_deviceResources->GetD3DDevice();
+        if (factory != nullptr && device != nullptr)
+        {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            if (SUCCEEDED(factory->EnumAdapterByLuid(device->GetAdapterLuid(),
+                                                     IID_PPV_ARGS(&adapter))))
+            {
+                adapter.As(&m_vramAdapter);
+            }
+        }
+    }
+    if (m_vramAdapter)
+    {
+        DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+        if (SUCCEEDED(m_vramAdapter->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        {
+            ImGui::Text("video memory %.0f / %.0f MB budget",
+                        static_cast<double>(info.CurrentUsage) / (1024.0 * 1024.0),
+                        static_cast<double>(info.Budget) / (1024.0 * 1024.0));
+        }
+    }
+    const RECT output = m_deviceResources->GetOutputSize();
+    ImGui::Text("render target %ld x %ld", output.right - output.left,
+                output.bottom - output.top);
+
+    // Off by default. Worth having as a toggle rather than a build-time
+    // choice: an uncapped frame rate is what makes the graph above mean
+    // anything, and a capped one is what makes the picture pleasant to look
+    // at.
+    if (m_deviceResources->CanDisableVSync())
+    {
+        bool vsync = m_deviceResources->VSync();
+        if (ImGui::Checkbox("vsync", &vsync))
+        {
+            m_deviceResources->SetVSync(vsync);
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Off presents without waiting for the vertical "
+                              "blank, so the frame rate is the machine's.\n"
+                              "Nothing time-based changes speed either way: "
+                              "the frame delta is measured, not assumed.");
+        }
+    }
+    else
+    {
+        ImGui::TextDisabled("vsync: forced on (the adapter cannot tear)");
+    }
     ImGui::Separator();
 }
 
@@ -1232,6 +1347,49 @@ void Sample::BuildUserInterface()
     // that only has data for the moments you were already looking at it.
     m_frameTimes[m_frameTimeCursor] = ImGui::GetIO().DeltaTime * 1000.0f;
     m_frameTimeCursor = (m_frameTimeCursor + 1) % kFrameTimeHistory;
+
+    // The same numbers the Performance tab shows, once, to stdout. The overlay
+    // is the right place to read them while using the application and the
+    // wrong place to collect them from: a window cannot be pasted into a
+    // report. Set PTFLIO_FRAME_REPORT=1 and it prints after one full history
+    // window has filled, which is also long enough for the frame time to have
+    // settled.
+    if (!m_frameReportDone && m_timer.GetFrameCount() >= kFrameTimeHistory * 2)
+    {
+        m_frameReportDone = true;
+        const char* wanted = std::getenv("PTFLIO_FRAME_REPORT");
+        if (wanted != nullptr && *wanted == '1')
+        {
+            float sorted[kFrameTimeHistory];
+            std::copy(std::begin(m_frameTimes), std::end(m_frameTimes),
+                      std::begin(sorted));
+            std::sort(std::begin(sorted), std::end(sorted));
+            const auto at = [&sorted](double q) {
+                const int index = static_cast<int>(q * (kFrameTimeHistory - 1) + 0.5);
+                return sorted[std::clamp(index, 0, kFrameTimeHistory - 1)];
+            };
+            const RECT size = m_deviceResources->GetOutputSize();
+            std::printf("[frames] %d samples  p50 %.2f  p95 %.2f  p99 %.2f  "
+                        "worst %.2f ms\n",
+                        kFrameTimeHistory, at(0.50), at(0.95), at(0.99),
+                        sorted[kFrameTimeHistory - 1]);
+            std::printf("[frames] %ld x %ld, vsync %s\n", size.right - size.left,
+                        size.bottom - size.top,
+                        m_deviceResources->VSync() ? "on" : "off");
+            if (m_vramAdapter)
+            {
+                DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+                if (SUCCEEDED(m_vramAdapter->QueryVideoMemoryInfo(
+                        0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+                {
+                    std::printf("[frames] video memory %.0f / %.0f MB budget\n",
+                                static_cast<double>(info.CurrentUsage) / (1024.0 * 1024.0),
+                                static_cast<double>(info.Budget) / (1024.0 * 1024.0));
+                }
+            }
+            std::fflush(stdout);
+        }
+    }
 
     // One window, four tabs. Everything was in a single scrolling column of
     // collapsing headers before, which meant the frame time was at the bottom

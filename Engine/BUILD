@@ -447,11 +447,11 @@ cc_library(
 )
 
 cc_binary(
-    name = "hello-world",
-    srcs = ["hello-world.cc"],
+    name = "AICGTestbed",
+    srcs = ["AICGTestbed.cc"],
     data = ["//:media"],
     # A Win32 GUI app: WinMain, not main. runtimeobject.lib is needed for the
-    # RoInitializeWrapper in Main.cpp.
+    # RoInitializeWrapper in AICGTestbed.cc.
     linkopts = [
         "-SUBSYSTEM:WINDOWS",
         "-ENTRY:wWinMainCRTStartup",
